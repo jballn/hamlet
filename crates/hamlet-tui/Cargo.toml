@@ -1,0 +1,10 @@
+[package]
+name = "hamlet-tui"
+description = "MUD-style terminal frontend over the daemon API (SPEC §12.2, stage 2)."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Stub stage: no dependencies yet. ratatui/crossterm arrive in sprint 08
+# (dev-allowlist today — runtime use requires an ADR + check-deps.sh update).

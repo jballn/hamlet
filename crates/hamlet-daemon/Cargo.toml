@@ -1,0 +1,10 @@
+[package]
+name = "hamlet-daemon"
+description = "The singular governor: only crate that spawns processes or mutates a live .hamlet/ tree (ADR-0001)."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Stub stage: no dependencies yet. Later sprints add workspace deps per the
+# SPEC §3 locked stack (tokio, notify, sled, axum, ...) — see TODO markers.

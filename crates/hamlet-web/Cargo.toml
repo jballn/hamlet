@@ -1,0 +1,10 @@
+[package]
+name = "hamlet-web"
+description = "WASM 8-bit RPG frontend assets + Rust/JS glue served by axum (SPEC §12.3, stage 3)."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Stub stage: no dependencies yet. WASM glue/tooling lands in sprint 09 and
+# will require an ADR for any crate outside the SPEC §3 locked stack.

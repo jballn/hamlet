@@ -1,0 +1,6 @@
+target/
+.hamlet/
+.env
+*.sled
+logs/
+__pycache__/

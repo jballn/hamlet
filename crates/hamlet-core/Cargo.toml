@@ -1,0 +1,9 @@
+[package]
+name = "hamlet-core"
+description = "Pure logic for hamlet: tree layout, sanitizer, charter state model, schemas. No side effects (ADR-0001 purity seam)."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde = { workspace = true }

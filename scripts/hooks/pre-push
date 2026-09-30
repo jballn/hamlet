@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# pre-push hook: run the full CI battery before anything leaves the machine.
+# Install: cp scripts/hooks/pre-push .git/hooks/pre-push && chmod +x .git/hooks/pre-push
+set -euo pipefail
+exec "$(git rev-parse --show-toplevel)/scripts/ci.sh"
