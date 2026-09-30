@@ -45,6 +45,7 @@ const INBOX: &str = "inbox";
 const MARKET: &str = "market";
 const SKILLS: &str = "skills";
 const PKGCACHE: &str = "pkgcache";
+const DIST: &str = "dist";
 const KEEP: &str = "keep";
 const VAULT: &str = "vault";
 const ARCHIVES: &str = "archives";
@@ -209,6 +210,14 @@ impl HamletTree {
         self.join(&[GUILD, BLUEPRINTS])
     }
 
+    /// `guild/register/<name>.md` — the immutable agent brief for `name`
+    /// (SPEC §5). Provisioning seeds `parcel<uid>/PROPRIETOR.md` from it;
+    /// runtime mutations are recorded in the parcel, never here.
+    #[must_use]
+    pub fn register_brief(&self, name: &SafeName) -> PathBuf {
+        self.join(&[GUILD, REGISTER, &format!("{name}.md")])
+    }
+
     /// `guild/ledger/` — all tracked goals.
     #[must_use]
     pub fn guild_ledger(&self) -> PathBuf {
@@ -343,6 +352,42 @@ impl HamletTree {
     #[must_use]
     pub fn market_pkgcache(&self) -> PathBuf {
         self.join(&[MARKET, PKGCACHE])
+    }
+
+    /// `market/pkgcache/dist/` — the pinned-artifact mirror blueprint
+    /// bootstrap fills and reads (ADR-0013 cl. 1); containers see the same
+    /// directory at `/var/pkgcache/dist/`.
+    ///
+    /// Deliberately NOT in [`Self::static_dirs`]: it is a cache subdir of a
+    /// normative node, created lazily by the daemon with its parent's 01777
+    /// sticky mode so every slot UID can publish into it.
+    #[must_use]
+    pub fn market_pkgcache_dist(&self) -> PathBuf {
+        self.join(&[MARKET, PKGCACHE, DIST])
+    }
+
+    /// One mirrored artifact: `market/pkgcache/dist/<file>`.
+    ///
+    /// `file` is a pin-supplied basename ([`crate::pins::ArtifactPin::file`],
+    /// charset-validated there) and is re-checked here — a value containing a
+    /// separator, `.`/`..`, or a leading `-` yields `None` instead of a path,
+    /// so no caller can turn a cache file name into a traversal or an argv
+    /// flag (ADR-0003 typed-paths policy; ADR-0007 never-follow discipline).
+    #[must_use]
+    pub fn pkgcache_artifact(&self, file: &str) -> Option<PathBuf> {
+        if file.is_empty()
+            || file.len() > 200
+            || file.starts_with('-')
+            || file == "."
+            || file == ".."
+            || file.contains('/')
+            || file.contains('\0')
+            || file.contains("..")
+            || !file.bytes().all(|b| b.is_ascii_graphic())
+        {
+            return None;
+        }
+        Some(self.join(&[MARKET, PKGCACHE, DIST, file]))
     }
 
     // --- keep ------------------------------------------------------------
@@ -546,6 +591,10 @@ mod tests {
         );
         let n = name("mayor");
         assert_eq!(
+            tree.register_brief(&n),
+            PathBuf::from("/v/.hamlet/guild/register/mayor.md")
+        );
+        assert_eq!(
             tree.commission(7),
             PathBuf::from("/v/.hamlet/guild/ledger/commission7")
         );
@@ -637,8 +686,41 @@ mod tests {
             tree.patron(&hostile_but_safe),
             tree.vault_artifact(&hostile_but_safe),
             tree.courier_mail_recipient(&hostile_but_safe),
+            tree.register_brief(&hostile_but_safe),
         ] {
             assert!(p.starts_with(tree.root()));
+        }
+    }
+    /// `market/pkgcache/dist/` mirror accessors (ADR-0013): lazy (not a
+    /// static dir), inside the root, and hostile file names yield `None`
+    /// instead of a path.
+    #[test]
+    fn pkgcache_mirror_accessors_are_typed_and_traversal_proof() {
+        let tree = HamletTree::new(PathBuf::from("/v/.hamlet"));
+        let dist = tree.market_pkgcache_dist();
+        assert_eq!(dist, PathBuf::from("/v/.hamlet/market/pkgcache/dist"));
+        assert!(
+            !tree.static_dirs().contains(&dist),
+            "a cache subdir of a normative node is created lazily"
+        );
+        assert_eq!(
+            tree.pkgcache_artifact("pixi-0.34.0-x86_64-unknown-linux-musl.tar.gz"),
+            Some(dist.join("pixi-0.34.0-x86_64-unknown-linux-musl.tar.gz"))
+        );
+        for hostile in [
+            "",
+            ".",
+            "..",
+            "../evil.tar.gz",
+            "a/b",
+            "/etc/passwd",
+            "-rf",
+            "a..b",
+            "a b",
+            "\u{e9}vil",
+            &"x".repeat(201),
+        ] {
+            assert_eq!(tree.pkgcache_artifact(hostile), None, "{hostile:?}");
         }
     }
 }

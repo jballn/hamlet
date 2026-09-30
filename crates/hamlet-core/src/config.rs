@@ -20,11 +20,18 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 /// Schema version this build writes and accepts (CONVENTIONS §3).
-pub const CONFIG_VERSION: u32 = 1;
+///
+/// v1 → v2 (Sprint 02): additive `resources` section (container resource
+/// limit placeholders). v1 documents still parse — the new field carries
+/// `#[serde(default)]`, so migration is "parse old, write new"; no rewrite
+/// of existing trees is required.
+pub const CONFIG_VERSION: u32 = 2;
 
 /// Default daemon data dir (sled telemetry location). Relative paths
 /// resolve against the *working directory containing* the village root —
@@ -44,6 +51,13 @@ const DEFAULT_BASE_IMAGE: &str = "docker.io/library/alpine:3.20";
 const DEFAULT_WEB_LISTEN_ADDR: &str = "127.0.0.1:8787";
 /// Default per-request webhook dispatch timeout (SPEC §8.4).
 const DEFAULT_DISPATCH_TIMEOUT_SECS: u64 = 30;
+/// Default container memory limit (conservative until the Sprint 07 policy
+/// ADR fixes the real curve).
+const DEFAULT_CONTAINER_MEMORY: &str = "512m";
+/// Default container CPU limit (`--cpus` value).
+const DEFAULT_CONTAINER_CPUS: &str = "1.0";
+/// Default container PID limit (`--pids-limit`); fork-bomb brace.
+const DEFAULT_CONTAINER_PIDS_LIMIT: u64 = 256;
 
 /// Orchestrator/engine settings — the typed form of `.hamlet/config.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +83,12 @@ pub struct Config {
     /// External webhook dispatch settings (placeholder — SPEC §8.4 policy is
     /// [DEV]; endpoint auth lives in `.env`, never here).
     pub dispatch: DispatchConfig,
+    /// Container resource-limit placeholders (SPEC §4; the binding policy
+    /// ADR is Sprint 07 — values here are wired into every `podman run` as
+    /// `--memory` / `--cpus` / `--pids-limit`). Absent in v1 documents;
+    /// defaults apply.
+    #[serde(default)]
+    pub resources: ResourcesConfig,
 }
 
 impl Default for Config {
@@ -81,6 +101,7 @@ impl Default for Config {
             web_listen_addr: DEFAULT_WEB_LISTEN_ADDR.to_string(),
             log_level: LogLevel::default(),
             dispatch: DispatchConfig::default(),
+            resources: ResourcesConfig::default(),
         }
     }
 }
@@ -154,7 +175,8 @@ impl Config {
                 self.web_listen_addr
             )));
         }
-        self.dispatch.validate()
+        self.dispatch.validate()?;
+        self.resources.validate()
     }
 
     /// Resolve [`Config::daemon_data_dir`] for the village rooted at
@@ -231,6 +253,72 @@ impl DispatchConfig {
             return Err(ConfigError::Invalid(format!(
                 "dispatch.timeout_secs must be in 1..=3600, got {}",
                 self.timeout_secs
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn memory_re() -> &'static Regex {
+    // podman --memory byte-unit form: digits + optional b/k/m/g suffix.
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^[0-9]+[bkmgBKMG]?$").unwrap())
+}
+
+fn cpus_re() -> &'static Regex {
+    // podman --cpus: decimal or percentage form.
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^[0-9]+(\.[0-9]+)?%?$").unwrap())
+}
+
+/// Container resource-limit settings (SPEC §4 hardening; policy **[DEV]**
+/// until the Sprint 07 ADR — these are the `config.json` placeholders the
+/// daemon's podman layer wires into every `podman run`). Defaults are
+/// deliberately conservative; values are charset-validated because they
+/// land verbatim in argv (ADR-0010: typed sources only, never a shell).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourcesConfig {
+    /// `--memory` value, e.g. `"512m"` (digits + optional b/k/m/g suffix).
+    pub memory: String,
+    /// `--cpus` value, e.g. `"1.0"` or `"50%"`.
+    pub cpus: String,
+    /// `--pids-limit` (1..=65535; unlimited is never a default).
+    pub pids_limit: u64,
+}
+
+impl Default for ResourcesConfig {
+    fn default() -> Self {
+        Self {
+            memory: DEFAULT_CONTAINER_MEMORY.to_string(),
+            cpus: DEFAULT_CONTAINER_CPUS.to_string(),
+            pids_limit: DEFAULT_CONTAINER_PIDS_LIMIT,
+        }
+    }
+}
+
+impl ResourcesConfig {
+    /// # Errors
+    ///
+    /// [`ConfigError::Invalid`] when a value falls outside the charset or
+    /// range podman (and ADR-0010 argv safety) accepts.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if !memory_re().is_match(&self.memory) {
+            return Err(ConfigError::Invalid(format!(
+                "resources.memory must match <digits>[bkmg], got {:?}",
+                self.memory
+            )));
+        }
+        if !cpus_re().is_match(&self.cpus) {
+            return Err(ConfigError::Invalid(format!(
+                "resources.cpus must be a decimal or percentage, got {:?}",
+                self.cpus
+            )));
+        }
+        if self.pids_limit == 0 || self.pids_limit > 65535 {
+            return Err(ConfigError::Invalid(format!(
+                "resources.pids_limit must be in 1..=65535, got {}",
+                self.pids_limit
             )));
         }
         Ok(())
@@ -430,6 +518,33 @@ mod tests {
     fn default_config_render_golden() {
         let expected = "\
 {
+  \"config_version\": 2,
+  \"daemon_data_dir\": \".hamlet-data/sled\",
+  \"podman_bin\": \"podman\",
+  \"base_image\": \"docker.io/library/alpine:3.20\",
+  \"web_listen_addr\": \"127.0.0.1:8787\",
+  \"log_level\": \"info\",
+  \"dispatch\": {
+    \"enabled\": false,
+    \"timeout_secs\": 30
+  },
+  \"resources\": {
+    \"memory\": \"512m\",
+    \"cpus\": \"1.0\",
+    \"pids_limit\": 256
+  }
+}
+";
+        assert_eq!(Config::default().render(), expected);
+    }
+
+    /// v1 → v2 migration is additive: a v1 document (no `resources` block)
+    /// still parses, defaults fill in, and the declared version is left
+    /// untouched (CONVENTIONS §3.3 — no silent rewrites).
+    #[test]
+    fn v1_config_parses_with_default_resources() {
+        let v1 = "\
+{
   \"config_version\": 1,
   \"daemon_data_dir\": \".hamlet-data/sled\",
   \"podman_bin\": \"podman\",
@@ -442,7 +557,65 @@ mod tests {
   }
 }
 ";
-        assert_eq!(Config::default().render(), expected);
+        let parsed = Config::parse(v1).expect("v1 must still parse");
+        assert_eq!(parsed.config_version, 1);
+        assert_eq!(parsed.resources, ResourcesConfig::default());
+    }
+
+    #[test]
+    fn resources_validation_rejects_bad_values() {
+        for bad in ["", "x", "-512m", "512 m", "512mb", "1;rm"] {
+            let cfg = Config {
+                resources: ResourcesConfig {
+                    memory: bad.to_string(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            assert!(
+                matches!(cfg.validate(), Err(ConfigError::Invalid(_))),
+                "memory {bad:?} must be rejected"
+            );
+        }
+        for bad in ["", "one", "1.0.0", "--cpus", "50pct"] {
+            let cfg = Config {
+                resources: ResourcesConfig {
+                    cpus: bad.to_string(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            assert!(
+                matches!(cfg.validate(), Err(ConfigError::Invalid(_))),
+                "cpus {bad:?} must be rejected"
+            );
+        }
+        for bad in [0u64, 65536, u64::MAX] {
+            let cfg = Config {
+                resources: ResourcesConfig {
+                    pids_limit: bad,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            assert!(
+                matches!(cfg.validate(), Err(ConfigError::Invalid(_))),
+                "pids_limit {bad} must be rejected"
+            );
+        }
+        for memory in ["512m", "2g", "1024"] {
+            for cpus in ["1", "1.0", "50%"] {
+                let cfg = Config {
+                    resources: ResourcesConfig {
+                        memory: memory.to_string(),
+                        cpus: cpus.to_string(),
+                        pids_limit: 256,
+                    },
+                    ..Default::default()
+                };
+                assert!(cfg.validate().is_ok(), "{memory}/{cpus} must pass");
+            }
+        }
     }
 
     #[test]

@@ -54,5 +54,25 @@ ADRs are immutable. To change a decision:
 | [0006](0006-concurrency-safe-atomic-writes.md) | Concurrency-safe atomic writes: unique temp per attempt | Accepted (supersedes ADR-0004 cl. 3 naming) |
 | [0007](0007-bootstrap-fs-boundary.md) | Bootstrap FS boundary: never follow, never adopt | Accepted (amends ADR-0003) |
 | [0008](0008-slot-identity-uniqueness.md) | Slot identity uniqueness is a load-time invariant | Accepted (extends ADR-0004 cl. 4) |
+| [0009](0009-blueprint-schema.md) | Blueprint TOML schema & immutability encoding | Accepted (Sprint 02 prompts cite it as "ADR-0006") |
+| [0010](0010-podman-invocation-policy.md) | Podman invocation policy: CLI-only, argv-only, rootless | Accepted, cl. 3 amended by ADR-0011 (Sprint 02 prompts cite it as "ADR-0007") |
+| [0011](0011-host-permission-model.md) | Host permission model & subuid userns mapping | Accepted (amends ADR-0010 cl. 3) |
+| [0012](0012-blueprint-execution-derived-images.md) | Blueprint execution: derived parcel images & pinned toolchains | Accepted |
+| [0013](0013-pkgcache-trust-model.md) | pkgcache trust model: shared mirror, digest-verified staging | Accepted |
+| [0014](0014-parcel-env-policy.md) | Parcel env policy: bootstrap-derived prefixes, refused keys | Accepted |
 
 Keep this index updated in the same commit that adds/changes an ADR.
+
+## Renumbering note (binding on later sprint prompts)
+
+Roadmap prompts were written before numbers were claimed, and numbers are never
+reused. Where a later prompt cites one of these, read the ADR actually written:
+
+| Prompt cites | Subject it means | Claimed by | Use instead |
+|---|---|---|---|
+| Sprint 02 "ADR-0006" | blueprint schema | 0006 (atomic writes) | **ADR-0009** |
+| Sprint 02 "ADR-0007" | podman invocation policy | 0007 (bootstrap fs boundary) | **ADR-0010** (+0011) |
+| Sprint 06 "ADR-0012" | commission state machine + git mediation | 0012 (derived images) | next free number (0015+) |
+| Sprint 07 "ADR-0013" | stasis formats + resource policy | 0013 (pkgcache trust) | next free number (0015+) |
+| Sprint 08 "ADR-0014" | CLI surface + local API contract | 0014 (parcel env policy) | next free number (0015+) |
+| Sprint 09 "ADR-0015" | WS protocol + asset architecture | — | next free number (0015+) |

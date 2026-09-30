@@ -1,0 +1,117 @@
+# hamlet toolchain pins — the artifact trust anchor for blueprint bootstrap
+# (ADR-0012 image/bootstrap policy, ADR-0013 pkgcache trust model).
+#
+# WHY THIS FILE EXISTS: `market/pkgcache/` is the shared download mirror for
+# every parcel and is mode 01777 (ADR-0011) — any agent UID can create or
+# replace files in it. Nothing that comes out of it is ever extracted,
+# chmod'ed or executed unless its sha256 matches a pin recorded HERE. A
+# `[[tools]]` entry with no matching pin is refused (`UnpinnedTool`), never
+# guessed at: no pin, no install.
+#
+# Digests were computed from the bytes actually downloaded from the URLs below
+# on 2026-09-30 and cross-checked against the upstream-published hash
+# manifests where they exist:
+#   node      — https://unofficial-builds.nodejs.org/download/release/v22.23.3/SHASUMS256.txt
+#   rustup    — https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-musl/rustup-init.sha256
+#   rustc/cargo/rust-std — `xz_hash` in channel-rust-stable.toml (date 2026-09-03)
+#   pixi/nvm  — no upstream manifest; digests are from the release assets themselves.
+#
+# Refreshing a version = editing this file (a reviewed daemon change). A
+# floating spec (`stable`, `22`) is FROZEN to the concrete `version` below;
+# when upstream moves, bootstrap keeps installing the pinned version until
+# this file changes. That is the point: parcels are reproducible.
+#
+# `arch` is matched against the daemon's `std::env::consts::ARCH`; a pin for
+# another arch is a refusal, not a silent fallback.
+
+version = 1
+
+# --- Pixi (SPEC §4 multiplexer) -------------------------------------------
+
+[[pins]]
+kind = "pixi"
+name = "pixi"
+version_spec = "0.34.*"
+version = "0.34.0"
+
+  [[pins.artifacts]]
+  role = "primary"          # single-file release tarball: ./pixi
+  version = "0.34.0"
+  arch = "x86_64"
+  format = "tar.gz"
+  file = "pixi-0.34.0-x86_64-unknown-linux-musl.tar.gz"
+  url = "https://github.com/prefix-dev/pixi/releases/download/v0.34.0/pixi-x86_64-unknown-linux-musl.tar.gz"
+  sha256 = "fbdec98dff8b522c4ceb12d76e3fdc177b55620a33451b350c94eae37b3803c8"
+
+# --- NVM + Node (SPEC §4 multiplexer; musl build — Alpine has no glibc) ----
+
+[[pins]]
+kind = "nvm"
+name = "node"
+version_spec = "22"
+version = "22.23.3"
+
+  [[pins.artifacts]]
+  role = "manager"          # nvm itself → $NVM_DIR (shell-function version manager)
+  version = "0.40.8"
+  arch = "x86_64"
+  format = "tar.gz"
+  file = "nvm-0.40.8.tar.gz"
+  url = "https://github.com/nvm-sh/nvm/archive/refs/tags/v0.40.8.tar.gz"
+  sha256 = "7c5b2c4c78e6447b518860ead1f365056e9a03b3562903439bb401607b05a2ef"
+
+  [[pins.artifacts]]
+  role = "runtime"          # materialized into nvm's own versions/ layout, so
+  version = "22.23.3"       # `nvm use 22` and a bare `node` both resolve offline
+  arch = "x86_64"
+  format = "tar.xz"
+  file = "node-v22.23.3-linux-x64-musl.tar.xz"
+  url = "https://unofficial-builds.nodejs.org/download/release/v22.23.3/node-v22.23.3-linux-x64-musl.tar.xz"
+  sha256 = "9b177f0c140a82a3d247e8f54586a65dbdf91e5e3a01f04708dabfdc9e0e01c4"
+
+# --- Cargo/Rust (SPEC §4 multiplexer: rustup links a pinned toolchain) -----
+
+[[pins]]
+kind = "cargo"
+name = "rust"
+version_spec = "stable"
+version = "1.98.1"
+
+  [[pins.artifacts]]
+  role = "rustup"           # static-pie musl binary → installs the multiplexer only
+  version = "1.29.1"        # (`--default-toolchain none`: no unverified downloads).
+                            # Rolling upstream URL, so the digest is the version:
+  arch = "x86_64"
+  format = "binary"
+  file = "rustup-init-x86_64-unknown-linux-musl"
+  url = "https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-musl/rustup-init"
+  # when rust-lang.org republishes rustup-init this pin must be refreshed
+  # (bootstrap fails closed on the mismatch instead of installing new bytes).
+  sha256 = "331228566cc931f32cd684f9bebc5956a5e5d7394c8d5de595f196a658ab98e6"
+
+  [[pins.artifacts]]
+  role = "rustc"            # standalone component tarballs, extracted into one
+  version = "1.98.1"        # toolchain dir and `rustup toolchain link`ed — every
+  arch = "x86_64"           # byte comes through the pkgcache mirror, so a second
+  format = "tar.xz"         # village parcel installs Rust with zero network.
+  file = "rustc-1.98.1-x86_64-unknown-linux-musl.tar.xz"
+  url = "https://static.rust-lang.org/dist/2026-09-03/rustc-1.98.1-x86_64-unknown-linux-musl.tar.xz"
+  sha256 = "dea916164b47437402d8041cbba90c1ff9ce859948b1ece8e36b08100ff92063"
+
+  [[pins.artifacts]]
+  role = "cargo"
+  version = "1.98.1"
+  arch = "x86_64"
+  format = "tar.xz"
+  file = "cargo-1.98.1-x86_64-unknown-linux-musl.tar.xz"
+  url = "https://static.rust-lang.org/dist/2026-09-03/cargo-1.98.1-x86_64-unknown-linux-musl.tar.xz"
+  sha256 = "2bced641e198f9c4e7b129770de65cb052f2486a8f58d577792ea57c66c91b1c"
+
+  [[pins.artifacts]]
+  role = "rust-std"
+  version = "1.98.1"
+  arch = "x86_64"
+  format = "tar.xz"
+  file = "rust-std-1.98.1-x86_64-unknown-linux-musl.tar.xz"
+  url = "https://static.rust-lang.org/dist/2026-09-03/rust-std-1.98.1-x86_64-unknown-linux-musl.tar.xz"
+  sha256 = "bd9f35880de21dab0e387e84009c00001ae7836a4ba565cb16823f13f75f325f"

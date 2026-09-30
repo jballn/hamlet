@@ -1,0 +1,78 @@
+# village-alpine — hamlet default blueprint (SPEC §4 base environment).
+# Schema: ADR-0009 (crates/hamlet-core/src/blueprint.rs). Immutable once
+# loaded; evolution only via DEED.md promotion at commission end (SPEC §9.4).
+
+[meta]
+name = "village-alpine"
+version = 1
+# The PARENT image. The daemon derives the parcel image from it (ADR-0012):
+# `localhost/hamlet/village-alpine:v1-f<floor>-c<containerfile fingerprint>`,
+# carrying these apk tools plus its own bootstrap floor. 3.24 is the current
+# supported stable — 3.20 went EOL 2026-05 and no longer receives apk
+# security updates (step-04 image-policy review).
+base_image = "docker.io/library/alpine:3.24"
+
+# --- system layer (apk): slim Alpine + uutils + commission/ACL tooling ---
+
+[[tools]]
+kind = "apk"
+name = "uutils-coreutils"   # the real Alpine package name (`uutils` does not
+                            # exist in any 3.2x repo); installs /usr/bin/uutils
+                            # plus uutils-<tool> symlinks, never shadowing busybox
+
+[[tools]]
+kind = "apk"
+name = "git"
+
+[[tools]]
+kind = "apk"
+name = "acl"          # setfacl/getfacl for /var/freight/ sandboxes (SPEC §4)
+
+[[tools]]
+kind = "apk"
+name = "ca-certificates"
+
+[[tools]]
+kind = "apk"
+name = "curl"
+
+# --- user-space multiplexers (SPEC §4: Pixi, NVM, Cargo) ---
+# Concrete versions + sha256 for these live in defaults/toolchain-pins.toml
+# (ADR-0012/0013): the spec below is frozen by a pin or bootstrap refuses.
+
+[[tools]]
+kind = "pixi"
+name = "pixi"
+version_spec = "0.34.*"
+
+[[tools]]
+kind = "nvm"
+name = "node"
+version_spec = "22"   # current LTS line
+
+[[tools]]
+kind = "cargo"
+name = "rust"
+version_spec = "stable"
+
+# --- non-secret defaults; caches steer into the /var/pkgcache/ mount ---
+#
+# NEVER declare an installation prefix here (CARGO_HOME, RUSTUP_HOME,
+# PIXI_HOME, NVM_DIR, HOME, PATH): those are per-UID and derived by
+# bootstrap into the parcel home (SPEC §4 "self-install … inside
+# /home/<uid>/"), and bootstrap REFUSES a blueprint that sets them
+# (ADR-0014 cl. 2–3). A shared prefix on the 01777 pkgcache mount would let
+# any agent UID write executables that every other parcel later runs.
+# Earlier revisions of this file carried `CARGO_HOME = "/var/pkgcache/cargo"`
+# for that reason; removed in Sprint 02 step 04.
+
+[env]
+PIXI_CACHE_DIR = "/var/pkgcache/pixi"
+NPM_CONFIG_CACHE = "/var/pkgcache/npm"
+PIP_CACHE_DIR = "/var/pkgcache/pip"
+LANG = "C.UTF-8"
+
+# --- skill references into market/skills/ (empty in a fresh village) ---
+
+[skills]
+refs = []

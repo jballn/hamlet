@@ -8,12 +8,14 @@
 # Runtime allowlist (SPEC §3):
 #   tokio, axum, tokio-tungstenite, serde, serde_json, sled, dotenvy,
 #   regex, reqwest, notify
+# ADR-approved additions (CONVENTIONS §2):
+#   toml (ADR-0009 — blueprint schema)
 # Dev-dependency allowlist (Sprint 00 baseline, recorded in HANDOFF.md):
 #   tempfile, anyhow, thiserror, clap, ratatui, crossterm
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-RUNTIME_ALLOW="tokio axum tokio-tungstenite serde serde_json sled dotenvy regex reqwest notify"
+RUNTIME_ALLOW="tokio axum tokio-tungstenite serde serde_json sled dotenvy regex reqwest notify toml"
 DEV_ALLOW="tempfile anyhow thiserror clap ratatui crossterm"
 
 shopt -s nullglob

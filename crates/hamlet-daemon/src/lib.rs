@@ -11,6 +11,8 @@
 //! | Module | Responsibility | SPEC | Sprint |
 //! |---|---|---|---|
 //! | [`podman`] | rootless podman CLI layer over tokio pipes | §4 | 02 |
+//! | [`bootstrap`] | blueprint execution: derived image, toolchains, profile | §4, §5 | 02 |
+//! | [`hostperm`] | host permission model: modes + subuid ownership | §4 | 02 |
 //! | [`supervise`] | agent session lifecycle: spawn/health/restart/stop | §6 | 03 |
 //! | [`watch`] | notify-driven tree watchers (mail, DEED, decrees) | §6, §8 | 04 |
 //! | [`mailroute`] | spool → sequential recipient stdin delivery | §8.1 | 04 |
@@ -19,12 +21,14 @@
 //! | [`web`] | axum server + WS (frontend assets, metrics stream) | §12.3 | 04/09 |
 //! | [`mayor`] | Mayor wake loop, context packets, decree interpretation | §7 | 05 |
 //! | [`ledger`] | commission lifecycle, git mediation, convergence | §9 | 06 |
-//! | [`census`] | parcels, hibernation, quick awakening | §10 | 07 |
+//! | [`census`] | parcel provisioning (02); hibernation, awakening | §10 | 02/07 |
 //! | [`telemetry`] | sled metrics sink (never orchestration state) | §11.2 | 01 |
 
+pub mod bootstrap;
 pub mod census;
 pub mod dispatch;
 pub mod freight;
+pub mod hostperm;
 pub mod ledger;
 pub mod mailroute;
 pub mod mayor;

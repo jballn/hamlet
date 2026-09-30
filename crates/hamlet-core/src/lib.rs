@@ -11,6 +11,7 @@
 //! | [`slots`] | UID slot allocation: 1000 Mayor, 1001–2000 subagents | §4 |
 //! | [`config`] | `config.json` + `.env` schemas | §2, §11.4 |
 //! | [`blueprint`] | blueprint TOML schema (`guild/blueprints/`) | §5 |
+//! | [`pins`] | toolchain pin table: version+URL+sha256 per artifact | §4, §5 |
 //! | [`mount`] | normative container mount table | §4 |
 //! | [`session`] | agent session protocol types (JSON-RPC, interrupts) | §6 |
 //! | [`mail`] | mail format + routing types | §8 |
@@ -36,6 +37,7 @@ pub mod config;
 pub mod decree;
 pub mod mail;
 pub mod mount;
+pub mod pins;
 pub mod promote;
 pub mod sanitize;
 pub mod session;
