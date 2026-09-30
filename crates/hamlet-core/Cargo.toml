@@ -7,3 +7,9 @@ publish.workspace = true
 
 [dependencies]
 serde = { workspace = true }
+serde_json = { workspace = true }
+dotenvy = { workspace = true }
+regex = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

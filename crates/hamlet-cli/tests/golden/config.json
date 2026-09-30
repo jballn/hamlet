@@ -1,0 +1,12 @@
+{
+  "config_version": 1,
+  "daemon_data_dir": ".hamlet-data/sled",
+  "podman_bin": "podman",
+  "base_image": "docker.io/library/alpine:3.20",
+  "web_listen_addr": "127.0.0.1:8787",
+  "log_level": "info",
+  "dispatch": {
+    "enabled": false,
+    "timeout_secs": 30
+  }
+}

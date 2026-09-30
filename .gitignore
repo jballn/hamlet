@@ -4,3 +4,4 @@ target/
 *.sled
 logs/
 __pycache__/
+.hamlet-data/

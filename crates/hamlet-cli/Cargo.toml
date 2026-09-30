@@ -5,11 +5,20 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[lib]
+name = "hamlet_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "hamlet"
 path = "src/main.rs"
 
 [dependencies]
-# Stub stage: no dependencies yet. clap arrives in sprint 08 — note that it
-# is currently dev-allowlist only, so sprint 08 needs an ADR + check-deps.sh
-# update before adding it here (see HANDOFF, Sprint 00 prompt 02).
+hamlet-core = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+# Stub stage note: clap arrives in sprint 08 — it is currently
+# dev-allowlist only, so sprint 08 needs an ADR + check-deps.sh update
+# before adding it here (see HANDOFF, Sprint 00 prompt 02).

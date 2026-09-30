@@ -1,0 +1,17 @@
+# hamlet .env — secrets (SPEC §11.4; CONVENTIONS §6).
+# Mode 0600. Never commit this file. Hydrated via dotenvy into the daemon
+# and injected into agent sessions out-of-band; values here are NEVER
+# written to charter.json, archives, or logs.
+#
+# Uncomment and replace the placeholders below. All sample values are
+# obvious fakes.
+
+# Model endpoint used by agent sessions:
+#HAMLET_MODEL_ENDPOINT=https://model.example.invalid/v1
+
+# Default model API key:
+#HAMLET_MODEL_API_KEY=test-key-do-not-use
+
+# Additional provider keys (HAMLET_API_KEY_<PROVIDER>):
+#HAMLET_API_KEY_ANTHROPIC=test-key-do-not-use
+#HAMLET_API_KEY_OPENAI=test-key-do-not-use

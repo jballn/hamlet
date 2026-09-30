@@ -20,10 +20,14 @@
 //! | [`stasis`] | hibernation/census types | §10 |
 //!
 //! **Purity seam (CONVENTIONS §2, review-failable):** this crate performs no
-//! filesystem, process, or network side effects. Side-effectful operations
-//! are typed traits implemented and injected by `hamlet-daemon`. Everything
-//! here must be unit-testable without podman or agents, over
-//! `BTreeMap`/`BTreeSet` state with no wall-clock reads (CONVENTIONS §3).
+//! filesystem, process, or network side effects, beyond the two sanctioned
+//! exceptions — [`tree::HamletTree::ensure`] (ADR-0003) and
+//! [`charter::Charter::load`]/[`charter::Charter::save_atomic`] (ADR-0004,
+//! the atomic-write protocol is itself the unit under test). Side-effectful
+//! operations are otherwise typed traits implemented and injected by
+//! `hamlet-daemon`. Everything here must be unit-testable without podman or
+//! agents, over `BTreeMap`/`BTreeSet` state with no wall-clock reads
+//! (CONVENTIONS §3).
 
 pub mod blueprint;
 pub mod charter;

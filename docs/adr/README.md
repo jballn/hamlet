@@ -47,5 +47,12 @@ ADRs are immutable. To change a decision:
 | ADR | Title | Status |
 |---|---|---|
 | [0001](0001-workspace-layout.md) | Workspace layout: 5-crate split & purity seam | Accepted |
+| [0002](0002-path-sanitizer.md) | Path/name sanitizer: §4 rules + SafeName newtype | Accepted |
+| [0003](0003-tree-layout-api.md) | Tree layout API: accessor-only path policy | Accepted |
+| [0004](0004-charter-schema.md) | Charter schema v1, canonical JSON & atomic persistence | Accepted |
+| [0005](0005-sled-key-layout.md) | sled telemetry: location, key layout & retention | Accepted |
+| [0006](0006-concurrency-safe-atomic-writes.md) | Concurrency-safe atomic writes: unique temp per attempt | Accepted (supersedes ADR-0004 cl. 3 naming) |
+| [0007](0007-bootstrap-fs-boundary.md) | Bootstrap FS boundary: never follow, never adopt | Accepted (amends ADR-0003) |
+| [0008](0008-slot-identity-uniqueness.md) | Slot identity uniqueness is a load-time invariant | Accepted (extends ADR-0004 cl. 4) |
 
 Keep this index updated in the same commit that adds/changes an ADR.

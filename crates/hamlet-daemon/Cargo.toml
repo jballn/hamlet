@@ -6,5 +6,12 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
-# Stub stage: no dependencies yet. Later sprints add workspace deps per the
-# SPEC §3 locked stack (tokio, notify, sled, axum, ...) — see TODO markers.
+# Locked stack (SPEC §3 / CONVENTIONS §2) — additions require an ADR.
+hamlet-core = { workspace = true }
+sled = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# TODO(sprint 02): tokio + notify once the governor loops land.
+
+[dev-dependencies]
+tempfile = "3"

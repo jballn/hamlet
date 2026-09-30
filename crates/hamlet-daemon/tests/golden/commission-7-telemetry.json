@@ -1,0 +1,60 @@
+{
+  "summary_version": 1,
+  "commission": 7,
+  "generated_at_unix_ms": 1700000000999,
+  "totals": {
+    "agents": 2,
+    "input_tokens": 117,
+    "output_tokens": 48,
+    "cost_micro_usd": 355,
+    "latency_spikes": 1,
+    "traces": 3
+  },
+  "agents": {
+    "1000": {
+      "totals": {
+        "input_tokens": 10,
+        "output_tokens": 5,
+        "cost_micro_usd": 100,
+        "latency_spikes": 0,
+        "traces": 1
+      },
+      "latency_spikes": [],
+      "traces": [
+        {
+          "at_unix_ms": 1700000000050,
+          "event": "commission-open",
+          "detail": "commission 7 opened"
+        }
+      ]
+    },
+    "1001": {
+      "totals": {
+        "input_tokens": 107,
+        "output_tokens": 43,
+        "cost_micro_usd": 255,
+        "latency_spikes": 1,
+        "traces": 2
+      },
+      "latency_spikes": [
+        {
+          "at_unix_ms": 1700000000100,
+          "duration_ms": 1200,
+          "operation": "mail-delivery"
+        }
+      ],
+      "traces": [
+        {
+          "at_unix_ms": 1700000000200,
+          "event": "session-start",
+          "detail": "session 1 spawned"
+        },
+        {
+          "at_unix_ms": 1700000000300,
+          "event": "session-start",
+          "detail": "session 2 spawned"
+        }
+      ]
+    }
+  }
+}
