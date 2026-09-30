@@ -623,3 +623,28 @@ HEAD: `crates/hamlet-core/tests/adversarial_sanitize.rs` (7),
   (CONVENTIONS §5).
 
 **GATE 01/06: PASS**
+
+---
+
+## GATE 01/07 — Merge & tag record (commit-agent)
+
+- **Precondition:** `GATE 01/06: PASS` verified in this HANDOFF.
+- **Diff review (`git diff main...HEAD`):** 35 files, +8459/−47. No secrets,
+  no `.env`, no `target/`, no runtime `.hamlet/` trees, no sled dbs.
+  `tests/golden/env-template` uses only `test-key-do-not-use` /
+  `example.invalid` fakes (CONVENTIONS §6); `.gitignore` gains
+  `.hamlet-data/` (keeps sled out of any accidental working-dir commit).
+- **Squash-merge:** `sprint/01-host-topology` (tip `c8e5b29`) → `main` as
+  **`3c8e9c8`** — `feat(core,cli,daemon): sprint 01 host topology — typed
+  tree, sanitizer, init, charter, telemetry`. Merged tree verified
+  byte-identical to the sprint branch tip.
+- **Tag:** `sprint/01-host-topology` (annotated) at `3c8e9c8`, pointing at
+  the same tree as branch tip `c8e5b29`.
+- **Post-merge CI on `main`:** `scripts/ci-local.sh` → **`CI battery:
+  PASS`** (fmt, clippy `-D warnings`, workspace tests, check-deps, both
+  e2e-01 harnesses incl. T1–T7 topology/state probes; podman-guarded tests
+  SKIP by design, as in gate 01/06).
+- DoD (CONVENTIONS §8) satisfied: tests shipped in-sprint, ADRs 0002–0008
+  committed + indexed, HANDOFF up to date.
+
+**GATE 01/07: PASS** — merge SHA `3c8e9c8`, tag `sprint/01-host-topology`.
