@@ -136,3 +136,21 @@ cargo run -p hamlet-cli        # stub prints version
 ls docs/adr/                   # README, 0000-template, 0001-workspace-layout
 git remote -v                  # empty → ci.sh + pre-push hook is the CI
 ```
+
+## Merge record — Sprint 00 (prompt 04, Commit Agent)
+
+- **Squash-merged** `sprint/00-foundations` → `main` per CONVENTIONS §7.
+- **Merge commit (main):** `b5802ff` — `feat(core): sprint 00 foundations — CI battery, 5-crate workspace skeleton, ADR-0001`
+  (squash of `410cde3` ci, `0c21a7d` feat(core), `adb37f8` docs gate).
+- **Tag:** `sprint/00-foundations` (annotated, tag object `59b7787`) → points at `b5802ff`.
+  Note: tag name intentionally equals the branch name per CONVENTIONS §7;
+  disambiguate with `refs/heads/…` vs `refs/tags/…` if git warns "refname ambiguous".
+- **Pre-merge review:** `git diff main...HEAD` — 46 files, 899 insertions, all
+  expected (workspace skeleton, scripts, ADRs, HANDOFF). No secrets, no `.env`,
+  no `target/`, no runtime `.hamlet/` trees, no sled dbs, no stray temp files.
+  Untracked `roadmap/.runner-state.json` (roadmap-runner state) deliberately
+  NOT committed.
+- **DoD (CONVENTIONS §8) on merged main:** `./scripts/ci-local.sh` →
+  `CI battery: PASS` (fmt ✔, clippy -D warnings ✔, test ✔ 0 tests/stubs by
+  design, check-deps ✔, podman SKIP — not on PATH).
+- No fixups were needed → no `chore: sprint 00 fixups` commit.
