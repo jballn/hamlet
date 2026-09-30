@@ -773,3 +773,34 @@ module rustdoc (lines 4, 23) *stating the prohibition*. **Zero product-code
 usage** of `--privileged` or any socket mount. Requirement satisfied.
 
 GATE 02/06: PASS
+
+---
+
+## GATE 02/07 — Merge & tag record (commit-agent)
+
+- **Precondition:** `GATE 02/06: PASS` verified in this HANDOFF (line 775).
+- **Diff review (`git diff main...HEAD`):** 35 files, +14541/−29 — all
+  source, tests, defaults, ADRs, roadmap, scripts. No secrets, no `.env`,
+  no `target/`, no runtime `.hamlet/` trees, no sled dbs, no binaries, no
+  pulled-image artifacts (only image references are `docker.io/library/
+  alpine:3.24` in the committed blueprint and derived `localhost/` tags in
+  ADR-0012 — never pullable). `crates/hamlet-cli/tests/golden/config.json`
+  v2 carries only the placeholder `resources` section. Untracked
+  `roadmap/.runner-state.json` left unstaged (runner scratch, not branch
+  content).
+- **DoD pre-check (CONVENTIONS §8):** `scripts/ci-local.sh` on the
+  pre-merge sprint tree → `CI battery: PASS`.
+- **Squash-merge:** `sprint/02-container-runtime` (tip `6e02a57`) → `main`
+  as **`f973675`** (`f973675c0ea759e43c3a09419959809a26643a2b`) —
+  `feat(core,daemon): sprint 02 container runtime — blueprint, podman exec
+  layer, parcel provisioning, toolchain bootstrap`. Merged tree verified
+  byte-identical to the sprint branch tip (`git diff` empty).
+- **Tag:** `sprint/02-container-runtime` (annotated) at `f973675`.
+- **Post-merge CI on `main`:** `scripts/ci-local.sh` → **`CI battery:
+  PASS`** (fmt, clippy `-D warnings`, 209 workspace tests, check-deps,
+  e2e-01 ×2, e2e-02-isolation incl. T1 adversarial suite + T2/T3 ratchets;
+  guarded podman steps SKIP — no podman on this host, recorded as in gate
+  02/06; open issue carried to the podman-capable CI job).
+- No amend, no force-push, shared history untouched.
+
+**GATE 02/07: PASS** — merge SHA `f973675`, tag `sprint/02-container-runtime`.
