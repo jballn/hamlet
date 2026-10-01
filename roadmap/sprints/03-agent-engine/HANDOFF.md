@@ -1,5 +1,44 @@
 # HANDOFF — Sprint 03 Agent Engine
 
+## GATE 03/07 — Merge & tag record (commit-agent)
+
+- **Precondition:** `GATE 03/06: PASS` verified in this HANDOFF (section
+  below).
+- **Diff review (`git diff main...HEAD`):** 27 files, +14905/−128 — all
+  source, tests, ADRs, roadmap, scripts, goldens. No secrets, no `.env`,
+  no `target/`, no runtime `.hamlet/` trees, no sled dbs, no logs, no
+  binaries (fakeagent.rs is a committed source bin, not an artifact).
+  Secret-shaped grep hits are deliberate fixtures only: the fake value
+  `sk-secret` in the session-exec argv golden and the `<redacted>` masking
+  assertions + the `secrets_never_reach_files_charter_or_sled` byte-scan
+  (SPEC §11.4, CONVENTIONS §6 — fixtures use obvious fakes).
+  `crates/hamlet-cli/tests/golden/{charter,config}.json` carry only the
+  additive v2/v4 session + latency-spike keys. Untracked `assets/` and
+  `roadmap/.runner-state.json` left unstaged (runner scratch, not branch
+  content).
+- **DoD pre-check (CONVENTIONS §8):** gate 03/06 ran the full battery on
+  the pre-merge sprint tree (`3fee968` + `6e0caf0` docs) → PASS; this gate
+  re-ran it on merged main (below).
+- **Squash-merge:** `sprint/03-agent-engine` (tip `6e0caf0`) → `main` as
+  **`2063c52`** (`2063c52fdee9434211d1355281ce439705a42579`) —
+  `feat(core,daemon): sprint 03 agent engine — pi session supervision,
+  delivery queue, divine interruption, telemetry → sled`. Merged tree
+  verified byte-identical to the sprint branch tip (`git diff 6e0caf0
+  main` empty).
+- **Tag:** `sprint/03-agent-engine` (annotated) at `2063c52`.
+- **Post-merge CI on `main`:** `scripts/ci-local.sh` → **`CI battery:
+  PASS`** (fmt, clippy `-D warnings`, 349 workspace tests across 31 ok
+  runs, check-deps, e2e-01 ×2, e2e-02-isolation, e2e-03-adversarial incl.
+  T1 12/12, T2 QA05-02 race 10/10 gated samples, T3 secrets ratchets, T4
+  flush-wiring ratchet; guarded podman steps SKIP — no podman on this
+  host, recorded as in gates 02/06 and 03/06; open issue carried to the
+  podman-capable CI job). Log: `/tmp/ci-03-07-main.log`, exit 0.
+- Open issue carried to Sprint 04: QA05-01 (capped incremental stdout
+  reader) — ruled SHOULD-FIX, non-blocking.
+- No amend, no force-push, shared history untouched.
+
+**GATE 03/07: PASS** — merge SHA `2063c52`, tag `sprint/03-agent-engine`.
+
 ## GATE 03/06 — CI gate verdict: **PASS**
 
 Precondition checked: `GATE 03/05: PASS` present (re-gate record below). Full
