@@ -14,6 +14,8 @@
 //! | [`bootstrap`] | blueprint execution: derived image, toolchains, profile | §4, §5 | 02 |
 //! | [`hostperm`] | host permission model: modes + subuid ownership | §4 | 02 |
 //! | [`supervise`] | agent session lifecycle: spawn/health/restart/stop | §6 | 03 |
+//! | [`delivery`] | persistent per-session delivery queues (stdin funnel) | §6, §8.1 | 03 |
+//! | [`metrics`] | stream telemetry extractor: JSON-RPC → sled observations | §6, §11.2 | 03 |
 //! | [`watch`] | notify-driven tree watchers (mail, DEED, decrees) | §6, §8 | 04 |
 //! | [`mailroute`] | spool → sequential recipient stdin delivery | §8.1 | 04 |
 //! | [`freight`] | freight ACL sandboxes, vault promotion copies | §4, §7 | 04 |
@@ -26,12 +28,14 @@
 
 pub mod bootstrap;
 pub mod census;
+pub mod delivery;
 pub mod dispatch;
 pub mod freight;
 pub mod hostperm;
 pub mod ledger;
 pub mod mailroute;
 pub mod mayor;
+pub mod metrics;
 pub mod podman;
 pub mod supervise;
 pub mod telemetry;

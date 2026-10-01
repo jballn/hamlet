@@ -76,6 +76,10 @@ pub const TELEMETRY_TREES: [&str; 5] = [
 const DOMAIN_TRACE_SEQ: u8 = 1;
 /// Counter domain: latency spike sequence allocation ([`TREE_LATENCY`]).
 const DOMAIN_LATENCY_SEQ: u8 = 2;
+/// Counter domain: session correlation-id sequence allocation (ADR-0015
+/// cl. 2: `<kind>-<seq>-<uid>.<inc>` seqs come from sled counters —
+/// additive use of the `counters.v1` key layout, ADR-0005 cl. 3).
+const DOMAIN_CORRELATION_SEQ: u8 = 3;
 
 /// Schema version of exported archive summaries (`keep/archives/`).
 pub const SUMMARY_VERSION: u32 = 1;
@@ -207,6 +211,143 @@ pub struct TraceRecord {
     pub event: String,
     /// Free-form detail (no secrets — CONVENTIONS §6).
     pub detail: String,
+}
+
+// --- live query surface -----------------------------------------------------
+
+/// Scope of a [`Telemetry::metrics_for`] query. `Session`, `Agent` and
+/// `Commission` are pure prefix scans; `Uid` crosses commissions and
+/// therefore walks the telemetry trees in full — prefer `Agent` whenever the
+/// commission is known (the CLI resolves it from the charter slot).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricsScope {
+    /// One session of one agent.
+    Session(SessionKey),
+    /// One commissioned identity — all of its sessions.
+    Agent(AgentKey),
+    /// Every agent in one commission.
+    Commission(u64),
+    /// One UID slot across every commission that recorded it.
+    Uid(u32),
+}
+
+impl MetricsScope {
+    /// The scan bounds this scope reduces to.
+    fn scan_bounds(self) -> ScanBounds {
+        match self {
+            Self::Session(key) => ScanBounds {
+                prefix: key.agent.encode().to_vec(),
+                uid: Some(key.agent.uid),
+                session: Some(key.session),
+            },
+            Self::Agent(agent) => ScanBounds {
+                prefix: agent.encode().to_vec(),
+                uid: Some(agent.uid),
+                session: None,
+            },
+            Self::Commission(commission) => ScanBounds {
+                prefix: commission.to_be_bytes().to_vec(),
+                uid: None,
+                session: None,
+            },
+            Self::Uid(uid) => ScanBounds {
+                prefix: Vec::new(),
+                uid: Some(uid),
+                session: None,
+            },
+        }
+    }
+}
+
+/// A resolved [`MetricsScope`]: the sled key prefix to scan plus the
+/// filters the prefix cannot express (a `Uid` scope is not a prefix, and a
+/// `Session` scope narrows below the agent prefix).
+struct ScanBounds {
+    prefix: Vec<u8>,
+    uid: Option<u32>,
+    session: Option<u64>,
+}
+
+impl ScanBounds {
+    fn matches(&self, key: SessionKey) -> bool {
+        self.matches_agent(key.agent) && self.session.is_none_or(|want| want == key.session)
+    }
+
+    fn matches_agent(&self, key: AgentKey) -> bool {
+        self.uid.is_none_or(|want| want == key.uid)
+    }
+}
+
+/// One session's rolled-up metrics ([`SessionKey`] flattened so the row is
+/// directly renderable by the CLI/WS stages).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionTotals {
+    /// Commission the session belongs to.
+    pub commission: u64,
+    /// UID slot.
+    pub uid: u32,
+    /// Session id (`SessionId::as_u64`: `incarnation << 32 | uid`).
+    pub session: u64,
+    /// Token tally.
+    pub tokens: TokenTally,
+    /// Accumulated API cost in micro-USD.
+    pub cost_micro_usd: u64,
+    /// Latency spikes recorded against this session.
+    pub latency_spikes: u64,
+}
+
+impl From<SessionKey> for SessionTotals {
+    fn from(key: SessionKey) -> Self {
+        Self {
+            commission: key.agent.commission,
+            uid: key.agent.uid,
+            session: key.session,
+            tokens: TokenTally::default(),
+            cost_micro_usd: 0,
+            latency_spikes: 0,
+        }
+    }
+}
+
+impl SessionTotals {
+    /// Does this row describe `key`?
+    #[must_use]
+    pub fn matches(&self, key: SessionKey) -> bool {
+        self.commission == key.agent.commission
+            && self.uid == key.agent.uid
+            && self.session == key.session
+    }
+}
+
+/// One agent's rollup inside a [`MetricsSnapshot`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentRow {
+    /// Commission (the lowest one when a uid spans several — `Uid` scope).
+    pub commission: u64,
+    /// UID slot.
+    pub uid: u32,
+    /// Rollup totals.
+    pub totals: AgentTotals,
+}
+
+/// A live metrics snapshot — the read model the CLI (Sprint 08) and the WS
+/// metric streams (Sprint 09) render. Serializable, deterministic and
+/// clock-free (CONVENTIONS §3 r4).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsSnapshot {
+    /// Rollup over the whole scope.
+    pub totals: AgentTotals,
+    /// Per-session rows, ascending.
+    pub sessions: Vec<SessionTotals>,
+    /// Per-agent rows, ascending by uid.
+    pub agents: Vec<AgentRow>,
+    /// The most recent spikes in scope (key order).
+    pub recent_spikes: Vec<LatencySpike>,
+    /// The most recent traces in scope (key order).
+    pub recent_traces: Vec<TraceRecord>,
 }
 
 // --- summaries --------------------------------------------------------------
@@ -509,6 +650,17 @@ impl Telemetry {
         self.bump_counter(TREE_COUNTERS, &key, 1)
     }
 
+    /// Allocate the next session correlation sequence for one agent
+    /// (ADR-0015 cl. 2 — envelope correlation ids `m|t|n|i-<seq>-<uid>.<inc>`).
+    /// 1-based, monotonic per agent, durable across daemon restarts.
+    ///
+    /// # Errors
+    ///
+    /// [`TelemetryError::Storage`] or [`TelemetryError::Corrupt`].
+    pub fn next_correlation_seq(&self, agent: AgentKey) -> Result<u64, TelemetryError> {
+        self.next_seq(DOMAIN_CORRELATION_SEQ, agent)
+    }
+
     /// Atomically add `delta` to a raw `u64` BE counter; returns the new
     /// value. Fail-hard: a malformed stored counter is
     /// [`TelemetryError::Corrupt`], never silently re-zeroed.
@@ -638,6 +790,217 @@ impl Telemetry {
             let (key, value) = entry?;
             if key.len() != AGENT_KEY_LEN + 8 {
                 return Err(corrupt(TREE_TRACES, "trace key is not agent+seq width"));
+            }
+            all.push(decode_json::<TraceRecord>(TREE_TRACES, &value)?);
+        }
+        let start = all.len().saturating_sub(window);
+        Ok(all.split_off(start))
+    }
+
+    // --- live query surface (Sprint 03 step 04; consumed by the CLI in
+    //     Sprint 08 and the WS metric streams in Sprint 09) ---
+
+    /// One live metrics snapshot for a scope: rolled totals, the per-session
+    /// and per-agent rows, and the most recent spikes/traces. Pure reads —
+    /// no clock, no writes, deterministic ordering (sled's byte order equals
+    /// commission → uid → session → seq, ADR-0005 cl. 3), so a snapshot is
+    /// golden-testable and safe to serialize straight into a WS frame.
+    ///
+    /// `window` bounds `recent_spikes` / `recent_traces` (the *last* N in
+    /// key order — not wall-clock order across agents).
+    ///
+    /// # Errors
+    ///
+    /// [`TelemetryError::Storage`] or [`TelemetryError::Corrupt`].
+    pub fn metrics_for(
+        &self,
+        scope: MetricsScope,
+        window: usize,
+    ) -> Result<MetricsSnapshot, TelemetryError> {
+        let bounds = scope.scan_bounds();
+        let sessions = self.collect_sessions(&bounds)?;
+
+        // A session scope is session-exact: no agent rollup (traces are
+        // agent-keyed, so an agent row would be broader than the question).
+        let agents = match scope {
+            MetricsScope::Session(_) => Vec::new(),
+            _ => self.collect_agents(&bounds, &sessions)?,
+        };
+
+        let totals = match scope {
+            MetricsScope::Session(key) => sessions.iter().find(|row| row.matches(key)).map_or_else(
+                AgentTotals::default,
+                |row| AgentTotals {
+                    input_tokens: row.tokens.input_tokens,
+                    output_tokens: row.tokens.output_tokens,
+                    cost_micro_usd: row.cost_micro_usd,
+                    latency_spikes: row.latency_spikes,
+                    // Traces are agent-scoped: a session reports none here
+                    // (see `recent_traces`, which is the agent's window).
+                    traces: 0,
+                },
+            ),
+            MetricsScope::Agent(agent) => self.agent_totals(agent)?,
+            _ => {
+                let mut rolled = AgentTotals::default();
+                for row in &agents {
+                    rolled.accumulate(&row.totals);
+                }
+                rolled
+            }
+        };
+
+        Ok(MetricsSnapshot {
+            totals,
+            sessions,
+            agents,
+            recent_spikes: self.collect_spikes(&bounds, window)?,
+            recent_traces: self.collect_traces(&bounds, window)?,
+        })
+    }
+
+    /// Per-session rows in scope, ascending by (commission, uid, session).
+    /// A session appears once it recorded tokens, cost, or a spike.
+    fn collect_sessions(&self, bounds: &ScanBounds) -> Result<Vec<SessionTotals>, TelemetryError> {
+        let mut rows: BTreeMap<SessionKey, SessionTotals> = BTreeMap::new();
+
+        let tokens = self.db.open_tree(TREE_TOKENS)?;
+        for entry in tokens.scan_prefix(&bounds.prefix) {
+            let (key, value) = entry?;
+            if key.len() != SESSION_KEY_LEN {
+                return Err(corrupt(TREE_TOKENS, "token key is not session width"));
+            }
+            let session = SessionKey::decode(&key, TREE_TOKENS)?;
+            if !bounds.matches(session) {
+                continue;
+            }
+            rows.entry(session)
+                .or_insert_with(|| SessionTotals::from(session))
+                .tokens = decode_json::<TokenTally>(TREE_TOKENS, &value)?;
+        }
+
+        let costs = self.db.open_tree(TREE_COSTS)?;
+        for entry in costs.scan_prefix(&bounds.prefix) {
+            let (key, value) = entry?;
+            if key.len() != SESSION_KEY_LEN {
+                return Err(corrupt(TREE_COSTS, "cost key is not session width"));
+            }
+            let session = SessionKey::decode(&key, TREE_COSTS)?;
+            if !bounds.matches(session) {
+                continue;
+            }
+            rows.entry(session)
+                .or_insert_with(|| SessionTotals::from(session))
+                .cost_micro_usd = decode_counter(TREE_COSTS, &value)?;
+        }
+
+        let latency = self.db.open_tree(TREE_LATENCY)?;
+        for entry in latency.scan_prefix(&bounds.prefix) {
+            let (key, _) = entry?;
+            if key.len() != SESSION_KEY_LEN + 8 {
+                return Err(corrupt(TREE_LATENCY, "spike key is not session+seq width"));
+            }
+            let session = SessionKey::decode(&key, TREE_LATENCY)?;
+            if !bounds.matches(session) {
+                continue;
+            }
+            rows.entry(session)
+                .or_insert_with(|| SessionTotals::from(session))
+                .latency_spikes += 1;
+        }
+
+        Ok(rows.into_values().collect())
+    }
+
+    /// Per-agent rollups in scope, ascending by uid. A uid seen under
+    /// several commissions (`Uid` scope) merges into one row — that is what
+    /// the scope means.
+    fn collect_agents(
+        &self,
+        bounds: &ScanBounds,
+        sessions: &[SessionTotals],
+    ) -> Result<Vec<AgentRow>, TelemetryError> {
+        // Distinct agents from the session rows *and* the trace tree (an
+        // agent that only ever traced has no session rows).
+        let mut agents: BTreeSet<AgentKey> = sessions
+            .iter()
+            .map(|row| AgentKey {
+                commission: row.commission,
+                uid: row.uid,
+            })
+            .collect();
+        let traces = self.db.open_tree(TREE_TRACES)?;
+        for entry in traces.scan_prefix(&bounds.prefix) {
+            let (key, _) = entry?;
+            let agent = AgentKey::decode(&key, TREE_TRACES)?;
+            if bounds.matches_agent(agent) {
+                agents.insert(agent);
+            }
+        }
+
+        let mut merged: BTreeMap<u32, AgentRow> = BTreeMap::new();
+        for agent in agents {
+            let totals = self.agent_totals(agent)?;
+            match merged.get_mut(&agent.uid) {
+                Some(row) => {
+                    row.commission = row.commission.min(agent.commission);
+                    row.totals.accumulate(&totals);
+                }
+                None => {
+                    merged.insert(
+                        agent.uid,
+                        AgentRow {
+                            commission: agent.commission,
+                            uid: agent.uid,
+                            totals,
+                        },
+                    );
+                }
+            }
+        }
+        Ok(merged.into_values().collect())
+    }
+
+    /// The last `window` latency spikes in scope, ascending by key.
+    fn collect_spikes(
+        &self,
+        bounds: &ScanBounds,
+        window: usize,
+    ) -> Result<Vec<LatencySpike>, TelemetryError> {
+        let tree = self.db.open_tree(TREE_LATENCY)?;
+        let mut all = Vec::new();
+        for entry in tree.scan_prefix(&bounds.prefix) {
+            let (key, value) = entry?;
+            if key.len() != SESSION_KEY_LEN + 8 {
+                return Err(corrupt(TREE_LATENCY, "spike key is not session+seq width"));
+            }
+            let session = SessionKey::decode(&key, TREE_LATENCY)?;
+            if !bounds.matches(session) {
+                continue;
+            }
+            all.push(decode_json::<LatencySpike>(TREE_LATENCY, &value)?);
+        }
+        let start = all.len().saturating_sub(window);
+        Ok(all.split_off(start))
+    }
+
+    /// The last `window` traces in scope, ascending by (commission, uid,
+    /// seq) — key order, which is seq order per agent, not a global clock.
+    fn collect_traces(
+        &self,
+        bounds: &ScanBounds,
+        window: usize,
+    ) -> Result<Vec<TraceRecord>, TelemetryError> {
+        let tree = self.db.open_tree(TREE_TRACES)?;
+        let mut all = Vec::new();
+        for entry in tree.scan_prefix(&bounds.prefix) {
+            let (key, value) = entry?;
+            if key.len() != AGENT_KEY_LEN + 8 {
+                return Err(corrupt(TREE_TRACES, "trace key is not agent+seq width"));
+            }
+            let agent = AgentKey::decode(&key, TREE_TRACES)?;
+            if !bounds.matches_agent(agent) {
+                continue;
             }
             all.push(decode_json::<TraceRecord>(TREE_TRACES, &value)?);
         }
@@ -1128,6 +1491,186 @@ mod tests {
         let (empty, agents) = t.commission_totals(999).unwrap();
         assert_eq!(empty, CommissionTotals::default());
         assert!(agents.is_empty());
+    }
+
+    // --- live query surface (Sprint 03 step 04) ----------------------------
+
+    /// `Session` scope is session-exact: one row, no agent rollup (traces
+    /// are agent-keyed, so an agent row would answer a broader question).
+    #[test]
+    fn metrics_for_session_scope_is_session_exact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = Telemetry::open(tmp.path().join("db")).unwrap();
+        populate(&t);
+
+        let snapshot = t
+            .metrics_for(MetricsScope::Session(session(AGENT, 1)), 10)
+            .unwrap();
+        assert_eq!(
+            snapshot.totals,
+            AgentTotals {
+                input_tokens: 100,
+                output_tokens: 41,
+                cost_micro_usd: 251,
+                latency_spikes: 1,
+                traces: 0,
+            }
+        );
+        assert_eq!(snapshot.sessions.len(), 1, "sibling sessions excluded");
+        assert_eq!(snapshot.sessions[0].session, 1);
+        assert_eq!(snapshot.sessions[0].uid, AGENT);
+        assert!(snapshot.agents.is_empty());
+        // Spikes are session-scoped; traces are the agent's window.
+        assert_eq!(snapshot.recent_spikes.len(), 1);
+        assert_eq!(snapshot.recent_spikes[0].operation, "mail-delivery");
+        assert_eq!(snapshot.recent_traces.len(), 2);
+    }
+
+    /// `Agent` scope lists every session of the identity and rolls up.
+    #[test]
+    fn metrics_for_agent_scope_rolls_up_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = Telemetry::open(tmp.path().join("db")).unwrap();
+        populate(&t);
+
+        let snapshot = t
+            .metrics_for(MetricsScope::Agent(agent(AGENT)), 10)
+            .unwrap();
+        assert_eq!(snapshot.totals, t.agent_totals(agent(AGENT)).unwrap());
+        assert_eq!(
+            snapshot
+                .sessions
+                .iter()
+                .map(|row| (row.session, row.cost_micro_usd))
+                .collect::<Vec<_>>(),
+            vec![(1, 251), (2, 4)],
+            "sessions ascending by id"
+        );
+        assert_eq!(snapshot.agents.len(), 1);
+        assert_eq!(snapshot.agents[0].uid, AGENT);
+        assert_eq!(snapshot.agents[0].totals, snapshot.totals);
+    }
+
+    /// `Commission` scope rolls every agent up, sorted by uid.
+    #[test]
+    fn metrics_for_commission_scope_rolls_up_agents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = Telemetry::open(tmp.path().join("db")).unwrap();
+        populate(&t);
+
+        let snapshot = t
+            .metrics_for(MetricsScope::Commission(COMMISSION), 10)
+            .unwrap();
+        assert_eq!(
+            snapshot
+                .agents
+                .iter()
+                .map(|row| row.uid)
+                .collect::<Vec<_>>(),
+            vec![MAYOR, AGENT]
+        );
+        assert_eq!(
+            snapshot.totals,
+            AgentTotals {
+                input_tokens: 117,
+                output_tokens: 48,
+                cost_micro_usd: 355,
+                latency_spikes: 1,
+                traces: 3,
+            }
+        );
+        assert_eq!(snapshot.sessions.len(), 3);
+        // The commission rollup must agree with the Sprint-01 API.
+        let (totals, _) = t.commission_totals(COMMISSION).unwrap();
+        assert_eq!(snapshot.totals.input_tokens, totals.input_tokens);
+        assert_eq!(snapshot.totals.cost_micro_usd, totals.cost_micro_usd);
+        assert_eq!(snapshot.totals.traces, totals.traces);
+    }
+
+    /// `Uid` scope crosses commissions: one merged agent row, sessions from
+    /// both, and no other uid's data.
+    #[test]
+    fn metrics_for_uid_scope_crosses_commissions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = Telemetry::open(tmp.path().join("db")).unwrap();
+        populate(&t);
+        // The same uid slot under a different commission, plus a different
+        // uid that must not appear.
+        let other = SessionKey::new(42, AGENT, 1);
+        t.add_tokens(
+            other,
+            TokenTally {
+                input_tokens: 5,
+                output_tokens: 5,
+            },
+        )
+        .unwrap();
+        t.add_tokens(
+            SessionKey::new(42, 1500, 1),
+            TokenTally {
+                input_tokens: 99,
+                output_tokens: 99,
+            },
+        )
+        .unwrap();
+
+        let snapshot = t.metrics_for(MetricsScope::Uid(AGENT), 10).unwrap();
+        assert_eq!(snapshot.agents.len(), 1);
+        assert_eq!(snapshot.agents[0].uid, AGENT);
+        assert_eq!(snapshot.agents[0].commission, 7, "lowest commission");
+        assert_eq!(
+            snapshot.agents[0].totals.input_tokens,
+            107 + 5,
+            "both commissions merged"
+        );
+        assert_eq!(snapshot.totals.input_tokens, 112);
+        assert!(
+            snapshot.sessions.iter().all(|row| row.uid == AGENT),
+            "uid filter must exclude other slots: {:?}",
+            snapshot.sessions
+        );
+        assert_eq!(snapshot.sessions.len(), 3);
+    }
+
+    /// `window` bounds the recent lists from the end; an unknown scope is
+    /// empty, never an error.
+    #[test]
+    fn metrics_for_window_and_unknown_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = Telemetry::open(tmp.path().join("db")).unwrap();
+        populate(&t);
+
+        let one = t.metrics_for(MetricsScope::Agent(agent(AGENT)), 1).unwrap();
+        assert_eq!(one.recent_traces.len(), 1);
+        assert_eq!(one.recent_traces[0].detail, "session 2 spawned");
+        let all = t
+            .metrics_for(MetricsScope::Agent(agent(AGENT)), usize::MAX)
+            .unwrap();
+        assert_eq!(all.recent_traces.len(), 2);
+
+        let empty = t.metrics_for(MetricsScope::Commission(999), 10).unwrap();
+        assert_eq!(empty.totals, AgentTotals::default());
+        assert!(empty.sessions.is_empty() && empty.agents.is_empty());
+        assert!(empty.recent_traces.is_empty() && empty.recent_spikes.is_empty());
+    }
+
+    /// The snapshot is the WS/CLI read model: it round-trips through
+    /// canonical JSON and renders sessions/agents in sorted order.
+    #[test]
+    fn metrics_snapshot_serializes_for_the_wire() {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = Telemetry::open(tmp.path().join("db")).unwrap();
+        populate(&t);
+
+        let snapshot = t
+            .metrics_for(MetricsScope::Commission(COMMISSION), 5)
+            .unwrap();
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(json["totals"]["input_tokens"], 117);
+        assert_eq!(json["agents"][0]["uid"], MAYOR);
+        assert_eq!(json["sessions"][0]["commission"], COMMISSION);
+        let decoded: MetricsSnapshot = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded, snapshot);
     }
 
     #[test]

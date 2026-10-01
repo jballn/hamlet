@@ -1,5 +1,5 @@
 {
-  "config_version": 2,
+  "config_version": 4,
   "daemon_data_dir": ".hamlet-data/sled",
   "podman_bin": "podman",
   "base_image": "docker.io/library/alpine:3.20",
@@ -13,5 +13,17 @@
     "memory": "512m",
     "cpus": "1.0",
     "pids_limit": 256
+  },
+  "sessions": {
+    "ready_timeout_ms": 30000,
+    "stop_grace_ms": 10000,
+    "queue_depth": 64,
+    "latency_spike_ms": 30000,
+    "continue_on_restart": true,
+    "restart": {
+      "max_restarts": 5,
+      "backoff_initial_ms": 1000,
+      "backoff_max_ms": 60000
+    }
   }
 }

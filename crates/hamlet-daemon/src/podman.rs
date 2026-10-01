@@ -42,11 +42,12 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::future::Future;
-use std::io::Cursor;
+use std::io::{self, Cursor};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use hamlet_core::blueprint::Blueprint;
@@ -704,6 +705,54 @@ pub fn exec_argv(
     Ok(argv)
 }
 
+/// `podman exec -i --user <uid>:<uid> --workdir /home/<uid> [-e K=V]…
+/// <container> <cmd…>` argv — the pi session spawn form (ADR-0015 cl. 1).
+/// Pure; env renders in sorted order. The workdir is always the slot's
+/// SPEC §4 home mount (typed source: [`home_container_dir`], never a
+/// format! literal).
+///
+/// # Errors
+///
+/// [`PodmanError`] when the container name fails the §4 sanitizer, the uid
+/// is outside the slot policy, any env key/value fails validation, or the
+/// command is empty/control-char/leading-dash.
+pub fn session_exec_argv(
+    podman_bin: &Path,
+    spec: &SessionExecSpec,
+) -> Result<Vec<String>, PodmanError> {
+    validate_container_name(&spec.container)?;
+    validate_session_uid(spec.uid)?;
+    validate_env(&spec.env)?;
+    validate_cmd(&spec.cmd)?;
+    let uid = spec.uid;
+    let mut argv = vec![
+        podman_bin.to_string_lossy().into_owned(),
+        "exec".to_owned(),
+        "-i".to_owned(),
+        "--user".to_owned(),
+        format!("{uid}:{uid}"),
+        "--workdir".to_owned(),
+        home_container_dir(uid),
+    ];
+    for (key, value) in &spec.env {
+        argv.push("-e".to_owned());
+        argv.push(format!("{key}={value}"));
+    }
+    argv.push(spec.container.clone());
+    argv.extend(spec.cmd.iter().cloned());
+    Ok(argv)
+}
+
+fn validate_session_uid(uid: u32) -> Result<(), PodmanError> {
+    if uid != MAYOR_UID && !(FIRST_AGENT_UID..=LAST_AGENT_UID).contains(&uid) {
+        return Err(PodmanError::invalid(format!(
+            "session uid {uid} is neither the Mayor ({MAYOR_UID}) nor a subagent slot \
+             ({FIRST_AGENT_UID}..={LAST_AGENT_UID})"
+        )));
+    }
+    Ok(())
+}
+
 /// `podman stop --time <grace>` argv. Pure.
 ///
 /// # Errors
@@ -891,20 +940,112 @@ pub fn build_argv(
 // Runtime trait (the seam)
 // ---------------------------------------------------------------------------
 
+/// The three stdio pipes of a live session, detached from the handle so a
+/// supervisor can read stdout, write stdin, and kill/wait **concurrently**
+/// (borrowing accessors cannot be split across tasks — Sprint 03 lesson).
+pub struct ExecPipes {
+    /// The session's stdin (write side).
+    pub stdin: Box<dyn AsyncWrite + Unpin + Send>,
+    /// The session's stdout (read side).
+    pub stdout: Box<dyn AsyncRead + Unpin + Send>,
+    /// The session's stderr (read side).
+    pub stderr: Box<dyn AsyncRead + Unpin + Send>,
+}
+
 /// A live `podman exec` session with piped stdio — the substrate for pi
 /// agent sessions (SPEC §6: JSON-RPC over stdin/stdout, sequential mail
 /// delivery, out-of-band interrupts). Implementors: the real child-process
 /// handle and [`FakeRuntime`]'s in-memory handle.
 pub trait ExecHandle: Send {
-    /// The session's stdin (write side).
-    fn stdin(&mut self) -> &mut (dyn AsyncWrite + Unpin + Send);
-    /// The session's stdout (read side).
-    fn stdout(&mut self) -> &mut (dyn AsyncRead + Unpin + Send);
-    /// The session's stderr (read side).
-    fn stderr(&mut self) -> &mut (dyn AsyncRead + Unpin + Send);
+    /// Detach the stdio pipes. Returns [`None`] when already taken (pipes
+    /// are detached exactly once, right after spawn).
+    fn take_pipes(&mut self) -> Option<ExecPipes>;
+    /// Hard kill (SIGKILL semantics): the process dies promptly and
+    /// [`ExecHandle::wait`] resolves to [`SIGNAL_EXIT_CODE`].
+    fn kill(&mut self) -> Result<(), PodmanError>;
     /// Wait for exit; resolves to the exit code ([`SIGNAL_EXIT_CODE`] when
     /// killed by a signal).
     fn wait<'a>(&'a mut self) -> BoxFuture<'a, Result<i32, PodmanError>>;
+}
+
+/// Spawn a local child process with piped stdio and `kill_on_drop` as an
+/// [`ExecHandle`]. Shared substrate of [`Runtime::spawn_exec`],
+/// [`Runtime::spawn_session`], and the FakeAgent test spawner
+/// ([`spawn_child_exec`] never runs a shell — ADR-0010 cl. 1).
+///
+/// `env` entries are *added to the child's environment*; only the
+/// host-process test spawner passes any (the podman paths carry env as
+/// `-e` argv flags instead, ADR-0015 cl. 1). `argv_label` is the full argv
+/// used for error reporting — it is passed through [`redacted_argv`] before
+/// it can reach any [`PodmanError`], so `-e K=V` values never leak
+/// (CONVENTIONS §6).
+///
+/// # Errors
+///
+/// [`PodmanError::kind`] `Spawn` when the process cannot be started.
+pub fn spawn_child_exec(
+    program: &Path,
+    args: &[String],
+    env: &BTreeMap<String, String>,
+    argv_label: Vec<String>,
+) -> Result<Box<dyn ExecHandle>, PodmanError> {
+    let argv = redacted_argv(&argv_label);
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .map_err(|e| PodmanError::spawn(e.to_string(), argv.clone()))?;
+    // piped() above guarantees these are Some.
+    let pipes = ExecPipes {
+        stdin: Box::new(
+            child
+                .stdin
+                .take()
+                .ok_or_else(|| PodmanError::spawn("exec stdin not piped", argv.clone()))?,
+        ),
+        stdout: Box::new(
+            child
+                .stdout
+                .take()
+                .ok_or_else(|| PodmanError::spawn("exec stdout not piped", argv.clone()))?,
+        ),
+        stderr: Box::new(
+            child
+                .stderr
+                .take()
+                .ok_or_else(|| PodmanError::spawn("exec stderr not piped", argv.clone()))?,
+        ),
+    };
+    Ok(Box::new(ChildExecHandle {
+        child,
+        pipes: Some(pipes),
+        argv,
+    }))
+}
+
+/// Everything needed to render one pi-session spawn argv (ADR-0015 cl. 1):
+/// `podman exec -i --user <uid>:<uid> --workdir /home/<uid> [-e K=V]…
+/// <container> <cmd…>`. Built from typed sources; re-validated at argv
+/// build time like every other spec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionExecSpec {
+    /// Target container name (sanitizer-checked).
+    pub container: String,
+    /// Charter UID slot — the exec *user* (ADR-0010 cl. 3, ADR-0011).
+    pub uid: u32,
+    /// `-e` env: structural parcel env + secret injection + pi hygiene
+    /// vars ([`redacted_argv`] masks the values in every log path).
+    /// Sorted rendering: `BTreeMap` iteration (CONVENTIONS §3 r1).
+    pub env: BTreeMap<String, String>,
+    /// In-container command (`pi --mode rpc …` in production; validated by
+    /// [`validate_cmd`] — no leading-dash flag injection).
+    pub cmd: Vec<String>,
 }
 
 /// The podman seam (CONVENTIONS §9): [`FakeRuntime`] records argv and
@@ -934,6 +1075,15 @@ pub trait Runtime: Send + Sync {
         &'a self,
         container: &'a str,
         cmd: &'a [String],
+    ) -> BoxFuture<'a, Result<Box<dyn ExecHandle>, PodmanError>>;
+
+    /// Spawn a pi session exec (ADR-0015 cl. 1): interactive, as the slot
+    /// uid, in the slot home, with `-e` env injection (secrets ride here
+    /// and nowhere else — SPEC §11.4) and piped stdio for the JSONL
+    /// protocol.
+    fn spawn_session<'a>(
+        &'a self,
+        spec: &'a SessionExecSpec,
     ) -> BoxFuture<'a, Result<Box<dyn ExecHandle>, PodmanError>>;
 
     /// Graceful stop: SIGTERM, then SIGKILL after `grace`.
@@ -1150,42 +1300,19 @@ impl Runtime for PodmanRuntime {
     ) -> BoxFuture<'a, Result<Box<dyn ExecHandle>, PodmanError>> {
         Box::pin(async move {
             let argv = exec_argv(&self.podman_bin, container, cmd, true)?;
-            let mut command = Command::new(&self.podman_bin);
-            command
-                .args(&argv[1..])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .kill_on_drop(true);
-            let mut child = command
-                .spawn()
-                .map_err(|e| PodmanError::spawn(e.to_string(), argv.clone()))?;
-            // piped() above guarantees these are Some.
-            let stdin = Box::new(
-                child
-                    .stdin
-                    .take()
-                    .ok_or_else(|| PodmanError::spawn("exec stdin not piped", argv.clone()))?,
-            ) as Box<dyn AsyncWrite + Unpin + Send>;
-            let stdout = Box::new(
-                child
-                    .stdout
-                    .take()
-                    .ok_or_else(|| PodmanError::spawn("exec stdout not piped", argv.clone()))?,
-            ) as Box<dyn AsyncRead + Unpin + Send>;
-            let stderr = Box::new(
-                child
-                    .stderr
-                    .take()
-                    .ok_or_else(|| PodmanError::spawn("exec stderr not piped", argv.clone()))?,
-            ) as Box<dyn AsyncRead + Unpin + Send>;
-            Ok(Box::new(ChildExecHandle {
-                child,
-                stdin,
-                stdout,
-                stderr,
-                argv: redacted_argv(&argv),
-            }) as Box<dyn ExecHandle>)
+            let args = argv[1..].to_vec();
+            spawn_child_exec(&self.podman_bin, &args, &BTreeMap::new(), argv)
+        })
+    }
+
+    fn spawn_session<'a>(
+        &'a self,
+        spec: &'a SessionExecSpec,
+    ) -> BoxFuture<'a, Result<Box<dyn ExecHandle>, PodmanError>> {
+        Box::pin(async move {
+            let argv = session_exec_argv(&self.podman_bin, spec)?;
+            let args = argv[1..].to_vec();
+            spawn_child_exec(&self.podman_bin, &args, &BTreeMap::new(), argv)
         })
     }
 
@@ -1299,23 +1426,19 @@ impl Runtime for PodmanRuntime {
 /// Real interactive exec session wrapping the tokio child.
 struct ChildExecHandle {
     child: Child,
-    stdin: Box<dyn AsyncWrite + Unpin + Send>,
-    stdout: Box<dyn AsyncRead + Unpin + Send>,
-    stderr: Box<dyn AsyncRead + Unpin + Send>,
+    pipes: Option<ExecPipes>,
     argv: Vec<String>,
 }
 
 impl ExecHandle for ChildExecHandle {
-    fn stdin(&mut self) -> &mut (dyn AsyncWrite + Unpin + Send) {
-        self.stdin.as_mut()
+    fn take_pipes(&mut self) -> Option<ExecPipes> {
+        self.pipes.take()
     }
 
-    fn stdout(&mut self) -> &mut (dyn AsyncRead + Unpin + Send) {
-        self.stdout.as_mut()
-    }
-
-    fn stderr(&mut self) -> &mut (dyn AsyncRead + Unpin + Send) {
-        self.stderr.as_mut()
+    fn kill(&mut self) -> Result<(), PodmanError> {
+        self.child
+            .start_kill()
+            .map_err(|e| PodmanError::spawn(e.to_string(), self.argv.clone()))
     }
 
     fn wait<'a>(&'a mut self) -> BoxFuture<'a, Result<i32, PodmanError>> {
@@ -1483,6 +1606,18 @@ impl FakeRuntime {
         redacted
     }
 
+    fn fake_handle(&self, argv: Vec<String>) -> Result<Box<dyn ExecHandle>, PodmanError> {
+        let recorded = self.record(argv);
+        if let Some(err) = self.take_failure(&recorded) {
+            return Err(err);
+        }
+        let script = self.lock(&self.script);
+        Ok(Box::new(FakeExecHandle::new(
+            script.exec_handle_stdout.clone(),
+            script.exec_handle_code,
+        )) as Box<dyn ExecHandle>)
+    }
+
     fn take_failure(&self, argv: &[String]) -> Option<PodmanError> {
         let mut script = self.lock(&self.script);
         let verb = argv.get(1).map(String::as_str).unwrap_or("");
@@ -1551,17 +1686,17 @@ impl Runtime for FakeRuntime {
     ) -> BoxFuture<'a, Result<Box<dyn ExecHandle>, PodmanError>> {
         Box::pin(async move {
             let argv = exec_argv(&self.podman_bin, container, cmd, true)?;
-            let recorded = self.record(argv);
-            if let Some(err) = self.take_failure(&recorded) {
-                return Err(err);
-            }
-            let script = self.lock(&self.script);
-            Ok(Box::new(FakeExecHandle {
-                stdin: Vec::new(),
-                stdout: Cursor::new(script.exec_handle_stdout.clone()),
-                stderr: Cursor::new(Vec::new()),
-                code: script.exec_handle_code,
-            }) as Box<dyn ExecHandle>)
+            self.fake_handle(argv)
+        })
+    }
+
+    fn spawn_session<'a>(
+        &'a self,
+        spec: &'a SessionExecSpec,
+    ) -> BoxFuture<'a, Result<Box<dyn ExecHandle>, PodmanError>> {
+        Box::pin(async move {
+            let argv = session_exec_argv(&self.podman_bin, spec)?;
+            self.fake_handle(argv)
         })
     }
 
@@ -1684,31 +1819,81 @@ impl Runtime for FakeRuntime {
     }
 }
 
-/// In-memory [`ExecHandle`] handed out by [`FakeRuntime::spawn_exec`]:
-/// stdin writes accumulate in a `Vec<u8>`; stdout replays the scripted
-/// bytes; `wait` resolves to the scripted exit code.
+/// In-memory [`ExecHandle`] handed out by [`FakeRuntime`]: stdin writes
+/// accumulate in a shared `Vec<u8>`; stdout replays the scripted bytes;
+/// `wait` resolves to the scripted exit code ([`SIGNAL_EXIT_CODE`] after
+/// [`ExecHandle::kill`]).
 struct FakeExecHandle {
-    stdin: Vec<u8>,
-    stdout: Cursor<Vec<u8>>,
-    stderr: Cursor<Vec<u8>>,
+    stdin: Arc<Mutex<Vec<u8>>>,
+    stdout: Option<Cursor<Vec<u8>>>,
+    stderr: Option<Cursor<Vec<u8>>>,
     code: i32,
+    killed: bool,
+}
+
+impl FakeExecHandle {
+    fn new(stdout: Vec<u8>, code: i32) -> Self {
+        Self {
+            stdin: Arc::new(Mutex::new(Vec::new())),
+            stdout: Some(Cursor::new(stdout)),
+            stderr: Some(Cursor::new(Vec::new())),
+            code,
+            killed: false,
+        }
+    }
+}
+
+/// [`AsyncWrite`] adapter appending into the fake's shared stdin buffer.
+#[derive(Debug)]
+struct FakeStdin(Arc<Mutex<Vec<u8>>>);
+
+impl AsyncWrite for FakeStdin {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend_from_slice(buf);
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
 }
 
 impl ExecHandle for FakeExecHandle {
-    fn stdin(&mut self) -> &mut (dyn AsyncWrite + Unpin + Send) {
-        &mut self.stdin
+    fn take_pipes(&mut self) -> Option<ExecPipes> {
+        let stdout = self.stdout.take()?;
+        Some(ExecPipes {
+            stdin: Box::new(FakeStdin(Arc::clone(&self.stdin))),
+            stdout: Box::new(stdout),
+            stderr: Box::new(
+                self.stderr
+                    .take()
+                    .unwrap_or_else(|| Cursor::new(Vec::new())),
+            ),
+        })
     }
 
-    fn stdout(&mut self) -> &mut (dyn AsyncRead + Unpin + Send) {
-        &mut self.stdout
-    }
-
-    fn stderr(&mut self) -> &mut (dyn AsyncRead + Unpin + Send) {
-        &mut self.stderr
+    fn kill(&mut self) -> Result<(), PodmanError> {
+        self.killed = true;
+        Ok(())
     }
 
     fn wait<'a>(&'a mut self) -> BoxFuture<'a, Result<i32, PodmanError>> {
-        let code = self.code;
+        let code = if self.killed {
+            SIGNAL_EXIT_CODE
+        } else {
+            self.code
+        };
         Box::pin(async move { Ok(code) })
     }
 }
@@ -2311,13 +2496,15 @@ mod tests {
         let fake = FakeRuntime::new();
         fake.set_exec_handle(b"hello stdout".to_vec(), 3);
         let mut handle = fake.spawn_exec("scribe", &cmd(&["pi"])).await.unwrap();
-        handle
-            .stdin()
+        let mut pipes = handle.take_pipes().expect("pipes detach exactly once");
+        assert!(handle.take_pipes().is_none(), "second take must be None");
+        pipes
+            .stdin
             .write_all(b"{\"jsonrpc\":\"2.0\"}\n")
             .await
             .unwrap();
         let mut buf = String::new();
-        handle.stdout().read_to_string(&mut buf).await.unwrap();
+        pipes.stdout.read_to_string(&mut buf).await.unwrap();
         assert_eq!(buf, "hello stdout");
         assert_eq!(handle.wait().await.unwrap(), 3);
         // The spawn was recorded as an interactive exec.
@@ -2325,6 +2512,180 @@ mod tests {
             fake.argv_log().pop().unwrap(),
             vec!["podman", "exec", "-i", "scribe", "pi"]
         );
+    }
+
+    #[tokio::test]
+    async fn fake_exec_handle_kill_reports_signal_exit() {
+        let fake = FakeRuntime::new();
+        fake.set_exec_handle(Vec::new(), 0);
+        let mut handle = fake.spawn_exec("scribe", &cmd(&["pi"])).await.unwrap();
+        handle.kill().unwrap();
+        assert_eq!(handle.wait().await.unwrap(), SIGNAL_EXIT_CODE);
+    }
+
+    /// Golden: the ADR-0015 cl. 1 session argv — sorted `-e` flags,
+    /// `--user`/`--workdir` from typed sources, values masked by redaction.
+    #[test]
+    fn session_exec_argv_golden() {
+        let mut env = BTreeMap::new();
+        env.insert("PI_TELEMETRY".to_owned(), "0".to_owned());
+        env.insert("ANTHROPIC_API_KEY".to_owned(), "sk-secret".to_owned());
+        let spec = SessionExecSpec {
+            container: "scribe".to_owned(),
+            uid: 1001,
+            env,
+            cmd: cmd(&["pi", "--mode", "rpc", "--continue"]),
+        };
+        let argv = session_exec_argv(Path::new("podman"), &spec).unwrap();
+        assert_eq!(
+            argv,
+            vec![
+                "podman",
+                "exec",
+                "-i",
+                "--user",
+                "1001:1001",
+                "--workdir",
+                "/home/1001",
+                "-e",
+                "ANTHROPIC_API_KEY=sk-secret",
+                "-e",
+                "PI_TELEMETRY=0",
+                "scribe",
+                "pi",
+                "--mode",
+                "rpc",
+                "--continue",
+            ]
+        );
+        // Secrets never reach logs: the redacted form masks every value.
+        assert_eq!(
+            redacted_argv(&argv)[7..11],
+            [
+                "-e",
+                "ANTHROPIC_API_KEY=<redacted>",
+                "-e",
+                "PI_TELEMETRY=<redacted>"
+            ]
+        );
+        // Mayor sessions run as uid 1000 in the manor home.
+        let mayor = SessionExecSpec {
+            uid: MAYOR_UID,
+            container: "manor".to_owned(),
+            ..spec.clone()
+        };
+        let argv = session_exec_argv(Path::new("podman"), &mayor).unwrap();
+        assert_eq!(
+            argv[3..7],
+            ["--user", "1000:1000", "--workdir", "/home/1000"]
+        );
+    }
+
+    #[test]
+    fn session_exec_argv_rejects_bad_inputs() {
+        let base = SessionExecSpec {
+            container: "scribe".to_owned(),
+            uid: 1001,
+            env: BTreeMap::new(),
+            cmd: cmd(&["pi", "--mode", "rpc"]),
+        };
+        let cases: Vec<(SessionExecSpec, &str)> = vec![
+            (
+                SessionExecSpec {
+                    uid: 999,
+                    ..base.clone()
+                },
+                "uid outside slot policy",
+            ),
+            (
+                SessionExecSpec {
+                    uid: 2001,
+                    ..base.clone()
+                },
+                "uid outside slot policy",
+            ),
+            (
+                SessionExecSpec {
+                    container: "--all".to_owned(),
+                    ..base.clone()
+                },
+                "container flag injection",
+            ),
+            (
+                SessionExecSpec {
+                    container: "a/b".to_owned(),
+                    ..base.clone()
+                },
+                "container separator",
+            ),
+            (
+                SessionExecSpec {
+                    cmd: vec!["-pi".to_owned()],
+                    ..base.clone()
+                },
+                "leading-dash command",
+            ),
+            (
+                SessionExecSpec {
+                    cmd: Vec::new(),
+                    ..base.clone()
+                },
+                "empty command",
+            ),
+            (
+                SessionExecSpec {
+                    env: [("BAD KEY".to_owned(), "v".to_owned())]
+                        .into_iter()
+                        .collect(),
+                    ..base.clone()
+                },
+                "env key charset",
+            ),
+            (
+                SessionExecSpec {
+                    env: [("K".to_owned(), "a\nb".to_owned())].into_iter().collect(),
+                    ..base
+                },
+                "env value control chars",
+            ),
+        ];
+        for (spec, why) in cases {
+            assert!(
+                session_exec_argv(Path::new("podman"), &spec).is_err(),
+                "must reject: {why}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fake_spawn_session_records_redacted_argv() {
+        let fake = FakeRuntime::new();
+        let mut env = BTreeMap::new();
+        env.insert(
+            "HAMLET_MODEL_API_KEY".to_owned(),
+            "test-key-do-not-use".to_owned(),
+        );
+        let spec = SessionExecSpec {
+            container: "scribe".to_owned(),
+            uid: 1042,
+            env,
+            cmd: cmd(&["pi", "--mode", "rpc"]),
+        };
+        let _handle = fake.spawn_session(&spec).await.unwrap();
+        let argv = fake.argv_log().pop().unwrap();
+        assert!(argv.contains(&"HAMLET_MODEL_API_KEY=<redacted>".to_owned()));
+        assert!(!argv.join(" ").contains("test-key-do-not-use"));
+        // Failure injection works on the session verb too.
+        fake.fail_next_for(
+            "exec",
+            PodmanErrorKind::NoSuchContainer {
+                name: "x".to_owned(),
+            },
+        );
+        assert!(matches!(
+            fake.spawn_session(&spec).await,
+            Err(e) if matches!(e.kind, PodmanErrorKind::NoSuchContainer { .. })
+        ));
     }
 
     #[test]

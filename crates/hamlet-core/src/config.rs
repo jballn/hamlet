@@ -28,10 +28,14 @@ use serde::{Deserialize, Serialize};
 /// Schema version this build writes and accepts (CONVENTIONS §3).
 ///
 /// v1 → v2 (Sprint 02): additive `resources` section (container resource
-/// limit placeholders). v1 documents still parse — the new field carries
-/// `#[serde(default)]`, so migration is "parse old, write new"; no rewrite
-/// of existing trees is required.
-pub const CONFIG_VERSION: u32 = 2;
+/// limit placeholders). v2 → v3 (Sprint 03, ADR-0015 cl. 4): additive
+/// `sessions` section (session supervision: pi model selection, readiness/
+/// stop timing, delivery-queue bound, restart policy). v3 → v4 (Sprint 03
+/// step 04, ADR-0016): additive `sessions.latency_spike_ms` (stream
+/// telemetry spike threshold). Older documents still parse — new fields
+/// carry `#[serde(default)]`, so migration is "parse old, write new"; no
+/// rewrite of existing trees is required.
+pub const CONFIG_VERSION: u32 = 4;
 
 /// Default daemon data dir (sled telemetry location). Relative paths
 /// resolve against the *working directory containing* the village root —
@@ -58,6 +62,23 @@ const DEFAULT_CONTAINER_MEMORY: &str = "512m";
 const DEFAULT_CONTAINER_CPUS: &str = "1.0";
 /// Default container PID limit (`--pids-limit`); fork-bomb brace.
 const DEFAULT_CONTAINER_PIDS_LIMIT: u64 = 256;
+/// Default readiness-probe timeout for spawned sessions (ADR-0015 cl. 4).
+const DEFAULT_SESSION_READY_TIMEOUT_MS: u64 = 30_000;
+/// Default graceful-stop window before SIGKILL (ADR-0015 cl. 4).
+const DEFAULT_SESSION_STOP_GRACE_MS: u64 = 10_000;
+/// Default per-session delivery-queue bound (Sprint 03 step 03).
+const DEFAULT_SESSION_QUEUE_DEPTH: u32 = 64;
+/// Default stream latency-spike threshold (Sprint 03 step 04, ADR-0016):
+/// any measured stream span (agent run/turn, tool call, delivery or
+/// interrupt acknowledgment, mid-run frame gap) at or above this many ms is
+/// recorded as a `latency.v1` spike.
+const DEFAULT_SESSION_LATENCY_SPIKE_MS: u64 = 30_000;
+/// Default consecutive auto-restart budget (ADR-0015 cl. 4).
+const DEFAULT_SESSION_MAX_RESTARTS: u32 = 5;
+/// Default first restart-backoff delay (ADR-0015 cl. 4).
+const DEFAULT_SESSION_BACKOFF_INITIAL_MS: u64 = 1_000;
+/// Default restart-backoff cap (ADR-0015 cl. 4).
+const DEFAULT_SESSION_BACKOFF_MAX_MS: u64 = 60_000;
 
 /// Orchestrator/engine settings — the typed form of `.hamlet/config.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,6 +110,11 @@ pub struct Config {
     /// defaults apply.
     #[serde(default)]
     pub resources: ResourcesConfig,
+    /// Agent-session supervision (SPEC §6; keys fixed by ADR-0015 cl. 4):
+    /// pi model selection, readiness/stop timing, delivery-queue bound,
+    /// restart policy. Absent in v1/v2 documents; defaults apply.
+    #[serde(default)]
+    pub sessions: SessionsConfig,
 }
 
 impl Default for Config {
@@ -102,6 +128,7 @@ impl Default for Config {
             log_level: LogLevel::default(),
             dispatch: DispatchConfig::default(),
             resources: ResourcesConfig::default(),
+            sessions: SessionsConfig::default(),
         }
     }
 }
@@ -176,7 +203,8 @@ impl Config {
             )));
         }
         self.dispatch.validate()?;
-        self.resources.validate()
+        self.resources.validate()?;
+        self.sessions.validate()
     }
 
     /// Resolve [`Config::daemon_data_dir`] for the village rooted at
@@ -319,6 +347,182 @@ impl ResourcesConfig {
             return Err(ConfigError::Invalid(format!(
                 "resources.pids_limit must be in 1..=65535, got {}",
                 self.pids_limit
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Agent-session supervision settings (`config.json` `sessions`; keys fixed
+/// by ADR-0015 cl. 4 — Sprint 03 step 02 consumes them). Timeouts are
+/// daemon-side wall-clock *behavior* (probe/sleep durations), never state
+/// inputs (CONVENTIONS §3 r4): the restart *schedule* derives purely from
+/// the persisted `restart_count` via [`RestartConfig::backoff_ms`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionsConfig {
+    /// pi `--provider` value; `None` = pi's own default. Charset-validated:
+    /// lands verbatim in argv (ADR-0010 cl. 2), never a shell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// pi `--model` value; `None` = provider default. Same charset rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Readiness window after spawn: the `get_state` probe (ADR-0015 cl. 3)
+    /// must be answered within this many ms, else the session is `crashed`
+    /// and the restart policy runs. Range 1_000..=600_000.
+    pub ready_timeout_ms: u64,
+    /// Graceful-stop window: close stdin (pi's orderly-shutdown signal) +
+    /// SIGTERM, then SIGKILL after this many ms. Range 500..=300_000.
+    pub stop_grace_ms: u64,
+    /// Per-session delivery-queue bound; overflow is a typed bounce back to
+    /// the sender (Sprint 03 step 03). Range 1..=10_000.
+    pub queue_depth: u32,
+    /// Stream latency-spike threshold in ms (ADR-0016): a measured span at
+    /// or above it is appended to `latency.v1`. Spans measured from the
+    /// JSON-RPC stream: `agent-run`, `agent-turn`, `tool-call`,
+    /// `stream-gap` (mid-run frame gap), `delivery-ack`, `interrupt-ack`.
+    /// Range 1..=3_600_000. Absent in v1–v3 documents; the default applies.
+    #[serde(default = "default_latency_spike_ms")]
+    pub latency_spike_ms: u64,
+    /// When true, restarted incarnations pass pi `--continue` so the agent
+    /// resumes its own session history from the parcel home (context
+    /// continuity across supervised restarts; ADR-0015 cl. 1).
+    pub continue_on_restart: bool,
+    /// Restart policy bounds + backoff.
+    #[serde(default)]
+    pub restart: RestartConfig,
+}
+
+impl Default for SessionsConfig {
+    fn default() -> Self {
+        Self {
+            provider: None,
+            model: None,
+            ready_timeout_ms: DEFAULT_SESSION_READY_TIMEOUT_MS,
+            stop_grace_ms: DEFAULT_SESSION_STOP_GRACE_MS,
+            queue_depth: DEFAULT_SESSION_QUEUE_DEPTH,
+            latency_spike_ms: DEFAULT_SESSION_LATENCY_SPIKE_MS,
+            continue_on_restart: true,
+            restart: RestartConfig::default(),
+        }
+    }
+}
+
+/// serde default for [`SessionsConfig::latency_spike_ms`] so v1–v3
+/// documents keep parsing (additive migration, CONVENTIONS §3 r3).
+fn default_latency_spike_ms() -> u64 {
+    DEFAULT_SESSION_LATENCY_SPIKE_MS
+}
+
+impl SessionsConfig {
+    /// # Errors
+    ///
+    /// [`ConfigError::Invalid`] naming the offending field.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        for (field, value) in [
+            ("sessions.provider", &self.provider),
+            ("sessions.model", &self.model),
+        ] {
+            if let Some(value) = value {
+                let ok = !value.is_empty()
+                    && !value.starts_with('-')
+                    && value.chars().all(|c| !c.is_whitespace() && !c.is_control());
+                if !ok {
+                    return Err(ConfigError::Invalid(format!(
+                        "{field} must be a non-empty single argv token (no leading '-', no whitespace/control characters), got {value:?}"
+                    )));
+                }
+            }
+        }
+        if !(1_000..=600_000).contains(&self.ready_timeout_ms) {
+            return Err(ConfigError::Invalid(format!(
+                "sessions.ready_timeout_ms must be in 1000..=600000, got {}",
+                self.ready_timeout_ms
+            )));
+        }
+        if !(500..=300_000).contains(&self.stop_grace_ms) {
+            return Err(ConfigError::Invalid(format!(
+                "sessions.stop_grace_ms must be in 500..=300000, got {}",
+                self.stop_grace_ms
+            )));
+        }
+        if self.queue_depth == 0 || self.queue_depth > 10_000 {
+            return Err(ConfigError::Invalid(format!(
+                "sessions.queue_depth must be in 1..=10000, got {}",
+                self.queue_depth
+            )));
+        }
+        if self.latency_spike_ms == 0 || self.latency_spike_ms > 3_600_000 {
+            return Err(ConfigError::Invalid(format!(
+                "sessions.latency_spike_ms must be in 1..=3600000, got {}",
+                self.latency_spike_ms
+            )));
+        }
+        self.restart.validate()
+    }
+}
+
+/// Restart policy (SPEC §6 supervision; ADR-0015 cl. 4). After
+/// `max_restarts` consecutive auto-restarts *without the session reaching a
+/// task boundary*, the session stays `crashed` permanently (lineage stamp
+/// to TITLE.md, trace to sled). The `restart_count` resets to 0 on the
+/// first `agent_settled` of a life.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestartConfig {
+    /// Consecutive auto-restart budget; 0 disables auto-restart. 0..=100.
+    pub max_restarts: u32,
+    /// First backoff delay, ms. 100..=600_000.
+    pub backoff_initial_ms: u64,
+    /// Backoff cap, ms. `backoff_initial_ms`..=3_600_000.
+    pub backoff_max_ms: u64,
+}
+
+impl Default for RestartConfig {
+    fn default() -> Self {
+        Self {
+            max_restarts: DEFAULT_SESSION_MAX_RESTARTS,
+            backoff_initial_ms: DEFAULT_SESSION_BACKOFF_INITIAL_MS,
+            backoff_max_ms: DEFAULT_SESSION_BACKOFF_MAX_MS,
+        }
+    }
+}
+
+impl RestartConfig {
+    /// Delay before auto-restart number `restart_count + 1`, or [`None`]
+    /// when the budget is exhausted. Delegates to the pure schedule in
+    /// [`crate::session::restart_backoff_ms`].
+    #[must_use]
+    pub fn backoff_ms(&self, restart_count: u32) -> Option<u64> {
+        crate::session::restart_backoff_ms(
+            self.backoff_initial_ms,
+            self.backoff_max_ms,
+            self.max_restarts,
+            restart_count,
+        )
+    }
+
+    /// # Errors
+    ///
+    /// [`ConfigError::Invalid`] naming the offending field.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.max_restarts > 100 {
+            return Err(ConfigError::Invalid(format!(
+                "sessions.restart.max_restarts must be in 0..=100, got {}",
+                self.max_restarts
+            )));
+        }
+        if !(100..=600_000).contains(&self.backoff_initial_ms) {
+            return Err(ConfigError::Invalid(format!(
+                "sessions.restart.backoff_initial_ms must be in 100..=600000, got {}",
+                self.backoff_initial_ms
+            )));
+        }
+        if self.backoff_max_ms < self.backoff_initial_ms || self.backoff_max_ms > 3_600_000 {
+            return Err(ConfigError::Invalid(format!(
+                "sessions.restart.backoff_max_ms must be in backoff_initial_ms..=3600000, got {}",
+                self.backoff_max_ms
             )));
         }
         Ok(())
@@ -518,7 +722,7 @@ mod tests {
     fn default_config_render_golden() {
         let expected = "\
 {
-  \"config_version\": 2,
+  \"config_version\": 4,
   \"daemon_data_dir\": \".hamlet-data/sled\",
   \"podman_bin\": \"podman\",
   \"base_image\": \"docker.io/library/alpine:3.20\",
@@ -532,6 +736,18 @@ mod tests {
     \"memory\": \"512m\",
     \"cpus\": \"1.0\",
     \"pids_limit\": 256
+  },
+  \"sessions\": {
+    \"ready_timeout_ms\": 30000,
+    \"stop_grace_ms\": 10000,
+    \"queue_depth\": 64,
+    \"latency_spike_ms\": 30000,
+    \"continue_on_restart\": true,
+    \"restart\": {
+      \"max_restarts\": 5,
+      \"backoff_initial_ms\": 1000,
+      \"backoff_max_ms\": 60000
+    }
   }
 }
 ";
@@ -560,6 +776,192 @@ mod tests {
         let parsed = Config::parse(v1).expect("v1 must still parse");
         assert_eq!(parsed.config_version, 1);
         assert_eq!(parsed.resources, ResourcesConfig::default());
+    }
+
+    /// v2 → v3 migration is additive: a v2 document (no `sessions` block)
+    /// still parses, defaults fill in, and the declared version is left
+    /// untouched (CONVENTIONS §3.3 — no silent rewrites).
+    #[test]
+    fn v2_config_parses_with_default_sessions() {
+        let v2 = "\
+{
+  \"config_version\": 2,
+  \"daemon_data_dir\": \".hamlet-data/sled\",
+  \"podman_bin\": \"podman\",
+  \"base_image\": \"docker.io/library/alpine:3.20\",
+  \"web_listen_addr\": \"127.0.0.1:8787\",
+  \"log_level\": \"info\",
+  \"dispatch\": {
+    \"enabled\": false,
+    \"timeout_secs\": 30
+  },
+  \"resources\": {
+    \"memory\": \"512m\",
+    \"cpus\": \"1.0\",
+    \"pids_limit\": 256
+  }
+}
+";
+        let parsed = Config::parse(v2).expect("v2 must still parse");
+        assert_eq!(parsed.config_version, 2);
+        assert_eq!(parsed.sessions, SessionsConfig::default());
+        assert_eq!(parsed.resources, ResourcesConfig::default());
+    }
+
+    /// v3 → v4 migration is additive: a v3 document (a `sessions` block
+    /// without `latency_spike_ms`) still parses and the threshold takes its
+    /// default (CONVENTIONS §3 r3 — no silent rewrites).
+    #[test]
+    fn v3_config_parses_with_default_latency_spike_threshold() {
+        let v3 = "\
+{
+  \"config_version\": 3,
+  \"daemon_data_dir\": \".hamlet-data/sled\",
+  \"podman_bin\": \"podman\",
+  \"base_image\": \"docker.io/library/alpine:3.20\",
+  \"web_listen_addr\": \"127.0.0.1:8787\",
+  \"log_level\": \"info\",
+  \"dispatch\": {
+    \"enabled\": false,
+    \"timeout_secs\": 30
+  },
+  \"sessions\": {
+    \"ready_timeout_ms\": 30000,
+    \"stop_grace_ms\": 10000,
+    \"queue_depth\": 64,
+    \"continue_on_restart\": true
+  }
+}
+";
+        let parsed = Config::parse(v3).expect("v3 must still parse");
+        assert_eq!(parsed.config_version, 3);
+        assert_eq!(parsed.sessions.latency_spike_ms, 30_000);
+        assert_eq!(parsed.sessions.queue_depth, 64);
+    }
+
+    #[test]
+    fn sessions_validation_matrix() {
+        let bad = [
+            SessionsConfig {
+                provider: Some("-rf".to_string()),
+                ..Default::default()
+            },
+            SessionsConfig {
+                provider: Some("with space".to_string()),
+                ..Default::default()
+            },
+            SessionsConfig {
+                provider: Some("".to_string()),
+                ..Default::default()
+            },
+            SessionsConfig {
+                model: Some("bad\nmodel".to_string()),
+                ..Default::default()
+            },
+            SessionsConfig {
+                ready_timeout_ms: 999,
+                ..Default::default()
+            },
+            SessionsConfig {
+                ready_timeout_ms: 600_001,
+                ..Default::default()
+            },
+            SessionsConfig {
+                stop_grace_ms: 499,
+                ..Default::default()
+            },
+            SessionsConfig {
+                stop_grace_ms: 300_001,
+                ..Default::default()
+            },
+            SessionsConfig {
+                queue_depth: 0,
+                ..Default::default()
+            },
+            SessionsConfig {
+                queue_depth: 10_001,
+                ..Default::default()
+            },
+            SessionsConfig {
+                restart: RestartConfig {
+                    max_restarts: 101,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            SessionsConfig {
+                restart: RestartConfig {
+                    backoff_initial_ms: 99,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            SessionsConfig {
+                restart: RestartConfig {
+                    backoff_max_ms: 999, // < initial (1000)
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            SessionsConfig {
+                restart: RestartConfig {
+                    backoff_max_ms: 3_600_001,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            SessionsConfig {
+                latency_spike_ms: 0,
+                ..Default::default()
+            },
+            SessionsConfig {
+                latency_spike_ms: 3_600_001,
+                ..Default::default()
+            },
+        ];
+        for cfg in bad {
+            assert!(
+                matches!(cfg.validate(), Err(ConfigError::Invalid(_))),
+                "must reject: {cfg:?}"
+            );
+        }
+        let good = [
+            SessionsConfig::default(),
+            SessionsConfig {
+                provider: Some("anthropic".to_string()),
+                model: Some("anthropic/claude-sonnet-4-5".to_string()),
+                ..Default::default()
+            },
+            SessionsConfig {
+                restart: RestartConfig {
+                    max_restarts: 0, // auto-restart disabled
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            SessionsConfig {
+                latency_spike_ms: 1, // tightest legal threshold
+                ..Default::default()
+            },
+        ];
+        for cfg in good {
+            assert!(cfg.validate().is_ok(), "must accept: {cfg:?}");
+        }
+    }
+
+    #[test]
+    fn restart_backoff_delegates_to_session_schedule() {
+        let restart = RestartConfig::default();
+        assert_eq!(restart.backoff_ms(0), Some(1_000));
+        assert_eq!(restart.backoff_ms(4), Some(16_000));
+        assert_eq!(restart.backoff_ms(5), None); // budget (5) exhausted
+                                                 // Cap honored.
+        let capped = RestartConfig {
+            backoff_initial_ms: 1_000,
+            backoff_max_ms: 3_000,
+            max_restarts: 10,
+        };
+        assert_eq!(capped.backoff_ms(3), Some(3_000));
     }
 
     #[test]

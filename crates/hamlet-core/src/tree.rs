@@ -38,6 +38,7 @@ const GOSSIP: &str = "gossip";
 const PATRONS: &str = "patrons";
 const COURIER: &str = "courier";
 const MAIL: &str = "mail";
+const QUEUES: &str = "queues";
 const FREIGHT: &str = "freight";
 const DISPATCH: &str = "dispatch";
 const OUTBOX: &str = "outbox";
@@ -308,6 +309,23 @@ impl HamletTree {
     #[must_use]
     pub fn courier_mail_recipient(&self, recipient: &SafeName) -> PathBuf {
         self.join(&[COURIER, MAIL, recipient.as_str()])
+    }
+
+    /// `courier/queues/` — undelivered per-session delivery queues
+    /// (daemon-owned spool, file-as-truth for SPEC §6 sequential
+    /// delivery; location decision recorded in the Sprint 03 HANDOFF).
+    /// Lazy: created on first enqueue, never by `ensure`.
+    #[must_use]
+    pub fn courier_queues(&self) -> PathBuf {
+        self.join(&[COURIER, QUEUES])
+    }
+
+    /// `courier/queues/<uid>.jsonl` — the undelivered FIFO queue of one
+    /// session slot: one `SessionEnvelope` JSONL record per line. The uid
+    /// is a typed `u32` (no externally-sourced name is involved).
+    #[must_use]
+    pub fn session_queue(&self, uid: u32) -> PathBuf {
+        self.join(&[COURIER, QUEUES, &format!("{uid}.jsonl")])
     }
 
     /// `courier/freight/` — shared folder, POSIX ACL sandboxes.
@@ -625,6 +643,14 @@ mod tests {
         assert_eq!(
             tree.courier_mail_recipient(&name("1001")),
             PathBuf::from("/v/.hamlet/courier/mail/1001")
+        );
+        assert_eq!(
+            tree.courier_queues(),
+            PathBuf::from("/v/.hamlet/courier/queues")
+        );
+        assert_eq!(
+            tree.session_queue(1001),
+            PathBuf::from("/v/.hamlet/courier/queues/1001.jsonl")
         );
         assert_eq!(
             tree.vault_artifact(&name("report.md")),

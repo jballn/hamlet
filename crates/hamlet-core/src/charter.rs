@@ -7,11 +7,12 @@
 //! with explicit version steps. No wall-clock reads anywhere in state
 //! derivation (timestamps are telemetry, never state inputs).
 //!
-//! **Normative content groups** (SPEC §11.1, v1 shape — later sprints extend
+//! **Normative content groups** (SPEC §11.1; later sprints extend
 //! additively): [`slots`](crate::slots) (uid → identity record), `agents`
 //! (registry refs), `commissions` (id → state placeholder), `parcels` (uid
-//! lease records), `decrees` (queue status placeholder), `webhooks` (config
-//! ref names).
+//! lease records), `sessions` (uid → supervised session record, charter v2,
+//! ADR-0015), `decrees` (queue status placeholder), `webhooks` (config ref
+//! names).
 //!
 //! **Persistence protocol** (CONVENTIONS §3 rule 2; ADR-0006):
 //! [`Charter::save_atomic`] serializes to a *unique* temp file in the same
@@ -36,21 +37,28 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::sanitize::SafeName;
+use crate::session::{SessionId, SessionRecord};
 use crate::slots::{self, SlotError, SlotTable, FIRST_AGENT_UID, LAST_AGENT_UID, MAYOR_UID};
 
 /// Current charter schema version. Mandatory field (CONVENTIONS §3 rule 3);
 /// migrations are additive-only with explicit version steps (ADR-0004).
-pub const CHARTER_VERSION: u32 = 1;
+///
+/// v1 → v2 (Sprint 03, ADR-0015): additive `sessions` group — supervised
+/// session identity/status/restart counter per UID slot. v1 files still
+/// load: the migration step stamps the version; serde defaults fill the
+/// group.
+pub const CHARTER_VERSION: u32 = 2;
 
 /// Master state map — the typed form of `.hamlet/charter.json`.
 ///
 /// All groups are `BTreeMap`/`BTreeSet` (sorted keys fall out naturally) and
 /// serialize away when empty, so a fresh village renders exactly
-/// `{"charter_version": 1}`. Parsing is strict (`deny_unknown_fields`):
-/// unknown fields at a *supported* version are corruption, not tolerance —
-/// newer files are rejected earlier by the version check.
+/// `{"charter_version": 2}`. Parsing is strict (`deny_unknown_fields` via
+/// the [`StrictCharter`] wire mirror): unknown fields are corruption at
+/// every supported version, older-version documents simply omit newer
+/// groups (additive migration fills defaults), and newer files are rejected
+/// by the version check.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Charter {
     /// Schema version; see [`CHARTER_VERSION`].
     pub charter_version: u32,
@@ -75,6 +83,12 @@ pub struct Charter {
     /// `tavern/patrons/` (SPEC §10); the slot mapping persists regardless.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub parcels: BTreeMap<u32, ParcelLease>,
+
+    /// Supervised session records (SPEC §6; ADR-0015): uid → live-or-last
+    /// session identity, status, and consecutive-restart counter. Added in
+    /// charter v2; Sprint 03 supervision owns the transitions.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sessions: BTreeMap<u32, SessionRecord>,
 
     /// Decree queue status: decree id → placeholder. Sprint 05 owns the
     /// decree vocabulary (SPEC §7); v1 records queue position only.
@@ -225,6 +239,7 @@ impl Charter {
             agents: BTreeMap::new(),
             commissions: BTreeMap::new(),
             parcels: BTreeMap::new(),
+            sessions: BTreeMap::new(),
             decrees: BTreeMap::new(),
             webhooks: BTreeSet::new(),
         }
@@ -285,7 +300,12 @@ impl Charter {
     ///
     /// Same as [`Charter::load`], minus I/O.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let charter = match serde_json::from_slice::<Self>(bytes) {
+        // Parsing is strict (deny_unknown_fields) against the UNION of
+        // supported schemas: an older-version document simply *omits* newer
+        // groups (serde defaults fill them — additive migration,
+        // CONVENTIONS §3 r3), while unknown fields are corruption at any
+        // supported version.
+        let charter = match serde_json::from_slice::<StrictCharter>(bytes).map(Charter::from) {
             Ok(charter) => charter,
             Err(err) => {
                 // A clean Value parse with a too-new version is a version
@@ -467,6 +487,24 @@ impl Charter {
                 }
             }
         }
+        for (&uid, session) in &self.sessions {
+            if session.id.uid != uid {
+                return Err(invariant(format!(
+                    "sessions key {uid} does not match session uid {}",
+                    session.id.uid
+                )));
+            }
+            if SessionId::new(uid, session.id.incarnation).is_err() {
+                return Err(invariant(format!(
+                    "session uid {uid} outside {MAYOR_UID} and {FIRST_AGENT_UID}-{LAST_AGENT_UID}"
+                )));
+            }
+            if !self.slots.contains_key(&uid) {
+                return Err(invariant(format!(
+                    "session for uid {uid} has no slot record (slots are permanent; this is corruption)"
+                )));
+            }
+        }
         Ok(())
     }
 }
@@ -496,9 +534,10 @@ fn gate_version(found: u32) -> Result<()> {
 /// if current.charter_version == 1 { current = step_1_to_2(current)?; }
 /// ```
 fn migrate(charter: Charter) -> Result<Charter> {
-    let current = charter;
-    // No steps exist yet: anything below CHARTER_VERSION that survived the
-    // gate is a schema bug, not a migratable file.
+    let mut current = charter;
+    if current.charter_version == 1 {
+        current = step_1_to_2(current)?;
+    }
     if current.charter_version != CHARTER_VERSION {
         return Err(invariant(format!(
             "no migration step from charter_version {} to {CHARTER_VERSION}",
@@ -507,6 +546,54 @@ fn migrate(charter: Charter) -> Result<Charter> {
     }
     current.validate()?;
     Ok(current)
+}
+
+/// v1 → v2 (Sprint 03, ADR-0015): additive `sessions` group. Serde
+/// defaults already populated the group at parse time; the step only stamps
+/// the new version — never renames, retypes, or drops state.
+fn step_1_to_2(mut charter: Charter) -> Result<Charter> {
+    charter.charter_version = 2;
+    Ok(charter)
+}
+
+/// Unknown-fields-strict wire mirror of [`Charter`] (v2 schema). Public
+/// parsing is lenient *only* for documents declaring an older version —
+/// additive migration (CONVENTIONS §3 r3) means a v1 file simply lacks the
+/// newer groups; it must never mean new fields are silently dropped from a
+/// current-version file.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictCharter {
+    charter_version: u32,
+    #[serde(default)]
+    slots: SlotTable,
+    #[serde(default)]
+    agents: BTreeMap<SafeName, AgentRef>,
+    #[serde(default)]
+    commissions: BTreeMap<u64, CommissionStatus>,
+    #[serde(default)]
+    parcels: BTreeMap<u32, ParcelLease>,
+    #[serde(default)]
+    sessions: BTreeMap<u32, SessionRecord>,
+    #[serde(default)]
+    decrees: BTreeMap<u64, DecreeStatus>,
+    #[serde(default)]
+    webhooks: BTreeSet<SafeName>,
+}
+
+impl From<StrictCharter> for Charter {
+    fn from(wire: StrictCharter) -> Self {
+        Self {
+            charter_version: wire.charter_version,
+            slots: wire.slots,
+            agents: wire.agents,
+            commissions: wire.commissions,
+            parcels: wire.parcels,
+            sessions: wire.sessions,
+            decrees: wire.decrees,
+            webhooks: wire.webhooks,
+        }
+    }
 }
 
 /// Build a [`CharterError::Corrupt`] with the offending byte offset derived
@@ -575,6 +662,7 @@ fn set_canonical_mode(_path: &Path) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use crate::sanitize::sanitize_name;
+    use crate::session::SessionStatus;
     use crate::slots::{SlotRecord, SlotStatus, AGENT_SLOT_CAPACITY};
 
     fn name(s: &str) -> SafeName {
@@ -598,6 +686,14 @@ mod tests {
         );
         charter.decrees.insert(1, DecreeStatus::Queued);
         charter.webhooks.insert(name("github"));
+        charter.sessions.insert(
+            ada,
+            SessionRecord {
+                id: SessionId::new(ada, 0).unwrap(),
+                status: SessionStatus::Idle,
+                restart_count: 0,
+            },
+        );
         charter
     }
 
@@ -607,7 +703,7 @@ mod tests {
     fn empty_charter_render_golden() {
         assert_eq!(
             Charter::empty().render(),
-            "{\n  \"charter_version\": 1\n}\n"
+            "{\n  \"charter_version\": 2\n}\n"
         );
     }
 
@@ -618,6 +714,101 @@ mod tests {
         assert_eq!(parsed, Charter::empty());
         assert_eq!(parsed.charter_version, CHARTER_VERSION);
         assert_eq!(Charter::default(), Charter::empty());
+    }
+
+    /// Committed migration vector (ADR-0015 cl. 4): a v1-rendered charter
+    /// loads as v2 with the empty `sessions` group defaulted in; all other
+    /// state untouched.
+    #[test]
+    fn v1_charter_migrates_to_v2_additively() {
+        let v1 = br#"{
+  "agents": { "ada": { "slot": 1001 } },
+  "charter_version": 1,
+  "slots": {
+    "1000": { "identity": "manor", "status": "active" },
+    "1001": { "identity": "ada", "status": "active" }
+  }
+}"#;
+        let mut charter = Charter::from_bytes(v1).unwrap();
+        assert_eq!(charter.charter_version, 2);
+        assert!(charter.sessions.is_empty());
+        assert_eq!(charter.slots.len(), 2);
+        // The supervisor writes the first session record; save/load
+        // round-trips the v2 shape.
+        charter.sessions.insert(
+            1001,
+            SessionRecord {
+                id: SessionId::new(1001, 0).unwrap(),
+                status: SessionStatus::Starting,
+                restart_count: 0,
+            },
+        );
+        let rendered = charter.render();
+        assert!(rendered.contains("\"charter_version\": 2"));
+        assert_eq!(Charter::from_bytes(rendered.as_bytes()).unwrap(), charter);
+    }
+
+    /// Unknown fields are corruption at every supported version — union-
+    /// strict parsing is not relaxed for older declared versions.
+    #[test]
+    fn v2_charter_rejects_unknown_fields() {
+        let bad = br#"{"charter_version": 2, "surprise": true}"#;
+        assert!(matches!(
+            Charter::from_bytes(bad),
+            Err(CharterError::Corrupt { .. })
+        ));
+        let bad_session = br#"{
+  "charter_version": 2,
+  "slots": { "1001": { "identity": "ada", "status": "active" } },
+  "sessions": { "1001": { "id": { "uid": 1001, "incarnation": 0 }, "status": "idle", "restart_count": 0, "extra": 1 } }
+}"#;
+        assert!(matches!(
+            Charter::from_bytes(bad_session),
+            Err(CharterError::Corrupt { .. })
+        ));
+    }
+
+    /// Sessions-group invariants: map key == `id.uid`; the slot must exist.
+    #[test]
+    fn session_invariants_reject_lying_charters() {
+        let key_mismatch = br#"{
+  "charter_version": 2,
+  "slots": {
+    "1001": { "identity": "ada", "status": "active" },
+    "1002": { "identity": "grace", "status": "active" }
+  },
+  "sessions": { "1001": { "id": { "uid": 1002, "incarnation": 0 }, "status": "idle", "restart_count": 0 } }
+}"#;
+        match Charter::from_bytes(key_mismatch) {
+            Err(CharterError::Invariant { message }) => {
+                assert!(message.contains("does not match session uid"), "{message}")
+            }
+            other => panic!("expected key/uid Invariant, got {other:?}"),
+        }
+        let missing_slot = br#"{
+  "charter_version": 2,
+  "sessions": { "1001": { "id": { "uid": 1001, "incarnation": 0 }, "status": "idle", "restart_count": 0 } }
+}"#;
+        match Charter::from_bytes(missing_slot) {
+            Err(CharterError::Invariant { message }) => {
+                assert!(message.contains("has no slot record"), "{message}")
+            }
+            other => panic!("expected missing-slot Invariant, got {other:?}"),
+        }
+        // Constructed in memory, validate() must catch the same lie.
+        let mut charter = Charter::empty();
+        charter.sessions.insert(
+            1001,
+            SessionRecord {
+                id: SessionId::new(1001, 0).unwrap(),
+                status: SessionStatus::Crashed,
+                restart_count: 5,
+            },
+        );
+        assert!(matches!(
+            charter.validate(),
+            Err(CharterError::Invariant { .. })
+        ));
     }
 
     /// Committed golden vector: full canonical rendering — groups sorted
@@ -631,7 +822,7 @@ mod tests {
       \"slot\": 1001
     }
   },
-  \"charter_version\": 1,
+  \"charter_version\": 2,
   \"commissions\": {
     \"1\": \"open\"
   },
@@ -642,6 +833,16 @@ mod tests {
     \"1001\": {
       \"identity\": \"ada\",
       \"stasis\": false
+    }
+  },
+  \"sessions\": {
+    \"1001\": {
+      \"id\": {
+        \"incarnation\": 0,
+        \"uid\": 1001
+      },
+      \"restart_count\": 0,
+      \"status\": \"idle\"
     }
   },
   \"slots\": {
@@ -709,21 +910,21 @@ mod tests {
 
     #[test]
     fn future_version_is_rejected_before_migration() {
-        let err = Charter::from_bytes(br#"{"charter_version": 2}"#).unwrap_err();
+        let err = Charter::from_bytes(br#"{"charter_version": 3}"#).unwrap_err();
         assert!(
             matches!(
                 err,
                 CharterError::UnsupportedVersion {
-                    found: 2,
+                    found: 3,
                     supported: CHARTER_VERSION
                 }
             ),
             "{err}"
         );
         let err =
-            Charter::from_bytes(br#"{"charter_version": 2, "brand_new_group": 42}"#).unwrap_err();
+            Charter::from_bytes(br#"{"charter_version": 3, "brand_new_group": 42}"#).unwrap_err();
         assert!(
-            matches!(err, CharterError::UnsupportedVersion { found: 2, .. }),
+            matches!(err, CharterError::UnsupportedVersion { found: 3, .. }),
             "{err}"
         );
         let err = Charter::from_bytes(br#"{"charter_version": 0}"#).unwrap_err();

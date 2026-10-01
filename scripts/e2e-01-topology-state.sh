@@ -51,7 +51,7 @@ check "T1 charter.json mode 0644"      "644" "$(mode "$R/charter.json")"
 check "T1 config.json mode 0644"       "644" "$(mode "$R/config.json")"
 check "T1 .env mode EXACTLY 0600"      "600" "$(mode "$R/.env")"
 check "T1 empty charter golden" '{
-  "charter_version": 1
+  "charter_version": 2
 }' "$(cat "$R/charter.json")"
 
 # --- T2: re-init idempotency (byte + mode stability) ------------------------

@@ -60,6 +60,10 @@ ADRs are immutable. To change a decision:
 | [0012](0012-blueprint-execution-derived-images.md) | Blueprint execution: derived parcel images & pinned toolchains | Accepted |
 | [0013](0013-pkgcache-trust-model.md) | pkgcache trust model: shared mirror, digest-verified staging | Accepted |
 | [0014](0014-parcel-env-policy.md) | Parcel env policy: bootstrap-derived prefixes, refused keys | Accepted |
+| [0015](0015-session-protocol.md) | Session protocol: pi RPC binding, envelopes, interrupt_and_steer | Accepted (Sprint 03 prompts cite it as "ADR-0008") |
+| [0016](0016-stream-telemetry-extraction.md) | Stream metric extraction: spike definition & usage accounting | Accepted |
+| [0017](0017-telemetry-sink-and-query-surface.md) | Telemetry sink: non-blocking extraction, bounded evidence, query surface | Accepted |
+| [0018](0018-metrics-liveness.md) | Metrics liveness: bounded staleness for the live query surface | Accepted (refines ADR-0017 cl. 2) |
 
 Keep this index updated in the same commit that adds/changes an ADR.
 
@@ -72,7 +76,8 @@ reused. Where a later prompt cites one of these, read the ADR actually written:
 |---|---|---|---|
 | Sprint 02 "ADR-0006" | blueprint schema | 0006 (atomic writes) | **ADR-0009** |
 | Sprint 02 "ADR-0007" | podman invocation policy | 0007 (bootstrap fs boundary) | **ADR-0010** (+0011) |
-| Sprint 06 "ADR-0012" | commission state machine + git mediation | 0012 (derived images) | next free number (0015+) |
-| Sprint 07 "ADR-0013" | stasis formats + resource policy | 0013 (pkgcache trust) | next free number (0015+) |
-| Sprint 08 "ADR-0014" | CLI surface + local API contract | 0014 (parcel env policy) | next free number (0015+) |
-| Sprint 09 "ADR-0015" | WS protocol + asset architecture | — | next free number (0015+) |
+| Sprint 03 "ADR-0008" | session protocol + interrupt schema | 0008 (slot identity uniqueness) | **ADR-0015** |
+| Sprint 06 "ADR-0012" | commission state machine + git mediation | 0012 (derived images) | next free number (0016+) |
+| Sprint 07 "ADR-0013" | stasis formats + resource policy | 0013 (pkgcache trust) | next free number (0016+) |
+| Sprint 08 "ADR-0014" | CLI surface + local API contract | 0014 (parcel env policy) | next free number (0016+) |
+| Sprint 09 "ADR-0015" | WS protocol + asset architecture | 0015 (session protocol) | next free number (0016+) |
