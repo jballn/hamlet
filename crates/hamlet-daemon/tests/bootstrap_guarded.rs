@@ -142,7 +142,7 @@ async fn podman_derived_image_is_slim_init_free_and_has_the_floor() {
         .expect("derived image resolves");
     let tag = outcome.tag.clone();
     assert!(
-        tag.starts_with("localhost/hamlet/village-alpine:v1-f1-c"),
+        tag.starts_with("localhost/hamlet/village-alpine:v1-f2-c"),
         "localhost-scoped, versioned, floored, fingerprinted: {tag}"
     );
 
@@ -240,6 +240,244 @@ async fn podman_derived_image_is_slim_init_free_and_has_the_floor() {
 }
 
 // ---------------------------------------------------------------------------
+// 1b. QA04-05/06 regressions, verified against a REAL built image
+// ---------------------------------------------------------------------------
+
+/// QA04-05: the pinned musl toolchain's shared libraries are really in the
+/// image, are root-owned and unwritable by a slot UID, and the loader
+/// resolves them.
+///
+/// These two `.so`s are the whole difference between "every parcel's node
+/// probe dies at the dynamic loader with exit 127" and a working toolchain,
+/// and they are now *in every parcel's* root filesystem — so the security
+/// question is not "are they present" but "can an agent tamper with them".
+#[tokio::test]
+#[ignore = "guarded: needs HAMLET_PODMAN_TESTS=1 + podman on PATH (CONVENTIONS §5)"]
+async fn podman_musl_runtime_libs_present_root_owned_and_not_agent_writable() {
+    if let Some(reason) = podman_guard() {
+        eprintln!(
+            "SKIP podman_musl_runtime_libs_present_root_owned_and_not_agent_writable: {reason}"
+        );
+        return;
+    }
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let tree = HamletTree::ensure(tmp.path().join(".hamlet")).expect("village tree");
+    let blueprint = Blueprint::default_village_alpine().expect("default blueprint");
+    let config = Config::default();
+    let runtime = PodmanRuntime::from_config(&config).with_pull_retry(3, Duration::from_secs(3));
+    let tag = Bootstrapper::new(&tree, &runtime)
+        .expect("committed pin table parses")
+        .ensure_image(&blueprint)
+        .await
+        .expect("derived image resolves")
+        .tag;
+
+    // Present AND resolvable by the loader. `readelf` is absent in alpine, so
+    // resolve through the loader itself: ldd of a linked binary is the real
+    // question, and `node`'s DT_NEEDED set is {libstdc++, libgcc_s, musl}.
+    let libs = podman(&[
+        "run",
+        "--rm",
+        &tag,
+        "sh",
+        "-c",
+        "set -e; for l in /usr/lib/libstdc++.so.6 /usr/lib/libgcc_s.so.1; do \
+         p=$(readlink -f $l); [ -r $p ] || { echo \"unreadable:$p\"; exit 1; }; \
+         echo \"$p\"; done; echo libs-ok",
+    ]);
+    assert!(
+        libs.contains("libs-ok"),
+        "the musl runtime libraries resolve inside the image (QA04-05): {libs:?}"
+    );
+
+    // Root-owned, and NOT writable by anyone but root: the container user is
+    // the slot UID and `--cap-drop=ALL` means it cannot chown them back.
+    let stats = podman(&[
+        "run",
+        "--rm",
+        "--user",
+        "1001:1001",
+        &tag,
+        "sh",
+        "-c",
+        "for l in /usr/lib/libstdc++.so.6 /usr/lib/libgcc_s.so.1; do \
+         stat -c '%u %a' $(readlink -f $l); done",
+    ]);
+    let mut seen = 0;
+    for line in stats.lines().filter(|l| !l.trim().is_empty()) {
+        let mut fields = line.split_whitespace();
+        let owner: u32 = fields.next().expect("uid").parse().expect("numeric uid");
+        let mode = fields.next().expect("mode");
+        assert_eq!(
+            owner, 0,
+            "runtime library is root-owned inside the image: {line}"
+        );
+        assert!(
+            !mode.ends_with('7')
+                && !mode.ends_with('6')
+                && !mode.ends_with('3')
+                && !mode.ends_with('2'),
+            "no group/other write bit on a runtime library: {mode}"
+        );
+        seen += 1;
+    }
+    assert_eq!(seen, 2, "both libraries inspected: {stats:?}");
+
+    // ADVERSARIAL: a slot UID cannot replace, shadow or rewrite them. Any of
+    // these succeeding would be a privilege escalation via the toolchain.
+    for attempt in [
+        "rm -f /usr/lib/libstdc++.so.6",
+        "ln -sf /tmp/evil.so /usr/lib/libstdc++.so.6",
+        "cp /bin/busybox /usr/lib/libgcc_s.so.1",
+        "mkdir -p /usr/lib && chmod 0777 /usr/lib",
+    ] {
+        let out = StdCommand::new("podman")
+            .args([
+                "run",
+                "--rm",
+                "--user",
+                "1001:1001",
+                &tag,
+                "sh",
+                "-c",
+                attempt,
+            ])
+            .output()
+            .expect("podman must be runnable (guarded)");
+        assert!(
+            !out.status.success(),
+            "slot uid must not be able to `{attempt}` a runtime library: \
+             stdout={:?} stderr={:?}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    // …and the originals are intact afterwards (a failed rm must not have
+    // unlinked them on the way out).
+    let intact = StdCommand::new("podman")
+        .args([
+            "run",
+            "--rm",
+            &tag,
+            "sh",
+            "-c",
+            "test -r /usr/lib/libstdc++.so.6",
+        ])
+        .status()
+        .expect("podman must be runnable (guarded)");
+    assert!(intact.success(), "libstdc++ survives the attack attempts");
+}
+
+/// QA04-06: the derived image inherits **no body** from its parent.
+///
+/// `alpine:3.24` upstream declares `CMD ["/bin/sh"]`, and the generated
+/// Containerfile used to merely omit CMD — so every real parcel image
+/// inherited an interactive root shell. The daemon never passes one (it always
+/// appends an explicit command), which is why nothing broke; but the pinned
+/// invariant "the derived image declares no entrypoint/cmd" was false for every
+/// image built since Sprint 02.
+#[tokio::test]
+#[ignore = "guarded: needs HAMLET_PODMAN_TESTS=1 + podman on PATH (CONVENTIONS §5)"]
+async fn podman_derived_image_inherits_no_body_from_its_parent() {
+    if let Some(reason) = podman_guard() {
+        eprintln!("SKIP podman_derived_image_inherits_no_body_from_its_parent: {reason}");
+        return;
+    }
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let tree = HamletTree::ensure(tmp.path().join(".hamlet")).expect("village tree");
+    let blueprint = Blueprint::default_village_alpine().expect("default blueprint");
+    let config = Config::default();
+    let runtime = PodmanRuntime::from_config(&config).with_pull_retry(3, Duration::from_secs(3));
+    let tag = Bootstrapper::new(&tree, &runtime)
+        .expect("committed pin table parses")
+        .ensure_image(&blueprint)
+        .await
+        .expect("derived image resolves")
+        .tag;
+
+    // Premise: the parent really does declare a body. If upstream ever drops
+    // it, this test keeps passing vacuously — so pin the premise explicitly.
+    let parent_cmd = podman(&[
+        "image",
+        "inspect",
+        "--format",
+        "{{json .Config.Cmd}}",
+        blueprint.meta().base_image(),
+    ]);
+    assert!(
+        !parent_cmd.trim().is_empty() && parent_cmd.trim() != "[]" && parent_cmd.trim() != "null",
+        "the parent declares a CMD — that is exactly what must not be inherited: {parent_cmd:?}"
+    );
+
+    for field in ["{{.Config.Cmd}}", "{{.Config.Entrypoint}}"] {
+        let value = podman(&["image", "inspect", "--format", field, &tag]);
+        let trimmed = value.trim();
+        assert!(
+            trimmed.is_empty() || trimmed == "[]" || trimmed == "<nil>" || trimmed == "<no value>",
+            "{field} of the derived image must be empty, not inherited: {trimmed:?}"
+        );
+    }
+
+    // FAIL-CLOSED, not merely quiet: running the image with NO command must
+    // ERROR rather than silently start the inherited `/bin/sh`. This is the
+    // direction the clearing was chosen for.
+    let bare = StdCommand::new("podman")
+        .args(["run", "--rm", &tag])
+        .output()
+        .expect("podman must be runnable (guarded)");
+    assert!(
+        !bare.status.success(),
+        "a commandless run must fail instead of inheriting a shell body: \
+         stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&bare.stdout),
+        String::from_utf8_lossy(&bare.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&bare.stderr);
+    assert!(
+        !stderr.contains("interactive"),
+        "the failure is the missing command, not a started shell: {stderr:?}"
+    );
+
+    // …and the daemon's own path still works: an explicit command runs fine,
+    // including the keep-alive shape bootstrap actually uses.
+    let keep_alive = StdCommand::new("podman")
+        .args([
+            "run",
+            "--rm",
+            "--name",
+            "hamlet-cmd-probe",
+            &tag,
+            "sleep",
+            "0.1",
+        ])
+        .status()
+        .expect("podman must be runnable (guarded)");
+    assert!(keep_alive.success(), "an explicit command still runs");
+    let _ = StdCommand::new("podman")
+        .args(["rm", "-f", "hamlet-cmd-probe"])
+        .status();
+    let detached = StdCommand::new("podman")
+        .args([
+            "run",
+            "-d",
+            "--name",
+            "hamlet-keepalive-probe",
+            &tag,
+            "sleep",
+            "infinity",
+        ])
+        .status()
+        .expect("podman must be runnable (guarded)");
+    assert!(
+        detached.success(),
+        "the SPEC §4 keep-alive body (sleep infinity) still starts"
+    );
+    let _ = StdCommand::new("podman")
+        .args(["rm", "-f", "hamlet-keepalive-probe"])
+        .status();
+}
+
+// ---------------------------------------------------------------------------
 // 2. The full contract: toolchains install, run, and re-provision offline
 // ---------------------------------------------------------------------------
 
@@ -309,7 +547,7 @@ async fn podman_bootstrap_installs_toolchains_and_reprovisions_with_zero_downloa
         assert!(
             a.image
                 .tag
-                .starts_with("localhost/hamlet/village-alpine:v1-f1-c"),
+                .starts_with("localhost/hamlet/village-alpine:v1-f2-c"),
             "the parcel runs the DERIVED image, not the raw parent: {}",
             a.image.tag
         );
@@ -457,7 +695,7 @@ async fn podman_bootstrap_installs_toolchains_and_reprovisions_with_zero_downloa
         let freight = run(&runtime, AGENT_A, &["ls", "/var/freight"]).await?;
         assert_ne!(
             freight.code, 0,
-            "freight stays ACL-gated (0710) until Sprint 04"
+            "freight stays ACL-gated (01770, other::---) without the freight plane"
         );
 
         // --- 8. the mirror holds every pinned artifact --------------------
@@ -548,6 +786,13 @@ async fn podman_bootstrap_installs_toolchains_and_reprovisions_with_zero_downloa
         Ok::<(), String>(())
     }
     .await;
+
+    // The container-side failure (if any) is reported FIRST and in full: the
+    // host-side records below are asserted even when it failed, and an
+    // empty DEED.md used to hide the real cause behind a confusing assert.
+    if let Err(err) = &result {
+        eprintln!("guarded bootstrap container-side failure: {err}");
+    }
 
     // --- host-side records (asserted even when the container side failed) --
     for uid in [UID_A, UID_B] {

@@ -80,6 +80,11 @@ const DOMAIN_LATENCY_SEQ: u8 = 2;
 /// cl. 2: `<kind>-<seq>-<uid>.<inc>` seqs come from sled counters —
 /// additive use of the `counters.v1` key layout, ADR-0005 cl. 3).
 const DOMAIN_CORRELATION_SEQ: u8 = 3;
+/// Counter domain: mail spool sequence allocation (ADR-0019 cl. 2 — the
+/// `{seq:012}` writer FIFO prefix of daemon-composed spool file names).
+/// Keyed by writer uid with commission 0; durable across daemon restarts
+/// so per-writer lexicographic FIFO never inverts on a seq reset.
+const DOMAIN_SPOOL_SEQ: u8 = 4;
 
 /// Schema version of exported archive summaries (`keep/archives/`).
 pub const SUMMARY_VERSION: u32 = 1;
@@ -659,6 +664,25 @@ impl Telemetry {
     /// [`TelemetryError::Storage`] or [`TelemetryError::Corrupt`].
     pub fn next_correlation_seq(&self, agent: AgentKey) -> Result<u64, TelemetryError> {
         self.next_seq(DOMAIN_CORRELATION_SEQ, agent)
+    }
+
+    /// Allocate the next mail spool sequence for one writer uid (ADR-0019
+    /// cl. 2 spool file-name grammar). 1-based, monotonic per writer,
+    /// durable across daemon restarts. Non-slot writers (system notices,
+    /// patrons) key under uid 0 — the counter only orders file names, it is
+    /// never orchestration state (CONVENTIONS §2).
+    ///
+    /// # Errors
+    ///
+    /// [`TelemetryError::Storage`] or [`TelemetryError::Corrupt`].
+    pub fn next_spool_seq(&self, writer_uid: u32) -> Result<u64, TelemetryError> {
+        self.next_seq(
+            DOMAIN_SPOOL_SEQ,
+            AgentKey {
+                commission: 0,
+                uid: writer_uid,
+            },
+        )
     }
 
     /// Atomically add `delta` to a raw `u64` BE counter; returns the new

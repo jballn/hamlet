@@ -14,7 +14,10 @@
 //! | [`pins`] | toolchain pin table: version+URL+sha256 per artifact | §4, §5 |
 //! | [`mount`] | normative container mount table | §4 |
 //! | [`session`] | agent session protocol types (JSON-RPC, interrupts) | §6 |
-//! | [`mail`] | mail format + routing types | §8 |
+//! | [`mail`] | mail format, spool naming & bounce types | §8.1 |
+//! | [`watch`] | watcher event vocabulary (FsEvent → Reaction) | §8 |
+//! | [`dispatch`] | webhook outbox/inbox schemas, allowlist, retry policy | §8.4 |
+//! | [`freight`] | freight ACL listing parser + audit rules | §4, §8.3 |
 //! | [`decree`] | decree vocabulary + encoding | §7 |
 //! | [`commission`] | commission lifecycle state machine | §9 |
 //! | [`promote`] | DEED/vault promotion parsing | §9.4, §10 |
@@ -35,6 +38,8 @@ pub mod charter;
 pub mod commission;
 pub mod config;
 pub mod decree;
+pub mod dispatch;
+pub mod freight;
 pub mod mail;
 pub mod mount;
 pub mod pins;
@@ -44,3 +49,4 @@ pub mod session;
 pub mod slots;
 pub mod stasis;
 pub mod tree;
+pub mod watch;

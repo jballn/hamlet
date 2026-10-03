@@ -261,7 +261,7 @@ async fn podman_escape_suite_ro_symlinks_cross_uid_no_infra_and_userns() {
             "cat /var/mail/1002/* 2>/dev/null; ls /var/mail/1002",
             "mkdir /var/mail/9999", // spool forgery in the 0755 root
             "touch /var/mail/rootfile",
-            "ls /var/freight", // 0710 daemon: ACL-gated (Sprint 04)
+            "ls /var/freight", // 01770 daemon, other::---: no slot root-ACL grant in this suite
             "mkdir /var/freight/sandbox",
             "touch /var/freight/x",
         ] {
@@ -426,7 +426,7 @@ async fn podman_escape_suite_ro_symlinks_cross_uid_no_infra_and_userns() {
         // (task 1 "perms braces"): 0755 daemon-owned ⇒ "other" has no w.
         assert_eq!(mode_of(&tree.commission_git(COMMISSION)), 0o755);
         assert_eq!(mode_of(&tree.tavern_gossip()), 0o755);
-        assert_eq!(mode_of(&tree.courier_freight()), 0o710);
+        assert_eq!(mode_of(&tree.courier_freight()), 0o1770);
         assert_eq!(mode_of(&tree.courier_mail()), 0o755);
         assert_eq!(mode_of(&tree.parcel_home(UID_A)), 0o700);
         assert_eq!(

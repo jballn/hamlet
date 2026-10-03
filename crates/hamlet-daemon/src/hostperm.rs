@@ -36,9 +36,15 @@ pub const MODE_PARCEL_HOME: u32 = 0o700;
 pub const MODE_MAIL_SPOOL: u32 = 0o700;
 /// `courier/mail/` root: traversable so containers can reach their spool.
 pub const MODE_MAIL_ROOT: u32 = 0o755;
-/// `courier/freight/`: 0710 + ACL-ready — Sprint 04 layers POSIX ACL
-/// sandboxes on top (`setfacl` inside containers); nothing here blocks that.
-pub const MODE_FREIGHT: u32 = 0o710;
+/// `courier/freight/`: sticky, daemon-owned, ACL layer underneath
+/// (ADR-0011 cl. 3 as amended by ADR-0021 cl. 2). Group bits are the
+/// POSIX ACL *mask slot* once slots hold named `u:<uid>:rwx` root grants
+/// (Linux `acl(5)`): `rwx` there keeps a later chmod from clipping the
+/// mask to r-x and silently disarming the grants. The daemon group has no
+/// agent members, and the sticky bit stops slots from unlinking/renaming
+/// each other's sandboxes (each slot's root ACL grant is rwx). Sprint 04
+/// `setfacl` sandboxes layer on top; nothing here blocks that.
+pub const MODE_FREIGHT: u32 = 0o1770;
 /// Commission `git/` + `tavern/gossip/`: readable by all slots, writable by
 /// none (daemon-owned; the `:ro` bind is the belt).
 pub const MODE_SHARED_READONLY: u32 = 0o755;
@@ -174,7 +180,7 @@ impl<'a> HostPermissions<'a> {
 
     /// Shared-mount hardening for one commission (ADR-0011 cl. 3):
     /// commission `git/` 0755, `tavern/gossip/` 0755 (both daemon-owned:
-    /// readable by all slots, writable by none), `courier/freight/` 0710
+    /// readable by all slots, writable by none), `courier/freight/` 01770
     /// (ACL-ready), `market/pkgcache/` 01777 (sticky shared cache).
     ///
     /// # Errors
@@ -262,7 +268,7 @@ mod tests {
         perms.apply_shared(&tree, 3).await.unwrap();
         assert_eq!(mode_of(&tree.commission_git(3)), 0o755);
         assert_eq!(mode_of(&tree.tavern_gossip()), 0o755);
-        assert_eq!(mode_of(&tree.courier_freight()), 0o710);
+        assert_eq!(mode_of(&tree.courier_freight()), 0o1770);
         assert_eq!(mode_of(&tree.market_pkgcache()), 0o1777);
         assert!(fake.argv_log().is_empty(), "chmod never spawns podman");
     }

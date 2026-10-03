@@ -4,6 +4,7 @@
 0644 file config.json
 0755 dir courier
 0755 dir courier/dispatch
+0755 dir courier/dispatch/dead
 0755 dir courier/dispatch/inbox
 0755 dir courier/dispatch/outbox
 0755 dir courier/freight

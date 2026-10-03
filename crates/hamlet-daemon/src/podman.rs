@@ -874,6 +874,113 @@ fn validate_host_path(path: &Path) -> Result<(), PodmanError> {
     Ok(())
 }
 
+/// `podman unshare <cmd…>` argv (ADR-0011 cl. 4, ADR-0021 cl. 2): run a
+/// HOST binary inside the daemon's own userns — root-equivalent over the
+/// subuid-owned village tree, ordinary user on the bare host. Never a
+/// shell; `cmd[0]` is the binary and is validated like every `exec`
+/// command (no leading-dash flag injection, no control chars). Pure.
+///
+/// # Errors
+///
+/// [`PodmanError`] on an invalid command payload.
+pub fn unshare_exec_argv(podman_bin: &Path, cmd: &[String]) -> Result<Vec<String>, PodmanError> {
+    validate_cmd(cmd)?;
+    let mut argv = vec![
+        podman_bin.to_string_lossy().into_owned(),
+        "unshare".to_owned(),
+    ];
+    argv.extend(cmd.iter().cloned());
+    Ok(argv)
+}
+
+/// `getfacl -p -n -c -- <path>` payload for [`unshare_exec_argv`]
+/// (ADR-0021 cl. 2): numeric ids (the in-userns slot UIDs), full path
+/// comment, no header noise. Pure.
+///
+/// # Errors
+///
+/// [`PodmanError`] on an invalid host path.
+pub fn getfacl_cmd(path: &Path) -> Result<Vec<String>, PodmanError> {
+    validate_host_path(path)?;
+    Ok(vec![
+        "getfacl".to_owned(),
+        "-p".to_owned(),
+        "-n".to_owned(),
+        "-c".to_owned(),
+        "--".to_owned(),
+        path.to_string_lossy().into_owned(),
+    ])
+}
+
+/// `setfacl -m <mod>… -- <path>` payload for [`unshare_exec_argv`]
+/// (ADR-0021 cl. 2). Each mod must be a `u:<uid>:<rwx>` grant token as
+/// rendered by [`hamlet_core::freight::AclGrant::token`] — anything else
+/// is rejected (charset-safe by construction, no injection surface).
+/// Pure.
+///
+/// # Errors
+///
+/// [`PodmanError`] on an empty mod list, a malformed mod token, or an
+/// invalid host path.
+pub fn setfacl_cmd(mods: &[String], path: &Path) -> Result<Vec<String>, PodmanError> {
+    if mods.is_empty() {
+        return Err(PodmanError::invalid("setfacl: no -m modifications"));
+    }
+    let mut cmd = vec!["setfacl".to_owned()];
+    for m in mods {
+        validate_acl_mod(m)?;
+        cmd.push("-m".to_owned());
+        cmd.push(m.clone());
+    }
+    cmd.push("--".to_owned());
+    validate_host_path(path)?;
+    cmd.push(path.to_string_lossy().into_owned());
+    Ok(cmd)
+}
+
+/// `u:<uid>:<perms>` grant-token validation: exactly the shape
+/// [`hamlet_core::freight::AclGrant::token`] renders — digits-only uid,
+/// perms strictly `[r-][w-][x-]`.
+fn validate_acl_mod(m: &str) -> Result<(), PodmanError> {
+    let invalid = || {
+        PodmanError::invalid(format!(
+            "setfacl mod {m:?} is not a u:<uid>:[r-][w-][x-] token"
+        ))
+    };
+    let parts: Vec<&str> = m.split(':').collect();
+    if parts.len() != 3 || parts[0] != "u" {
+        return Err(invalid());
+    }
+    if parts[1].is_empty() || !parts[1].chars().all(|c| c.is_ascii_digit()) {
+        return Err(invalid());
+    }
+    let perms: Vec<char> = parts[2].chars().collect();
+    let ok = perms.len() == 3
+        && (perms[0] == 'r' || perms[0] == '-')
+        && (perms[1] == 'w' || perms[1] == '-')
+        && (perms[2] == 'x' || perms[2] == '-');
+    if !ok {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+/// `cat -- <path>` payload for [`unshare_exec_argv`] — the promotion-read
+/// primitive (ADR-0021 cl. 6): daemon read access to any freight artifact
+/// regardless of agent-side ACLs, without relaxing them. Pure.
+///
+/// # Errors
+///
+/// [`PodmanError`] on an invalid host path.
+pub fn cat_cmd(path: &Path) -> Result<Vec<String>, PodmanError> {
+    validate_host_path(path)?;
+    Ok(vec![
+        "cat".to_owned(),
+        "--".to_owned(),
+        path.to_string_lossy().into_owned(),
+    ])
+}
+
 /// `podman image exists` argv (pull idempotency probe). Pure.
 ///
 /// # Errors
@@ -1140,6 +1247,18 @@ pub trait Runtime: Send + Sync {
         gid: u32,
         paths: &'a [PathBuf],
     ) -> BoxFuture<'a, Result<(), PodmanError>>;
+
+    /// `podman unshare <cmd…>` (ADR-0011 cl. 4, ADR-0021 cl. 2): run a
+    /// HOST binary as the daemon's userns root over the village tree —
+    /// the freight ACL audit (`getfacl`), root grants (`setfacl`) and the
+    /// Sprint 06 promotion-read (`cat`) path. Payload argv is built by the
+    /// typed [`getfacl_cmd`]/[`setfacl_cmd`]/[`cat_cmd`] helpers, never
+    /// free-form. Non-zero exit codes are returned in [`ExecOutput`] for
+    /// the caller to judge; podman-level failures (exit 125) are errors.
+    fn unshare_exec<'a>(
+        &'a self,
+        cmd: &'a [String],
+    ) -> BoxFuture<'a, Result<ExecOutput, PodmanError>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -1419,6 +1538,20 @@ impl Runtime for PodmanRuntime {
             let argv = unshare_chown_argv(&self.podman_bin, uid, gid, paths)?;
             self.spawn_ok(argv).await?;
             Ok(())
+        })
+    }
+
+    fn unshare_exec<'a>(
+        &'a self,
+        cmd: &'a [String],
+    ) -> BoxFuture<'a, Result<ExecOutput, PodmanError>> {
+        Box::pin(async move {
+            let argv = unshare_exec_argv(&self.podman_bin, cmd)?;
+            let out = self.spawn_argv(argv.clone(), None).await?;
+            if out.code == PODMAN_SELF_ERROR_CODE {
+                return Err(map_nonzero(out.code, &argv, out.stderr_lossy()));
+            }
+            Ok(out)
         })
     }
 }
@@ -1815,6 +1948,29 @@ impl Runtime for FakeRuntime {
                 return Err(err);
             }
             Ok(())
+        })
+    }
+
+    fn unshare_exec<'a>(
+        &'a self,
+        cmd: &'a [String],
+    ) -> BoxFuture<'a, Result<ExecOutput, PodmanError>> {
+        Box::pin(async move {
+            let argv = unshare_exec_argv(&self.podman_bin, cmd)?;
+            let recorded = self.record(argv);
+            if let Some(err) = self.take_failure(&recorded) {
+                return Err(err);
+            }
+            let joined = cmd.join(" ");
+            let script = self.lock(&self.script);
+            if let Some((_, output)) = script
+                .exec_scripts
+                .iter()
+                .find(|(matcher, _)| joined.contains(matcher.as_str()))
+            {
+                return Ok(output.clone());
+            }
+            Ok(script.exec_output.clone())
         })
     }
 }
@@ -2273,6 +2429,102 @@ mod tests {
         }
         // Valid absolute path passes.
         assert!(unshare_chown_argv(&bin(), 1001, 1001, &[PathBuf::from("/v/.hamlet/x")]).is_ok());
+    }
+
+    /// ADR-0021 cl. 2 goldens: the typed `podman unshare` payload builders
+    /// (freight ACL audit / root grants / promotion-read).
+    #[test]
+    fn unshare_payload_argv_goldens() {
+        assert_eq!(
+            unshare_exec_argv(&bin(), &["getfacl".to_owned(), "--".to_owned()]).unwrap(),
+            vec!["podman", "unshare", "getfacl", "--"]
+        );
+        assert_eq!(
+            getfacl_cmd(Path::new("/v/.hamlet/courier/freight/exchange")).unwrap(),
+            vec![
+                "getfacl",
+                "-p",
+                "-n",
+                "-c",
+                "--",
+                "/v/.hamlet/courier/freight/exchange"
+            ]
+        );
+        assert_eq!(
+            setfacl_cmd(
+                &[
+                    hamlet_core::freight::AclGrant::root_access(1001).token(),
+                    hamlet_core::freight::AclGrant::root_access(1002).token(),
+                ],
+                Path::new("/v/.hamlet/courier/freight")
+            )
+            .unwrap(),
+            vec![
+                "setfacl",
+                "-m",
+                "u:1001:rwx",
+                "-m",
+                "u:1002:rwx",
+                "--",
+                "/v/.hamlet/courier/freight"
+            ]
+        );
+        assert_eq!(
+            cat_cmd(Path::new("/v/.hamlet/courier/freight/exchange/payload.bin")).unwrap(),
+            vec![
+                "cat",
+                "--",
+                "/v/.hamlet/courier/freight/exchange/payload.bin"
+            ]
+        );
+    }
+
+    /// Injection matrix for the unshare payloads: hostile paths/mods/commands
+    /// are rejected before any argv exists (ADR-0010 typed-source discipline).
+    #[test]
+    fn unshare_payload_injection_rejected() {
+        // Command payload: empty, leading-dash binary, control chars.
+        assert!(unshare_exec_argv(&bin(), &[]).is_err());
+        assert!(unshare_exec_argv(&bin(), &["-rf".to_owned()]).is_err());
+        assert!(unshare_exec_argv(&bin(), &["getfacl\n--privileged".to_owned()]).is_err());
+        assert!(unshare_exec_argv(&bin(), &["".to_owned()]).is_err());
+        // Paths: relative, empty, leading dash, newline.
+        for evil in ["relative/path", "", "-m", "/v/has\nnewline"] {
+            assert!(
+                getfacl_cmd(Path::new(evil)).is_err(),
+                "{evil:?} must be rejected"
+            );
+            assert!(
+                cat_cmd(Path::new(evil)).is_err(),
+                "{evil:?} must be rejected"
+            );
+            assert!(
+                setfacl_cmd(&["u:1001:rwx".to_owned()], Path::new(evil)).is_err(),
+                "{evil:?} must be rejected"
+            );
+        }
+        // Traversal-shaped paths are blocked UPSTREAM (SafeName/tree
+        // accessors, ADR-0002/0003): validate_host_path is positional and
+        // stays opaque to `/../`, exactly like unshare_chown's validator.
+        // setfacl mods: only u:<digits>:[r-][w-][x-] tokens pass.
+        for evil in [
+            "",
+            "g:1001:rwx",
+            "u:1001",
+            "u:1001:rws",
+            "u:-1:rwx",
+            "u:1001:rwx -m u:0:rwx",
+            "u:1001:rwxx",
+            "x:1001:rwx",
+            "u:1oo1:rwx",
+        ] {
+            assert!(
+                setfacl_cmd(&[evil.to_owned()], Path::new("/v/.hamlet/x")).is_err(),
+                "{evil:?} must be rejected"
+            );
+        }
+        assert!(setfacl_cmd(&[], Path::new("/v/.hamlet/x")).is_err());
+        assert!(setfacl_cmd(&["u:1001:rwx".to_owned()], Path::new("/v/.hamlet/x")).is_ok());
     }
 
     /// Verb-targeted failure injection: `fail_next_for` hits exactly the

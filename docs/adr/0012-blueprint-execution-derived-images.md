@@ -1,6 +1,6 @@
 # ADR-0012 — Blueprint execution: derived parcel images & pinned toolchains
 
-Status: Accepted
+Status: Accepted (cl. 2 amended by ADR-0024, ADR-0025)
 Date: Sprint 02 (step 04)
 Refs: SPEC §4 (base image), §5 (blueprints "executed by the daemon at parcel
 provisioning", format [DEV]); ADR-0009, ADR-0010 cl. 1–2, ADR-0011

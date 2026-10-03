@@ -15,3 +15,11 @@
 # Additional provider keys (HAMLET_API_KEY_<PROVIDER>):
 #HAMLET_API_KEY_ANTHROPIC=test-key-do-not-use
 #HAMLET_API_KEY_OPENAI=test-key-do-not-use
+
+# Shared secret for inbound webhook auth (ADR-0022; sent as the
+# X-Hamlet-Auth header on POST /webhook/<topic>):
+#HAMLET_WEBHOOK_AUTH=test-key-do-not-use
+
+# Endpoint credentials referenced BY KEY NAME from dispatch outbox files
+# (ADR-0020 cl. 1/6 `headers_env` — values live only here), for example:
+#HAMLET_DISPATCH_AUTH=test-key-do-not-use

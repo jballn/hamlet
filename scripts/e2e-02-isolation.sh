@@ -6,9 +6,9 @@
 # Layers:
 #   T1  FakeRuntime adversarial suite (always runs; no podman needed):
 #         crates/hamlet-daemon/tests/adversarial_isolation.rs
-#   T2  Source-level ratchets: no container-API crates in the lockfile, the
-#       daemon never touches .env, forbidden podman flags exist ONLY in the
-#       podman.rs audit/test sections.
+#   T2  Source-level ratchets: no container-API crates in the lockfile,
+#       daemon .env reads confined to dispatch.rs's single seam, forbidden
+#       podman flags exist ONLY in the podman.rs audit/test sections.
 #   T3  Committed golden vectors are privilege-free and secret-free.
 #   T4  Guarded real-podman escape suite (only when HAMLET_PODMAN_TESTS=1
 #       AND podman is on PATH; subuid preflight first). Skips with a
@@ -46,13 +46,21 @@ else
   fail "Cargo.lock contains container-API crates: $API_CRATES"
 fi
 
-# The daemon never reads .env (SPEC §11.4: secrets are injected at session
-# start by the daemon's env layer, never by provisioning/bootstrap).
+# The daemon reads .env through ONE seam: dispatch.rs's load_env_secrets
+# (ADR-0020 cl. 6 secret resolution at send time; ADR-0022 cl. 1 webhook
+# auth — both SPEC §8.4/§8.5 "endpoint auth via .env"). Any other file
+# touching env_file() fails this gate until reviewed (provisioning/bootstrap
+# still never hydrate secrets, SPEC §11.4).
 ENV_HITS="$(grep -rn 'env_file()' crates/hamlet-daemon/src || true)"
 if [ -z "$ENV_HITS" ]; then
   pass "hamlet-daemon src: zero env_file() references"
 else
-  fail "daemon touches .env: $ENV_HITS"
+  ENV_UNEXPECTED="$(printf '%s\n' "$ENV_HITS" | grep -v 'crates/hamlet-daemon/src/dispatch.rs' || true)"
+  if [ -z "$ENV_UNEXPECTED" ]; then
+    pass ".env reads confined to dispatch.rs (single seam, ADR-0020 cl. 6 / ADR-0022 cl. 1)"
+  else
+    fail "daemon touches .env outside the single seam: $ENV_UNEXPECTED"
+  fi
 fi
 
 # Forbidden-flag ratchet: privilege/host-namespace literals may only exist
@@ -68,6 +76,44 @@ for f in $PRIV_HITS; do
 done
 if [ -z "$PRIV_HITS" ]; then
   fail "ratchet broken: podman.rs audit no longer mentions the forbidden flags"
+fi
+
+# Image-policy ratchet (SPEC §4 base image, ADR-0012 cl. 2, ADR-0024,
+# ADR-0025). The Containerfile golden already fails if the generator drifts,
+# but two things it CANNOT catch are ratcheted here:
+#   (a) a floor edited WITHOUT bumping FLOOR_VERSION — the derived tag would
+#       stay identical and every already-built image would be reused stale,
+#       silently (this is the exact QA04-05 failure mode);
+#   (b) a parent-supplied body: the derived image must CLEAR ENTRYPOINT/CMD
+#       rather than merely omit them (QA04-06).
+BOOT="crates/hamlet-daemon/src/bootstrap.rs"
+FLOOR_VER="$(sed -n 's/^pub const FLOOR_VERSION: u32 = \([0-9]*\);/\1/p' "$BOOT")"
+FLOOR_SET="$(sed -n '/^pub const BOOTSTRAP_FLOOR/,/^];/p' "$BOOT" \
+  | tr -d ' \n' | sed 's/.*\[//;s/\].*//;s/"//g;s/,$//')"
+# The (floor version → floor contents) pairs this repo has blessed. Editing
+# the floor without updating this line fails the gate: bump FLOOR_VERSION,
+# then update the blessed mapping here in the same commit.
+EXPECTED_V2="ca-certificates,curl,gzip,libgcc,libstdc++,tar,xz"
+if [ -z "$FLOOR_VER" ] || [ -z "$FLOOR_SET" ]; then
+  fail "image-policy ratchet broken: could not read FLOOR_VERSION/BOOTSTRAP_FLOOR from $BOOT"
+elif [ "$FLOOR_VER" != "2" ]; then
+  fail "FLOOR_VERSION is $FLOOR_VER, expected 2 (ADR-0024) — a floor change without a version bump serves stale images"
+elif [ "$FLOOR_SET" != "$EXPECTED_V2" ]; then
+  fail "BOOTSTRAP_FLOOR drifted from the blessed floor-v2 set (ADR-0024): got [$FLOOR_SET], want [$EXPECTED_V2]"
+  fail "  — if this is an intentional floor change: bump FLOOR_VERSION in $BOOT and update EXPECTED_V2 here in the same commit"
+else
+  pass "floor v2 == blessed set (musl runtime libs present: $FLOOR_SET)"
+fi
+if grep -q '"libstdc++"' "$BOOT" && grep -q '"libgcc"' "$BOOT"; then
+  pass "apk floor carries the pinned musl runtime libraries (QA04-05: node DT_NEEDED)"
+else
+  fail "apk floor lost libgcc/libstdc++ — pinned musl `node` cannot load (QA04-05)"
+fi
+CF_BODY="$(sed -n '/^pub fn containerfile(/,/^}/p' "$BOOT")"
+if printf '%s' "$CF_BODY" | grep -q 'ENTRYPOINT \[\]' && printf '%s' "$CF_BODY" | grep -q 'CMD \[\]'; then
+  pass "derived Containerfile explicitly CLEARS the parent's ENTRYPOINT/CMD (ADR-0025, QA04-06)"
+else
+  fail "containerfile() no longer emits ENTRYPOINT [] / CMD [] — a parent body (alpine:3.24 ships CMD [\"/bin/sh\"]) would be inherited (QA04-06)"
 fi
 
 # --- T3: golden vectors are privilege-free and secret-free -------------------

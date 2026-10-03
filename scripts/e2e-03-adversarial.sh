@@ -23,8 +23,9 @@
 #       the flood scenarios intermittent.
 #   T3  Source-level ratchets:
 #         - `.expose()` (secret unmasking) appears ONLY in supervise.rs's
-#           session_env — the single channel secrets take into a parcel
-#           (SPEC §11.4, CONVENTIONS §6).
+#           session_env (the channel into parcels), dispatch.rs (outbox
+#           headers_env at send time, ADR-0020 cl. 6), and web.rs (inbound
+#           auth compare, ADR-0022 cl. 1) — SPEC §11.4/§8.4–5, CONVENTIONS §6.
 #         - FakeAgent never logs env VALUES (only key names).
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -74,12 +75,16 @@ fi
 # --- T3: source-level secrets ratchets ----------------------------------------
 step "T3: secrets ratchets (SPEC §11.4, CONVENTIONS §6)"
 
+# Allowed unmask seams: supervise.rs (session env channel), dispatch.rs
+# (outbox headers_env resolution at send time — ADR-0020 cl. 6), web.rs
+# (inbound auth compare — ADR-0022 cl. 1). Both SPEC §8.4/§8.5 mandate
+# "endpoint auth via .env"; values still never reach disk, traces, or logs.
 EXPOSE_HITS="$(grep -rn '\.expose()' crates/hamlet-daemon/src --include='*.rs' || true)"
-OFFENDERS="$(printf '%s\n' "$EXPOSE_HITS" | grep -v 'supervise\.rs' | grep -v '^$' || true)"
+OFFENDERS="$(printf '%s\n' "$EXPOSE_HITS" | grep -v 'supervise\.rs' | grep -v 'dispatch\.rs' | grep -v 'web\.rs' | grep -v '^$' || true)"
 if [ -z "$OFFENDERS" ]; then
-  pass "daemon .expose() confined to supervise.rs (session_env channel)"
+  pass "daemon .expose() confined to supervise/dispatch/web (session env + endpoint auth seams)"
 else
-  fail "secret unmasking outside supervise.rs:"
+  fail "secret unmasking outside the allowed seams:"
   printf '%s\n' "$OFFENDERS"
 fi
 

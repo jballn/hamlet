@@ -313,13 +313,13 @@ async fn unshare_chown_targets_slot_uids_only_and_never_shared_mounts() {
     assert!(saw_reclaim, "rollback reclaims via chown 0:0");
 
     // Host-side braces on the REAL fs (modes the fake chown cannot touch):
-    // ro/shared mounts stay daemon-owned 0755/0710 → a mapped (sub)uid has
+    // ro/shared mounts stay daemon-owned 0755/01770 → a mapped (sub)uid has
     // no write bit. Belt (ro mount) AND braces (perms), SPEC §4.
     use std::os::unix::fs::PermissionsExt;
     let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o7777;
     assert_eq!(mode(&f.tree.commission_git(7)), 0o755);
     assert_eq!(mode(&f.tree.tavern_gossip()), 0o755);
-    assert_eq!(mode(&f.tree.courier_freight()), 0o710);
+    assert_eq!(mode(&f.tree.courier_freight()), 0o1770);
     assert_eq!(mode(&f.tree.courier_mail()), 0o755);
     assert_eq!(mode(&f.tree.market_pkgcache()), 0o1777);
     assert_eq!(mode(&f.tree.parcel_home(1001)), 0o700);

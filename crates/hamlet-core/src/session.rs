@@ -417,8 +417,8 @@ impl std::error::Error for SessionError {}
 /// Opaque, charset-validated correlation id tying an envelope to its wire
 /// records, pi responses, and telemetry rows. Canonical forms:
 /// `m-<seq>-<uid>.<inc>` (mail), `t-…` (tasking), `n-…` (notice),
-/// `i-…` (interrupt). `<seq>` is allocated per session by the daemon
-/// (sled `counters.v1`, ADR-0005 cl. 2).
+/// `i-…` (interrupt), `d-…` (webhook dispatch, ADR-0020 cl. 1). `<seq>` is
+/// allocated per session by the daemon (sled `counters.v1`, ADR-0005 cl. 2).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CorrelationId(String);
 
@@ -461,6 +461,16 @@ impl CorrelationId {
     /// Propagates [`CorrelationId::parse`] (cannot fail for valid inputs).
     pub fn for_interrupt(session: &SessionId, seq: u64) -> Result<Self, SessionError> {
         Self::parse(&format!("i-{seq}-{}", session.token()))
+    }
+
+    /// Id for a webhook dispatch request, sequence `seq` (ADR-0020 cl. 1:
+    /// `d-<seq>-<uid>.<inc>`; also the dispatch outbox/inbox file stem).
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`CorrelationId::parse`] (cannot fail for valid inputs).
+    pub fn for_dispatch(session: &SessionId, seq: u64) -> Result<Self, SessionError> {
+        Self::parse(&format!("d-{seq}-{}", session.token()))
     }
 
     /// The validated id string.
@@ -509,8 +519,8 @@ impl<'de> Deserialize<'de> for CorrelationId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QueuedKind {
-    /// Courier mail (SPEC §8.1; header rendering is Sprint 04's ADR — the
-    /// envelope carries the fully rendered `text`).
+    /// Courier mail (SPEC §8.1; rendered per [`crate::mail`] — ADR-0019 —
+    /// before enqueueing; the envelope carries the fully rendered `text`).
     Mail,
     /// Mayor tasking (INDENTURE-bound work assignment, SPEC §7).
     Tasking,

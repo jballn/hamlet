@@ -40,9 +40,11 @@ const COURIER: &str = "courier";
 const MAIL: &str = "mail";
 const QUEUES: &str = "queues";
 const FREIGHT: &str = "freight";
+const QUARANTINE: &str = ".quarantine";
 const DISPATCH: &str = "dispatch";
 const OUTBOX: &str = "outbox";
 const INBOX: &str = "inbox";
+const DEAD: &str = "dead";
 const MARKET: &str = "market";
 const SKILLS: &str = "skills";
 const PKGCACHE: &str = "pkgcache";
@@ -70,6 +72,7 @@ const ENSURE_DIRS: &[&[&str]] = &[
     &[COURIER, DISPATCH],
     &[COURIER, DISPATCH, OUTBOX],
     &[COURIER, DISPATCH, INBOX],
+    &[COURIER, DISPATCH, DEAD],
     &[MARKET],
     &[MARKET, SKILLS],
     &[MARKET, PKGCACHE],
@@ -311,6 +314,15 @@ impl HamletTree {
         self.join(&[COURIER, MAIL, recipient.as_str()])
     }
 
+    /// `courier/mail/<recipient>/.read/` — the hidden ack dir of one spool
+    /// (ADR-0019 cl. 3): delivered/consumed mail is renamed in here and
+    /// never rescanned. Hidden, so watcher classification and spool scans
+    /// ignore it; daemon-owned (created lazily on first ack).
+    #[must_use]
+    pub fn courier_mail_read(&self, recipient: &SafeName) -> PathBuf {
+        self.join(&[COURIER, MAIL, recipient.as_str(), crate::mail::READ_DIR])
+    }
+
     /// `courier/queues/` — undelivered per-session delivery queues
     /// (daemon-owned spool, file-as-truth for SPEC §6 sequential
     /// delivery; location decision recorded in the Sprint 03 HANDOFF).
@@ -334,6 +346,33 @@ impl HamletTree {
         self.join(&[COURIER, FREIGHT])
     }
 
+    /// `courier/freight/<name>/` — one agent-created POSIX ACL sandbox
+    /// (SPEC §4 freight ACLs; ADR-0021). The name must already be
+    /// sanitized; lazy: created by the agent inside its container, audited
+    /// by the daemon on the [`crate::watch::Reaction::FreightDir`] event.
+    #[must_use]
+    pub fn courier_freight_sandbox(&self, name: &SafeName) -> PathBuf {
+        self.join(&[COURIER, FREIGHT, name.as_str()])
+    }
+
+    /// `courier/freight/.quarantine/` — daemon-written audit flag dir
+    /// (ADR-0021 cl. 5): one JSON flag per violating sandbox, mode 0444,
+    /// readable-but-never-writable by agents. Hidden, so watcher
+    /// classification and freight scans skip it; lazy: created by the
+    /// daemon's freight plane, never by `ensure`.
+    #[must_use]
+    pub fn courier_freight_quarantine(&self) -> PathBuf {
+        self.join(&[COURIER, FREIGHT, QUARANTINE])
+    }
+
+    /// `courier/freight/.quarantine/<name>.json` — the quarantine flag of
+    /// one sandbox (ADR-0021 cl. 5). Built from a typed [`SafeName`], so
+    /// the flag file name is charset-safe by construction.
+    #[must_use]
+    pub fn courier_freight_quarantine_flag(&self, name: &SafeName) -> PathBuf {
+        self.join(&[COURIER, FREIGHT, QUARANTINE, &format!("{}.json", name)])
+    }
+
     /// `courier/dispatch/` — external webhook exchange root.
     #[must_use]
     pub fn courier_dispatch(&self) -> PathBuf {
@@ -350,6 +389,14 @@ impl HamletTree {
     #[must_use]
     pub fn courier_dispatch_inbox(&self) -> PathBuf {
         self.join(&[COURIER, DISPATCH, INBOX])
+    }
+
+    /// `courier/dispatch/dead/` — dead-lettered outbox requests
+    /// (ADR-0020 cl. 5): renamed here after validation failure or retry
+    /// exhaustion; operator-recoverable, never daemon-deleted.
+    #[must_use]
+    pub fn courier_dispatch_dead(&self) -> PathBuf {
+        self.join(&[COURIER, DISPATCH, DEAD])
     }
 
     // --- market ----------------------------------------------------------
@@ -545,6 +592,7 @@ mod tests {
             tree.courier_freight(),
             tree.courier_dispatch_outbox(),
             tree.courier_dispatch_inbox(),
+            tree.courier_dispatch_dead(),
             tree.market_skills(),
             tree.market_pkgcache(),
             tree.keep_vault(),
@@ -645,6 +693,26 @@ mod tests {
             PathBuf::from("/v/.hamlet/courier/mail/1001")
         );
         assert_eq!(
+            tree.courier_mail_read(&name("1001")),
+            PathBuf::from("/v/.hamlet/courier/mail/1001/.read")
+        );
+        assert_eq!(
+            tree.courier_dispatch_dead(),
+            PathBuf::from("/v/.hamlet/courier/dispatch/dead")
+        );
+        assert_eq!(
+            tree.courier_freight_sandbox(&name("exchange")),
+            PathBuf::from("/v/.hamlet/courier/freight/exchange")
+        );
+        assert_eq!(
+            tree.courier_freight_quarantine(),
+            PathBuf::from("/v/.hamlet/courier/freight/.quarantine")
+        );
+        assert_eq!(
+            tree.courier_freight_quarantine_flag(&name("exchange")),
+            PathBuf::from("/v/.hamlet/courier/freight/.quarantine/exchange.json")
+        );
+        assert_eq!(
             tree.courier_queues(),
             PathBuf::from("/v/.hamlet/courier/queues")
         );
@@ -700,7 +768,7 @@ mod tests {
         assert!(!statics.contains(&tree.parcel(1001)));
         assert!(!statics.contains(&tree.commission(1)));
         // count: root + ENSURE_DIRS
-        assert_eq!(statics.len(), 23);
+        assert_eq!(statics.len(), 24);
     }
 
     /// Every accessor stays inside the root — a SafeName can never escape.

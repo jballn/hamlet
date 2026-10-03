@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+# e2e-04-comms.sh — QA prompt 05/05, adversarial harness for the Sprint 04
+# communication planes (SPEC §8; ADR-0009/0010/0019/0020/0022/0023;
+# CONVENTIONS §9). No podman required — every unit-level attack runs against
+# the scripted seams (FakeRuntime / HttpClient); only T3 needs a real host.
+#
+# Layers:
+#   T1  Adversarial comms suite (always runs):
+#         crates/hamlet-daemon/tests/adversarial_comms.rs
+#       Mail: header-injection matrix (CR/space/oversize), spoofed-From
+#       delivery + bounce, bounce paths (unallocated/hibernating/crashed/
+#       overflow, named senders never chained), partial-file recovery,
+#       kill/restart zero-duplicates across two restarts, FIFO storm.
+#       Watcher: churn bursts, event ordering determinism.
+#       Freight: audit-rule matrix (owner/foreign-uid/named-group/world-
+#       writable, combined), symlink escape flags without getfacl,
+#       promotion-read under strict ACLs.
+#       Dispatch: URL allowlist matrix (byte-prefix, port, http:// denied at
+#       config time), secret redaction in outbox artifacts, retry schedule
+#       gaps per ADR-0010, dead-letter after exhaustion, malformed JSON ->
+#       precise error file without panic.
+#       Inbound webhooks: bad auth (constant-time), oversize body, path-
+#       traversal topics 404 + sanitizer-clean artifacts, content-type
+#       smuggling (body is truth), fixed rejection tokens (no echo).
+#   T2  Source-level ratchets:
+#         - mail.rs: CR anywhere in a message is a typed rejection (LF-only,
+#           ADR-0019 cl. 5) — the header-injection backstop.
+#         - web.rs: constant-time secret_eq + fixed rejection tokens
+#           (ADR-0022: no input echo in error artifacts).
+#         - dispatch.rs: REDACTED_HEADERS covers the full auth/cookie family
+#           (SPEC §8.4; ADR-0020 cl. 6).
+#         - daemon freight.rs: quarantine constants pinned (flag 0444 / dir
+#           0755 — agents can read, never rewrite, the flag).
+#         - dispatch.rs: the allowlist ENFORCEMENT call survives (QA04-10 —
+#           deleting it once left the whole adversarial suite green).
+#         - dispatch.rs: the backoff sleep is the bare deterministic schedule
+#           value — no jitter arithmetic (QA04-11 — a jittered sleep kept all
+#           36 workspace test binaries green).
+#   T3  Guarded real-podman freight suite (only when HAMLET_PODMAN_TESTS=1
+#       AND podman is on PATH; subuid preflight first). Skips with a
+#       recorded reason otherwise — ci.sh runs the guarded battery separately.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+FAILURES=0
+step()  { printf '\033[1m==> %s\033[0m\n' "$*"; }
+pass()  { printf '  ok: %s\n' "$*"; }
+fail()  { printf '\033[1;31m  FAIL: %s\033[0m\n' "$*"; FAILURES=$((FAILURES + 1)); }
+skip()  { printf '  SKIP: %s\n' "$*"; }
+
+# --- T1: adversarial comms suite --------------------------------------------
+step "T1: adversarial comms suite (scripted seams; SPEC §8)"
+if T1_OUT="$(cargo test -p hamlet-daemon --test adversarial_comms --quiet 2>&1)"; then
+  printf '%s\n' "$T1_OUT" | tail -3
+  pass "adversarial_comms: all committed tests green"
+else
+  printf '%s\n' "$T1_OUT"
+  fail "adversarial_comms suite"
+fi
+
+# --- T2: source-level ratchets ----------------------------------------------
+step "T2: source-level ratchets (SPEC §8, ADR-0019/0020/0022)"
+
+# LF-only discipline: a CR anywhere in the message is a typed rejection, so
+# CRLF/CR-LF header splitting cannot smuggle extra headers into mail files.
+if grep -qF "contains('\\r')" crates/hamlet-core/src/mail.rs; then
+  pass "mail parse rejects CR (LF-only, ADR-0019 cl. 5)"
+else
+  fail "CR check missing from mail.rs — header-injection surface opened"
+fi
+
+# Webhook auth: constant-time compare (no timing side-channel) and fixed
+# rejection tokens (input is never echoed into error artifacts).
+if grep -q 'pub fn secret_eq' crates/hamlet-daemon/src/web.rs; then
+  pass "webhook auth uses constant-time secret_eq"
+else
+  fail "secret_eq missing from web.rs — timing side-channel surface"
+fi
+
+TOKENS_OK=1
+for token in unknown-topic bad-auth auth-unavailable payload-too-large malformed-json internal-error; do
+  grep -q "\"$token\"" crates/hamlet-daemon/src/web.rs || TOKENS_OK=0
+done
+if [ "$TOKENS_OK" -eq 1 ]; then
+  pass "all six rejection tokens fixed (sanitizer-clean, no echo)"
+else
+  fail "a rejection reason token changed — re-audit error artifacts for input echo"
+fi
+
+# Outbound redaction: the full authorization/cookie family is stripped from
+# outbox/inbox artifacts before anything touches disk.
+REDACT_OK=1
+for header in authorization proxy-authorization cookie set-cookie x-api-key; do
+  grep -q "\"$header\"" crates/hamlet-core/src/dispatch.rs || REDACT_OK=0
+done
+if [ "$REDACT_OK" -eq 1 ]; then
+  pass "REDACTED_HEADERS covers the auth/cookie family (SPEC §8.4)"
+else
+  fail "a secret-bearing header left the redaction list"
+fi
+
+# Allowlist ENFORCEMENT (not just the matcher): the plane must actually call
+# `allows()` before touching the network. QA04-10: mutation testing showed
+# that deleting this call left adversarial_comms 27/27 GREEN, because the
+# suite's allowlist test exercised only the pure `UrlAllowlist` matcher.
+if grep -qF 'if !allowlist.allows(&request.url) {' crates/hamlet-daemon/src/dispatch.rs; then
+  pass "dispatch plane enforces the URL allowlist (QA04-10)"
+else
+  fail "allowlist.allows() call missing from dispatch.rs — outbox files would POST anywhere"
+fi
+
+# Deterministic, jitter-free backoff (ADR-0020 cl. 4). QA04-11: adding jitter
+# to the sleep (`ms + (attempt % 7) * 3`) kept the ENTIRE workspace green,
+# because the only schedule assertions were on the pure `RetryPolicy::schedule()`
+# plus a lower-bound wall-clock check. Wall-clock tolerances cannot pin
+# ms-scale determinism, so the sleep expression itself is ratcheted.
+if grep -qF 'tokio::time::sleep(Duration::from_millis(ms)).await;' crates/hamlet-daemon/src/dispatch.rs; then
+  # `ms` must be the schedule value itself — never rebound or arithmetically
+  # perturbed before the sleep.
+  if grep -qE 'let (mut )?ms[ :]|ms *[-+*/]' crates/hamlet-daemon/src/dispatch.rs; then
+    fail "backoff sleep perturbed — ADR-0020 cl. 4 requires the jitter-free schedule"
+  else
+    pass "backoff sleep is the bare deterministic schedule (QA04-11)"
+  fi
+else
+  fail "backoff sleep expression changed — re-audit the deterministic schedule (ADR-0020 cl. 4)"
+fi
+
+# Quarantine is agent-readable, never agent-writable: the flag file is 0444
+# and its directory 0755 — pinned constants, not scattered literals.
+if grep -q 'MODE_QUARANTINE_FLAG: u32 = 0o444' crates/hamlet-daemon/src/freight.rs \
+   && grep -q 'MODE_QUARANTINE_DIR: u32 = 0o755' crates/hamlet-daemon/src/freight.rs; then
+  pass "quarantine constants pinned (flag 0444 / dir 0755)"
+else
+  fail "quarantine mode constants drifted — re-audit agent writability"
+fi
+
+# --- T3: guarded real-podman freight suite -----------------------------------
+step "T3: guarded podman freight suite (SPEC §8.6; ADR-0011)"
+if [ "${HAMLET_PODMAN_TESTS:-0}" != "1" ]; then
+  skip "HAMLET_PODMAN_TESTS != 1 (export it on a podman-capable host)"
+elif ! command -v podman >/dev/null 2>&1; then
+  skip "podman not on PATH"
+else
+  # Preflight: ADR-0011 needs a subuid range for the slot UIDs, and podman
+  # must be rootless. Fail loudly before a cold (~200 MB) bootstrap.
+  USER_NAME="$(id -un)"
+  SUBUID_LINE="$(grep "^${USER_NAME}:" /etc/subuid 2>/dev/null || true)"
+  if [ -z "$SUBUID_LINE" ]; then
+    fail "no /etc/subuid entry for ${USER_NAME} — ADR-0011 subuid chown cannot work"
+  else
+    if T3_OUT="$(cargo test -p hamlet-daemon --test freight_guarded --quiet 2>&1)"; then
+      printf '%s\n' "$T3_OUT" | tail -3
+      pass "freight_guarded: real-podman quarantine/promotion suite green"
+    else
+      printf '%s\n' "$T3_OUT"
+      fail "freight_guarded suite"
+    fi
+  fi
+fi
+
+# --- summary -----------------------------------------------------------------
+if [ "$FAILURES" -eq 0 ]; then
+  printf '\033[1;32me2e-04-comms: PASS\033[0m\n'
+else
+  printf '\033[1;31me2e-04-comms: %s FAILURE(S)\033[0m\n' "$FAILURES"
+  exit 1
+fi

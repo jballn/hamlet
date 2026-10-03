@@ -618,7 +618,7 @@ async fn ensure_image_builds_once_from_a_private_context() {
     assert!(outcome.built);
     assert!(outcome
         .tag
-        .starts_with("localhost/hamlet/village-alpine:v1-f1-c"));
+        .starts_with("localhost/hamlet/village-alpine:v1-f2-c"));
 
     let log = f.runtime.argv_log();
     let verbs: Vec<&str> = log.iter().map(|a| a[1].as_str()).collect();

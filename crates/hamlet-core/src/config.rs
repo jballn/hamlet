@@ -32,10 +32,12 @@ use serde::{Deserialize, Serialize};
 /// `sessions` section (session supervision: pi model selection, readiness/
 /// stop timing, delivery-queue bound, restart policy). v3 → v4 (Sprint 03
 /// step 04, ADR-0016): additive `sessions.latency_spike_ms` (stream
-/// telemetry spike threshold). Older documents still parse — new fields
-/// carry `#[serde(default)]`, so migration is "parse old, write new"; no
-/// rewrite of existing trees is required.
-pub const CONFIG_VERSION: u32 = 4;
+/// telemetry spike threshold). v4 → v5 (Sprint 04, ADR-0020): additive
+/// `dispatch` keys — `url_allowlist`, `max_attempts`, `backoff_initial_ms`,
+/// `backoff_max_ms` (dispatch protocol policy). Older documents still parse
+/// — new fields carry `#[serde(default)]`, so migration is "parse old,
+/// write new"; no rewrite of existing trees is required.
+pub const CONFIG_VERSION: u32 = 6;
 
 /// Default daemon data dir (sled telemetry location). Relative paths
 /// resolve against the *working directory containing* the village root —
@@ -55,6 +57,16 @@ const DEFAULT_BASE_IMAGE: &str = "docker.io/library/alpine:3.20";
 const DEFAULT_WEB_LISTEN_ADDR: &str = "127.0.0.1:8787";
 /// Default per-request webhook dispatch timeout (SPEC §8.4).
 const DEFAULT_DISPATCH_TIMEOUT_SECS: u64 = 30;
+/// Default dispatch retry budget (ADR-0020 cl. 4).
+const DEFAULT_DISPATCH_MAX_ATTEMPTS: u32 = 5;
+/// Default dispatch backoff initial delay, ms (ADR-0020 cl. 4).
+const DEFAULT_DISPATCH_BACKOFF_INITIAL_MS: u64 = 5_000;
+/// Default dispatch backoff cap, ms (ADR-0020 cl. 4).
+const DEFAULT_DISPATCH_BACKOFF_MAX_MS: u64 = 900_000;
+/// Default `.env` key holding the inbound-webhook shared secret (ADR-0022).
+const DEFAULT_WEBHOOK_AUTH_ENV_KEY: &str = "HAMLET_WEBHOOK_AUTH";
+/// Default inbound-webhook body cap, bytes (ADR-0022 cl. 2).
+const DEFAULT_WEBHOOK_MAX_BODY_BYTES: u64 = 64 * 1024;
 /// Default container memory limit (conservative until the Sprint 07 policy
 /// ADR fixes the real curve).
 const DEFAULT_CONTAINER_MEMORY: &str = "512m";
@@ -101,8 +113,9 @@ pub struct Config {
     pub web_listen_addr: String,
     /// Daemon log level.
     pub log_level: LogLevel,
-    /// External webhook dispatch settings (placeholder — SPEC §8.4 policy is
-    /// [DEV]; endpoint auth lives in `.env`, never here).
+    /// External webhook dispatch settings (SPEC §8.4; policy per ADR-0020
+    /// — allowlist, deterministic retry, dead-letter; endpoint auth lives
+    /// in `.env`, never here).
     pub dispatch: DispatchConfig,
     /// Container resource-limit placeholders (SPEC §4; the binding policy
     /// ADR is Sprint 07 — values here are wired into every `podman run` as
@@ -115,6 +128,12 @@ pub struct Config {
     /// restart policy. Absent in v1/v2 documents; defaults apply.
     #[serde(default)]
     pub sessions: SessionsConfig,
+    /// Inbound webhook endpoints (SPEC §8.5; policy per ADR-0022): shared-
+    /// secret auth by `.env` key name, body cap, topic → sink routing
+    /// table. The secret itself never appears here. Absent in ≤v5
+    /// documents; defaults apply.
+    #[serde(default)]
+    pub webhooks: WebhooksConfig,
 }
 
 impl Default for Config {
@@ -129,6 +148,7 @@ impl Default for Config {
             dispatch: DispatchConfig::default(),
             resources: ResourcesConfig::default(),
             sessions: SessionsConfig::default(),
+            webhooks: WebhooksConfig::default(),
         }
     }
 }
@@ -204,7 +224,8 @@ impl Config {
         }
         self.dispatch.validate()?;
         self.resources.validate()?;
-        self.sessions.validate()
+        self.sessions.validate()?;
+        self.webhooks.validate()
     }
 
     /// Resolve [`Config::daemon_data_dir`] for the village rooted at
@@ -251,16 +272,40 @@ impl fmt::Display for LogLevel {
     }
 }
 
-/// Webhook dispatch settings (SPEC §8.4). Placeholder: retry/backoff policy
-/// and the outbox/inbox file schema land with the courier work; endpoint
-/// auth comes from `.env` secrets, never from `config.json`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Webhook dispatch settings (SPEC §8.4; policy fixed by ADR-0020).
+/// Endpoint auth comes from `.env` secrets referenced by key name only —
+/// never from `config.json` and never inline in outbox files.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DispatchConfig {
     /// Whether the daemon POSTs `courier/dispatch/outbox/` files at all.
     pub enabled: bool,
     /// Per-request HTTP timeout, seconds (1..=3600).
     pub timeout_secs: u64,
+    /// URL allowlist entries `https://host[:port][/prefix]` (ADR-0020
+    /// cl. 3). Empty (the default) denies every dispatch.
+    #[serde(default)]
+    pub url_allowlist: Vec<String>,
+    /// Total attempts per request before dead-letter, 1..=16 (ADR-0020
+    /// cl. 4). Absent in v4 documents; default applies.
+    #[serde(default = "default_dispatch_max_attempts")]
+    pub max_attempts: u32,
+    /// Backoff delay before attempt 2, ms (ADR-0020 cl. 4).
+    #[serde(default = "default_dispatch_backoff_initial_ms")]
+    pub backoff_initial_ms: u64,
+    /// Backoff delay cap, ms (ADR-0020 cl. 4).
+    #[serde(default = "default_dispatch_backoff_max_ms")]
+    pub backoff_max_ms: u64,
+}
+
+fn default_dispatch_max_attempts() -> u32 {
+    DEFAULT_DISPATCH_MAX_ATTEMPTS
+}
+fn default_dispatch_backoff_initial_ms() -> u64 {
+    DEFAULT_DISPATCH_BACKOFF_INITIAL_MS
+}
+fn default_dispatch_backoff_max_ms() -> u64 {
+    DEFAULT_DISPATCH_BACKOFF_MAX_MS
 }
 
 impl Default for DispatchConfig {
@@ -268,6 +313,10 @@ impl Default for DispatchConfig {
         Self {
             enabled: false,
             timeout_secs: DEFAULT_DISPATCH_TIMEOUT_SECS,
+            url_allowlist: Vec::new(),
+            max_attempts: DEFAULT_DISPATCH_MAX_ATTEMPTS,
+            backoff_initial_ms: DEFAULT_DISPATCH_BACKOFF_INITIAL_MS,
+            backoff_max_ms: DEFAULT_DISPATCH_BACKOFF_MAX_MS,
         }
     }
 }
@@ -275,13 +324,130 @@ impl Default for DispatchConfig {
 impl DispatchConfig {
     /// # Errors
     ///
-    /// [`ConfigError::Invalid`] when `timeout_secs` is outside 1..=3600.
+    /// [`ConfigError::Invalid`] when `timeout_secs` is outside 1..=3600,
+    /// an allowlist entry is malformed, or the retry policy is out of the
+    /// ADR-0020 cl. 4 ranges.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.timeout_secs == 0 || self.timeout_secs > 3600 {
             return Err(ConfigError::Invalid(format!(
                 "dispatch.timeout_secs must be in 1..=3600, got {}",
                 self.timeout_secs
             )));
+        }
+        crate::dispatch::UrlAllowlist::parse(&self.url_allowlist)
+            .map_err(|e| ConfigError::Invalid(format!("dispatch.url_allowlist: {e}")))?;
+        self.retry_policy()
+            .validate()
+            .map_err(|e| ConfigError::Invalid(format!("dispatch: {e}")))
+    }
+
+    /// The ADR-0020 cl. 4 retry policy as a typed value.
+    #[must_use]
+    pub fn retry_policy(&self) -> crate::dispatch::RetryPolicy {
+        crate::dispatch::RetryPolicy {
+            max_attempts: self.max_attempts,
+            initial_ms: self.backoff_initial_ms,
+            max_ms: self.backoff_max_ms,
+        }
+    }
+}
+
+/// Inbound webhook endpoint settings (SPEC §8.5; policy fixed by ADR-0022).
+/// The shared secret comes from `.env` under [`WebhooksConfig::auth_env_key`]
+/// — never from `config.json`. The routing table maps a sanitized topic
+/// name to its sinks; topics outside the table are rejected (404).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebhooksConfig {
+    /// Whether the daemon serves `POST /webhook/<topic>` at all.
+    pub enabled: bool,
+    /// `.env` key holding the shared secret (`[A-Z][A-Z0-9_]{0,63}`;
+    /// compared against the `X-Hamlet-Auth` request header — ADR-0022
+    /// cl. 1). A referenced-but-missing key fails every request closed
+    /// (503), never open.
+    pub auth_env_key: String,
+    /// Request body cap, bytes (1..=1048576; oversize → 413 — ADR-0022
+    /// cl. 2).
+    pub max_body_bytes: u64,
+    /// Topic → sinks. Keys must pass the §4 sanitizer (they become file
+    /// name components and mail subjects); an empty table (the default)
+    /// rejects every topic.
+    pub routes: BTreeMap<String, WebhookRoute>,
+}
+
+/// Sinks of one webhook topic route (ADR-0022 cl. 3). At least one sink
+/// must be active — a route that does nothing is a config error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebhookRoute {
+    /// Write the validated event as a dispatch **inbox** file
+    /// (`courier/dispatch/inbox/<correlation>.json`, ADR-0022 cl. 4).
+    #[serde(default)]
+    pub dispatch_inbox: bool,
+    /// Deliver the event as mail to these slot UIDs (1000–2000; the mail
+    /// router applies the normal bounce rules — ADR-0022 cl. 5).
+    #[serde(default)]
+    pub mail_to: Vec<u32>,
+}
+
+impl Default for WebhooksConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            auth_env_key: DEFAULT_WEBHOOK_AUTH_ENV_KEY.to_string(),
+            max_body_bytes: DEFAULT_WEBHOOK_MAX_BODY_BYTES,
+            routes: BTreeMap::new(),
+        }
+    }
+}
+
+impl WebhooksConfig {
+    /// # Errors
+    ///
+    /// [`ConfigError::Invalid`] when `auth_env_key` violates the `.env`
+    /// key grammar, `max_body_bytes` is out of 1..=1 MiB, a topic fails
+    /// the §4 sanitizer, a route has no sink, or a `mail_to` uid is not a
+    /// slot uid / is duplicated.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if !crate::dispatch::is_env_key(&self.auth_env_key) {
+            return Err(ConfigError::Invalid(format!(
+                "webhooks.auth_env_key must match [A-Z][A-Z0-9_]{{0,63}}, got {:?}",
+                self.auth_env_key
+            )));
+        }
+        if self.max_body_bytes == 0
+            || self.max_body_bytes > crate::dispatch::MAX_OUTBOX_BYTES as u64
+        {
+            return Err(ConfigError::Invalid(format!(
+                "webhooks.max_body_bytes must be in 1..={}, got {}",
+                crate::dispatch::MAX_OUTBOX_BYTES,
+                self.max_body_bytes
+            )));
+        }
+        for (topic, route) in &self.routes {
+            if crate::sanitize::sanitize_name(topic).is_err() {
+                return Err(ConfigError::Invalid(format!(
+                    "webhooks.routes topic {topic:?} fails the §4 sanitizer"
+                )));
+            }
+            if !route.dispatch_inbox && route.mail_to.is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "webhooks.routes[{topic:?}] must enable dispatch_inbox or list mail_to recipients"
+                )));
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            for uid in &route.mail_to {
+                if !crate::mail::is_slot_uid(*uid) {
+                    return Err(ConfigError::Invalid(format!(
+                        "webhooks.routes[{topic:?}].mail_to uid {uid} is not a slot uid (1000–2000)"
+                    )));
+                }
+                if !seen.insert(uid) {
+                    return Err(ConfigError::Invalid(format!(
+                        "webhooks.routes[{topic:?}].mail_to lists uid {uid} twice"
+                    )));
+                }
+            }
         }
         Ok(())
     }
@@ -586,6 +752,14 @@ pub const ENV_TEMPLATE: &str = "\
 # Additional provider keys (HAMLET_API_KEY_<PROVIDER>):
 #HAMLET_API_KEY_ANTHROPIC=test-key-do-not-use
 #HAMLET_API_KEY_OPENAI=test-key-do-not-use
+
+# Shared secret for inbound webhook auth (ADR-0022; sent as the
+# X-Hamlet-Auth header on POST /webhook/<topic>):
+#HAMLET_WEBHOOK_AUTH=test-key-do-not-use
+
+# Endpoint credentials referenced BY KEY NAME from dispatch outbox files
+# (ADR-0020 cl. 1/6 `headers_env` — values live only here), for example:
+#HAMLET_DISPATCH_AUTH=test-key-do-not-use
 ";
 
 /// A single secret value. Deliberately has **no** [`serde::Serialize`] impl
@@ -717,12 +891,12 @@ mod tests {
     use super::*;
 
     /// Committed golden vector: the exact bytes `hamlet init` writes to
-    /// `config.json` (defaults, `config_version` 1).
+    /// `config.json` (defaults, `config_version` 6).
     #[test]
     fn default_config_render_golden() {
         let expected = "\
 {
-  \"config_version\": 4,
+  \"config_version\": 6,
   \"daemon_data_dir\": \".hamlet-data/sled\",
   \"podman_bin\": \"podman\",
   \"base_image\": \"docker.io/library/alpine:3.20\",
@@ -730,7 +904,11 @@ mod tests {
   \"log_level\": \"info\",
   \"dispatch\": {
     \"enabled\": false,
-    \"timeout_secs\": 30
+    \"timeout_secs\": 30,
+    \"url_allowlist\": [],
+    \"max_attempts\": 5,
+    \"backoff_initial_ms\": 5000,
+    \"backoff_max_ms\": 900000
   },
   \"resources\": {
     \"memory\": \"512m\",
@@ -748,6 +926,12 @@ mod tests {
       \"backoff_initial_ms\": 1000,
       \"backoff_max_ms\": 60000
     }
+  },
+  \"webhooks\": {
+    \"enabled\": false,
+    \"auth_env_key\": \"HAMLET_WEBHOOK_AUTH\",
+    \"max_body_bytes\": 65536,
+    \"routes\": {}
   }
 }
 ";
@@ -837,6 +1021,221 @@ mod tests {
         assert_eq!(parsed.config_version, 3);
         assert_eq!(parsed.sessions.latency_spike_ms, 30_000);
         assert_eq!(parsed.sessions.queue_depth, 64);
+    }
+
+    /// v4 → v5 migration is additive: a v4 document (a `dispatch` block
+    /// without the ADR-0020 policy keys) still parses; the retry policy
+    /// takes its defaults (CONVENTIONS §3 r3 — no silent rewrites).
+    #[test]
+    fn v4_config_parses_with_default_dispatch_policy() {
+        let v4 = "\
+{
+  \"config_version\": 4,
+  \"daemon_data_dir\": \".hamlet-data/sled\",
+  \"podman_bin\": \"podman\",
+  \"base_image\": \"docker.io/library/alpine:3.20\",
+  \"web_listen_addr\": \"127.0.0.1:8787\",
+  \"log_level\": \"info\",
+  \"dispatch\": {
+    \"enabled\": false,
+    \"timeout_secs\": 30
+  }
+}
+";
+        let parsed = Config::parse(v4).expect("v4 must still parse");
+        assert_eq!(parsed.config_version, 4);
+        assert_eq!(parsed.dispatch, DispatchConfig::default());
+        // ADR-0020 cl. 4 golden schedule falls out of the defaults:
+        assert_eq!(
+            parsed.dispatch.retry_policy().schedule(),
+            vec![5_000, 10_000, 20_000, 40_000]
+        );
+    }
+
+    /// v5 → v6 migration is additive: a v5 document (no `webhooks` block)
+    /// still parses; the inbound-webhook surface takes its deny-all
+    /// defaults (CONVENTIONS §3 r3 — no silent rewrites).
+    #[test]
+    fn v5_config_parses_with_default_webhooks() {
+        let v5 = "\
+{
+  \"config_version\": 5,
+  \"daemon_data_dir\": \".hamlet-data/sled\",
+  \"podman_bin\": \"podman\",
+  \"base_image\": \"docker.io/library/alpine:3.20\",
+  \"web_listen_addr\": \"127.0.0.1:8787\",
+  \"log_level\": \"info\",
+  \"dispatch\": {
+    \"enabled\": false,
+    \"timeout_secs\": 30
+  }
+}
+";
+        let parsed = Config::parse(v5).expect("v5 must still parse");
+        assert_eq!(parsed.config_version, 5);
+        assert_eq!(parsed.webhooks, WebhooksConfig::default());
+        assert!(!parsed.webhooks.enabled); // default posture: closed
+        assert!(parsed.webhooks.routes.is_empty()); // deny-all routing
+    }
+
+    /// Webhook routing-table validation (ADR-0022 cl. 1–3, 5).
+    #[test]
+    fn webhooks_config_validation() {
+        let base = WebhooksConfig::default();
+        assert!(base.validate().is_ok());
+
+        let bad_key = WebhooksConfig {
+            auth_env_key: "lower_case".to_string(),
+            ..base.clone()
+        };
+        assert!(bad_key.validate().is_err());
+
+        for bad_cap in [0, crate::dispatch::MAX_OUTBOX_BYTES as u64 + 1] {
+            let capped = WebhooksConfig {
+                max_body_bytes: bad_cap,
+                ..base.clone()
+            };
+            assert!(capped.validate().is_err(), "cap {bad_cap} must fail");
+        }
+
+        // Topic names are §4-sanitizer-checked (they become file name
+        // components and mail subject fragments).
+        for bad_topic in ["../etc", "a/b", "", "-lead", "spaced topic"] {
+            let mut routes = BTreeMap::new();
+            routes.insert(
+                bad_topic.to_string(),
+                WebhookRoute {
+                    dispatch_inbox: true,
+                    mail_to: vec![],
+                },
+            );
+            let routed = WebhooksConfig {
+                routes,
+                ..base.clone()
+            };
+            assert!(
+                routed.validate().is_err(),
+                "topic {bad_topic:?} must be rejected"
+            );
+        }
+
+        // A route with no sink is a config error.
+        let mut routes = BTreeMap::new();
+        routes.insert(
+            "deploy".to_string(),
+            WebhookRoute {
+                dispatch_inbox: false,
+                mail_to: vec![],
+            },
+        );
+        assert!(WebhooksConfig {
+            routes,
+            ..base.clone()
+        }
+        .validate()
+        .is_err());
+
+        // mail_to: slot uids only, no duplicates.
+        let mut routes = BTreeMap::new();
+        routes.insert(
+            "deploy".to_string(),
+            WebhookRoute {
+                dispatch_inbox: false,
+                mail_to: vec![4242],
+            },
+        );
+        assert!(WebhooksConfig {
+            routes,
+            ..base.clone()
+        }
+        .validate()
+        .is_err());
+        let mut routes = BTreeMap::new();
+        routes.insert(
+            "deploy".to_string(),
+            WebhookRoute {
+                dispatch_inbox: false,
+                mail_to: vec![1001, 1001],
+            },
+        );
+        assert!(WebhooksConfig {
+            routes,
+            ..base.clone()
+        }
+        .validate()
+        .is_err());
+
+        // A valid mixed routing table passes.
+        let mut routes = BTreeMap::new();
+        routes.insert(
+            "deploy.done".to_string(),
+            WebhookRoute {
+                dispatch_inbox: true,
+                mail_to: vec![],
+            },
+        );
+        routes.insert(
+            "audit".to_string(),
+            WebhookRoute {
+                dispatch_inbox: true,
+                mail_to: vec![1000, 1002],
+            },
+        );
+        let ok = WebhooksConfig {
+            enabled: true,
+            routes,
+            ..base
+        };
+        ok.validate().unwrap();
+    }
+
+    /// Dispatch policy validation (ADR-0020 cl. 3–4): malformed allowlist
+    /// entries and out-of-range retry values are config errors.
+    #[test]
+    fn dispatch_config_validation() {
+        let base = DispatchConfig::default();
+        assert!(base.validate().is_ok());
+        assert!(base.url_allowlist.is_empty()); // deny-all default posture
+
+        let allowed = DispatchConfig {
+            url_allowlist: vec!["https://hooks.example.invalid/v1".to_owned()],
+            ..base.clone()
+        };
+        assert!(allowed.validate().is_ok());
+
+        let http_entry = DispatchConfig {
+            url_allowlist: vec!["http://hooks.example.invalid".to_owned()],
+            ..base.clone()
+        };
+        assert!(matches!(
+            http_entry.validate(),
+            Err(ConfigError::Invalid(_))
+        ));
+
+        for bad in [
+            DispatchConfig {
+                max_attempts: 0,
+                ..base.clone()
+            },
+            DispatchConfig {
+                max_attempts: 17,
+                ..base.clone()
+            },
+            DispatchConfig {
+                backoff_initial_ms: 1,
+                ..base.clone()
+            },
+            DispatchConfig {
+                backoff_max_ms: 100,
+                ..base.clone()
+            }, // < initial
+        ] {
+            assert!(
+                matches!(bad.validate(), Err(ConfigError::Invalid(_))),
+                "{:?} must be rejected",
+                bad
+            );
+        }
     }
 
     #[test]
@@ -1072,6 +1471,7 @@ mod tests {
                 dispatch: DispatchConfig {
                     enabled: false,
                     timeout_secs: 0,
+                    ..Default::default()
                 },
                 ..Default::default()
             },
@@ -1079,6 +1479,7 @@ mod tests {
                 dispatch: DispatchConfig {
                     enabled: false,
                     timeout_secs: 3601,
+                    ..Default::default()
                 },
                 ..Default::default()
             },

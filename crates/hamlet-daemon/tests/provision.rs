@@ -206,7 +206,7 @@ async fn provision_happy_path_records_lease_and_hardens_host() {
     // The parcel runs the DERIVED image, never the raw parent (ADR-0012).
     assert!(
         run.iter()
-            .any(|a| a.starts_with("localhost/hamlet/village-alpine:v1-f1-c")),
+            .any(|a| a.starts_with("localhost/hamlet/village-alpine:v1-f2-c")),
         "derived image tag: {run:?}"
     );
     assert!(

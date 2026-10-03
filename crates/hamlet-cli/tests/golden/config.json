@@ -1,5 +1,5 @@
 {
-  "config_version": 4,
+  "config_version": 6,
   "daemon_data_dir": ".hamlet-data/sled",
   "podman_bin": "podman",
   "base_image": "docker.io/library/alpine:3.20",
@@ -7,7 +7,11 @@
   "log_level": "info",
   "dispatch": {
     "enabled": false,
-    "timeout_secs": 30
+    "timeout_secs": 30,
+    "url_allowlist": [],
+    "max_attempts": 5,
+    "backoff_initial_ms": 5000,
+    "backoff_max_ms": 900000
   },
   "resources": {
     "memory": "512m",
@@ -25,5 +29,11 @@
       "backoff_initial_ms": 1000,
       "backoff_max_ms": 60000
     }
+  },
+  "webhooks": {
+    "enabled": false,
+    "auth_env_key": "HAMLET_WEBHOOK_AUTH",
+    "max_body_bytes": 65536,
+    "routes": {}
   }
 }

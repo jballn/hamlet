@@ -170,12 +170,13 @@ async fn podman_provisioned_parcels_enforce_the_spec4_isolation_invariants() {
             cache.stderr_lossy()
         );
 
-        // --- freight: 0710 daemon-owned — slot UIDs cannot traverse until
-        // Sprint 04 layers the POSIX ACL sandboxes on top (ADR-0011 cl. 3).
+        // --- freight: 01770 daemon-owned, other::--- — slot UIDs cannot
+        // traverse until the Sprint 04 freight plane grants root ACLs
+        // (ADR-0021 cl. 2); this suite never runs the plane.
         let freight = run(&runtime, AGENT_A, &["ls", "/var/freight"]).await?;
         assert_ne!(
             freight.code, 0,
-            "freight is ACL-gated (0710) until Sprint 04 setfacl sandboxes"
+            "freight stays ACL-gated (01770, no slot grants) without the freight plane"
         );
 
         // --- mirror checks from container B ---------------------------------
@@ -242,7 +243,7 @@ async fn podman_provisioned_parcels_enforce_the_spec4_isolation_invariants() {
         "home must be subuid-owned on the host (podman unshare chown ran), \
          not daemon-owned — cross-container ownership isolation depends on it"
     );
-    assert_eq!(host_mode(&tree.courier_freight()), 0o710);
+    assert_eq!(host_mode(&tree.courier_freight()), 0o1770);
     assert_eq!(host_mode(&tree.commission_git(COMMISSION)), 0o755);
     assert_eq!(host_mode(&tree.market_pkgcache()), 0o1777);
 
