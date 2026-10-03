@@ -1051,3 +1051,59 @@ cargo test --workspace                  # 36/36 binaries
 TMPDIR=/home/dock/tmp-ci ./scripts/ci-local.sh   # e2e always run; step 5 red = QA04-07/08/09
 HAMLET_PODMAN_TESTS=1 ./scripts/e2e-04-comms.sh  # T3 guarded freight: green
 ```
+
+---
+
+## Step 07 — commit-agent: squash-merge & tag
+
+Precondition met: step 06 recorded `GATE 04/06: PASS`.
+
+### Merge
+
+- **Squash-merge:** `sprint/04-communication` (7 commits) → `main`, single
+  conventional commit:
+  `feat(core,daemon,ci): sprint 04 communication planes — mail, watchers,
+  freight ACLs, dispatch, inbound webhooks` — **SHA `b21cccf`**.
+- **Tag:** `sprint/04-communication` (points at `b21cccf`; merged tree is
+  byte-identical to the branch tip — `git diff sprint/04-communication main`
+  is empty).
+- **Diff review (`git diff main...HEAD`, 51 files, +16932/−209): clean.**
+  No `.env`, no `target/`, no `.hamlet/` runtime tree, no sled database, no
+  logs. The only credential-shaped strings are the commented-out
+  `test-key-do-not-use` fakes in
+  `crates/hamlet-cli/tests/golden/env-template` (the env *template*, not a
+  populated `.env`) — the `headers_env` schema makes an inline secret
+  inexpressible by construction (ADR-0020 cl. 1). Untracked `assets/` and
+  `roadmap/.runner-state.json` were left unstaged.
+
+### DoD on merged main (CONVENTIONS §8)
+
+| Check | Result |
+|---|---|
+| `cargo fmt --all --check` | **PASS** |
+| `cargo clippy --workspace --all-targets -- -D warnings` | **PASS** |
+| `cargo test --workspace` | **PASS** — 36/36 binaries, 0 failed |
+| `scripts/check-deps.sh` | **PASS** |
+| `scripts/e2e-01..04` (via `ci-local.sh`) | **PASS** — all five harnesses, incl. `e2e-04` T1 29/29 + T2's 8 ratchets |
+| `scripts/ci-local.sh` overall | **FAIL (1)** — step 5 only: guarded podman battery |
+| guarded freight ACL suite (`HAMLET_PODMAN_TESTS=1 ./scripts/e2e-04-comms.sh`) | **PASS** (green on real podman) |
+
+Run with the QA04-08 remedy (`TMPDIR=/home/dock/tmp-ci`, disk-backed), which
+removes the ENOSPC/SIGKILL class from the guarded step. The single red is the
+**identical** step-5 failure the 04/06 gate recorded — host findings
+**QA04-07** (daemon user is also the podman owner, so the escape suite's
+uid-disjointness precondition cannot hold), **QA04-08** (RAM-bound `/tmp`)
+and **QA04-09** (SPEC §4 mounts home and pkgcache on separate devices, so the
+ADR-0013 EXDEV publish is non-fatal while the suite asserts otherwise). No
+new failure, no product defect: `main` is byte-identical to the gated branch.
+
+### Verdict
+
+`GATE 04/07: PASS` — merge `b21cccf`, tag `sprint/04-communication`.
+
+**Merge SHA:** `b21cccf`
+**Tag:** `sprint/04-communication`
+
+Carry-forward unchanged: QA04-07/08/09 to the CI-agent (host provisioning —
+dedicated `hamlet` service user, disk-backed `TMPDIR`, ≥4 GB RAM headroom) and
+QA04-09's assertion policy to the container/QA owners.
