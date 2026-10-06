@@ -1458,3 +1458,17 @@ while no realistic load can sink it.
 
 Step 06's precondition (HANDOFF shows `GATE 05/05: PASS`) is met; the merge
 & tag follow per `06-commit-agent.md`.
+
+### Merge & tag
+
+- **Squash-merged** `sprint/05-mayor-loop` → `main`: **`51dbfa9`** (21 branch
+  commits squashed; 65 files, +21199). Tag **`sprint/05-mayor-loop`** →
+  `51dbfa9`.
+- Battery on merged main: the first run was red by one line — e2e-06's
+  hermetic work-area test needs ≥ 4 GiB free in the *real* area, and
+  repeated battery runs had stranded `.tmp*` village trees down to 2.5 GB
+  (host shape, not a defect: the guard refused correctly, and e2e-05's manor
+  smoke SKIPped with its recorded QA04-08 remedy). After the operator
+  reclaimed the stranded trees (~27 GiB free restored): **full battery PASS
+  on `main`** (`TMPDIR=/var/hamlet/tmp HAMLET_PODMAN_TESTS=1
+  ./scripts/ci-local.sh`, exit 0) — GATE 05/05 holds on the merged artifact.
