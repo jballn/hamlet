@@ -3,6 +3,10 @@
 Status: Accepted
 Date: Sprint 04 (step 03)
 Amends: ADR-0011 cl. 3 (freight-root mode row only)
+Amended by: ADR-0031 (cl. 1: the listing keeps its `# owner:` header — the
+original `-c` flag suppressed the very state the audit's first rule reads),
+ADR-0033 (cl. 6: promotion-read's pre-read kind check escalates through the
+userns, because a 0700 subuid-owned sandbox denies the daemon's own lstat)
 Refs: SPEC §4 (Freight ACLs), §8.3; ADR-0019 cl. 5 (`Reaction::FreightDir`)
 
 ## Context
@@ -15,7 +19,7 @@ subuid-owned 0700 dirs — impossible for the daemon's host user directly.
 
 ## Decision
 
-1. Audit engine is pure (`hamlet-core::freight`): strict `getfacl -p -n -c`
+1. Audit engine is pure (`hamlet-core::freight`): strict `getfacl -p -n`
    parser + rule table over committed golden fixtures. Rules: owner is a
    charter slot; no `other` write (access or default); every named grantee
    UID is on the roster; no named *group* entries (groups aren't charter

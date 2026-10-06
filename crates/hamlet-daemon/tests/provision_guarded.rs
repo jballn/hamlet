@@ -14,6 +14,13 @@
 //! (0700 + subuid ownership — the invariant keep-id could never provide,
 //! ADR-0011 context). Host-side braces (modes, subuid ownership) are
 //! asserted after teardown.
+//!
+//! The SPEC §4 per-slot uid policy needs the QA04-07 host precondition (a
+//! daemon user disjoint from the rootless userns that can actually chown to a
+//! subuid); it is checked up front and recorded as a SKIP with the host
+//! remedy. See `tests/support/mod.rs`.
+
+mod support;
 
 use std::fs;
 use std::os::unix::fs::MetadataExt;
@@ -42,42 +49,68 @@ async fn run(
 /// CONVENTIONS §5 guard: run only with `HAMLET_PODMAN_TESTS=1` and podman
 /// on PATH; otherwise skip with a recorded reason.
 fn podman_guard() -> Option<String> {
-    if std::env::var("HAMLET_PODMAN_TESTS").unwrap_or_default() != "1" {
-        return Some("HAMLET_PODMAN_TESTS != 1".to_owned());
-    }
-    let found = StdCommand::new("podman")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if !found {
-        return Some("podman not on PATH".to_owned());
-    }
-    None
+    support::podman_env_guard()
+}
+
+/// Does `path` exist, asked through the daemon's own userns capability?
+///
+/// `podman unshare stat -c %F -- <path>` (the same typed probe the freight
+/// promotion-read uses, ADR-0033): the parcel home is 0700 slot-owned, so a
+/// host-side `Path::exists()` is EACCES-false on any host whose subuid
+/// mapping actually works.
+async fn unshare_exists(
+    runtime: &PodmanRuntime,
+    path: &std::path::Path,
+) -> Result<bool, PodmanError> {
+    let cmd = hamlet_daemon::podman::stat_cmd(path)?;
+    // A non-zero exit means "no such path" (stat's own answer); anything else
+    // is a real seam failure and stays an error.
+    Ok(runtime
+        .unshare_exec(&cmd)
+        .await
+        .map(|out| out.code == 0)
+        .unwrap_or(false))
 }
 
 const COMMISSION: u64 = 91;
-const AGENT_A: &str = "hamlet-guard-a"; // slot 1001
-const AGENT_B: &str = "hamlet-guard-b"; // slot 1002
+/// Container names are **per-run** (QA04-26): podman names are global to the
+/// store, so two overlapping batteries provisioned each other's containers and
+/// then failed inside an isolation assertion with text that reads like a
+/// SPEC §4 defect. The constants are the stable *bases*; every container,
+/// brief and cleanup below uses the pid-scoped name.
+const AGENT_A_BASE: &str = "hamlet-guard-a"; // slot 1001
+const AGENT_B_BASE: &str = "hamlet-guard-b"; // slot 1002
 const UID_A: u32 = 1001;
 const UID_B: u32 = 1002;
 
 #[tokio::test]
 #[ignore = "guarded: needs HAMLET_PODMAN_TESTS=1 + podman on PATH (CONVENTIONS §5)"]
 async fn podman_provisioned_parcels_enforce_the_spec4_isolation_invariants() {
-    if let Some(reason) = podman_guard() {
-        eprintln!(
-            "SKIP podman_provisioned_parcels_enforce_the_spec4_isolation_invariants: {reason}"
+    if let Some(reason) = podman_guard()
+        .or_else(support::userns_precondition)
+        .or_else(|| support::work_area_precondition(&std::env::temp_dir()))
+    {
+        support::skip(
+            "podman_provisioned_parcels_enforce_the_spec4_isolation_invariants",
+            &reason,
         );
         return;
     }
+
+    // QA04-26: podman container names are global to the store, so two
+    // overlapping batteries adopted (and `rm -f`ed) each other's parcels and
+    // then failed inside isolation assertions with text that reads like a
+    // SPEC §4 defect. Per-run names make concurrent runs coexist; the
+    // battery-wide lock is the CI layer's half (`guarded-entry.sh`).
+    let agent_a = support::scoped(AGENT_A_BASE);
+    let agent_b = support::scoped(AGENT_B_BASE);
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let tree = HamletTree::ensure(tmp.path().join(".hamlet")).expect("village tree");
     Charter::empty()
         .save_atomic(&tree.charter())
         .expect("seed charter");
-    for agent in [AGENT_A, AGENT_B] {
+    for agent in [&agent_a, &agent_b] {
         let brief = tree.register_brief(&sanitize_name(agent).unwrap());
         fs::write(brief, format!("# {agent}\n\nGuarded-test brief.\n")).expect("brief");
     }
@@ -94,7 +127,7 @@ async fn podman_provisioned_parcels_enforce_the_spec4_isolation_invariants() {
 
     // Whatever happens, the guard containers must not leak.
     let cleanup = || {
-        for name in [AGENT_A, AGENT_B] {
+        for name in [&agent_a, &agent_b] {
             let _ = StdCommand::new("podman").args(["rm", "-f", name]).output();
         }
     };
@@ -103,40 +136,48 @@ async fn podman_provisioned_parcels_enforce_the_spec4_isolation_invariants() {
     let result = async {
         // --- provision both parcels end to end (real podman) --------------
         provisioner
-            .provision_parcel(&sanitize_name(AGENT_A).unwrap(), COMMISSION, &blueprint)
+            .provision_parcel(&sanitize_name(&agent_a).unwrap(), COMMISSION, &blueprint)
             .await
             .map_err(|e| PodmanError::invalid(e.to_string()))?;
         provisioner
-            .provision_parcel(&sanitize_name(AGENT_B).unwrap(), COMMISSION, &blueprint)
+            .provision_parcel(&sanitize_name(&agent_b).unwrap(), COMMISSION, &blueprint)
             .await
             .map_err(|e| PodmanError::invalid(e.to_string()))?;
 
         // --- container A: identity + ro invariants ------------------------
-        let out = run(&runtime, AGENT_A, &["id", "-u"]).await?;
+        let out = run(&runtime, &agent_a, &["id", "-u"]).await?;
         assert_eq!(
             out.stdout_lossy().trim(),
             UID_A.to_string(),
             "container user IS the slot uid (ADR-0011 subuid mapping)"
         );
 
-        let denied = run(&runtime, AGENT_A, &["touch", "/var/git/escape"]).await?;
+        let denied = run(&runtime, &agent_a, &["touch", "/var/git/escape"]).await?;
         assert_ne!(denied.code, 0, "/var/git must be read-only inside");
-        let denied = run(&runtime, AGENT_A, &["touch", "/var/context/escape"]).await?;
+        let denied = run(&runtime, &agent_a, &["touch", "/var/context/escape"]).await?;
         assert_ne!(denied.code, 0, "/var/context must be read-only inside");
 
         // --- home: rw, owned by the mapped UID -----------------------------
-        let ok = run(&runtime, AGENT_A, &["touch", "/home/1001/probe"]).await?;
+        let ok = run(&runtime, &agent_a, &["touch", "/home/1001/probe"]).await?;
         assert_eq!(
             ok.code,
             0,
             "home must be rw for its slot: {}",
             ok.stderr_lossy()
         );
+        // Host-side confirmation that the bind mount IS the parcel home —
+        // observed through the userns, because the host user cannot traverse a
+        // 0700 slot-owned home (ADR-0011 cl. 2). The same wall `promotion_read`
+        // hits (ADR-0033): the daemon reaches those trees with userns
+        // capability, so its tests must too. A plain `Path::exists()` here is
+        // EACCES-false on any host whose subuid mapping works, i.e. silently
+        // vacuous exactly where it matters most.
+        let seen = unshare_exists(runtime.as_ref(), &tree.parcel_home(UID_A).join("probe")).await?;
         assert!(
-            tree.parcel_home(UID_A).join("probe").exists(),
-            "the bind mount is the host parcel home"
+            seen,
+            "the bind mount is the host parcel home (seen through the userns)"
         );
-        let owner = run(&runtime, AGENT_A, &["stat", "-c", "%u", "/home/1001"]).await?;
+        let owner = run(&runtime, &agent_a, &["stat", "-c", "%u", "/home/1001"]).await?;
         assert_eq!(
             owner.stdout_lossy().trim(),
             UID_A.to_string(),
@@ -144,7 +185,7 @@ async fn podman_provisioned_parcels_enforce_the_spec4_isolation_invariants() {
         );
 
         // --- another parcel's home: not even visible -----------------------
-        let hidden = run(&runtime, AGENT_A, &["ls", "/home/1002"]).await?;
+        let hidden = run(&runtime, &agent_a, &["ls", "/home/1002"]).await?;
         assert_ne!(
             hidden.code, 0,
             "another parcel's home must not be reachable (not mounted; \
@@ -152,9 +193,9 @@ async fn podman_provisioned_parcels_enforce_the_spec4_isolation_invariants() {
         );
 
         // --- mail: own spool rw, cross-UID read blocked by spool perms -----
-        let own = run(&runtime, AGENT_A, &["touch", "/var/mail/1001/probe"]).await?;
+        let own = run(&runtime, &agent_a, &["touch", "/var/mail/1001/probe"]).await?;
         assert_eq!(own.code, 0, "own spool must be rw: {}", own.stderr_lossy());
-        let cross = run(&runtime, AGENT_A, &["ls", "/var/mail/1002"]).await?;
+        let cross = run(&runtime, &agent_a, &["ls", "/var/mail/1002"]).await?;
         assert_ne!(
             cross.code, 0,
             "cross-UID spool read must be blocked by 0700 + per-UID \
@@ -162,7 +203,7 @@ async fn podman_provisioned_parcels_enforce_the_spec4_isolation_invariants() {
         );
 
         // --- pkgcache: shared rw cache --------------------------------------
-        let cache = run(&runtime, AGENT_A, &["touch", "/var/pkgcache/probe-a"]).await?;
+        let cache = run(&runtime, &agent_a, &["touch", "/var/pkgcache/probe-a"]).await?;
         assert_eq!(
             cache.code,
             0,
@@ -173,20 +214,20 @@ async fn podman_provisioned_parcels_enforce_the_spec4_isolation_invariants() {
         // --- freight: 01770 daemon-owned, other::--- — slot UIDs cannot
         // traverse until the Sprint 04 freight plane grants root ACLs
         // (ADR-0021 cl. 2); this suite never runs the plane.
-        let freight = run(&runtime, AGENT_A, &["ls", "/var/freight"]).await?;
+        let freight = run(&runtime, &agent_a, &["ls", "/var/freight"]).await?;
         assert_ne!(
             freight.code, 0,
             "freight stays ACL-gated (01770, no slot grants) without the freight plane"
         );
 
         // --- mirror checks from container B ---------------------------------
-        let out = run(&runtime, AGENT_B, &["id", "-u"]).await?;
+        let out = run(&runtime, &agent_b, &["id", "-u"]).await?;
         assert_eq!(out.stdout_lossy().trim(), UID_B.to_string());
-        let owner = run(&runtime, AGENT_B, &["stat", "-c", "%u", "/home/1002"]).await?;
+        let owner = run(&runtime, &agent_b, &["stat", "-c", "%u", "/home/1002"]).await?;
         assert_eq!(owner.stdout_lossy().trim(), UID_B.to_string());
-        let cross = run(&runtime, AGENT_B, &["ls", "/var/mail/1001"]).await?;
+        let cross = run(&runtime, &agent_b, &["ls", "/var/mail/1001"]).await?;
         assert_ne!(cross.code, 0, "cross-UID spool blocked in both directions");
-        let hidden = run(&runtime, AGENT_B, &["ls", "/home/1001"]).await?;
+        let hidden = run(&runtime, &agent_b, &["ls", "/home/1001"]).await?;
         assert_ne!(hidden.code, 0);
 
         // --- no infrastructure sockets reachable (SPEC §4) ------------------
@@ -202,7 +243,7 @@ async fn podman_provisioned_parcels_enforce_the_spec4_isolation_invariants() {
             "/run/dbus/system_bus_socket",
             "/var/run/dbus/system_bus_socket",
         ] {
-            let probe = run(&runtime, AGENT_A, &["ls", sock]).await?;
+            let probe = run(&runtime, &agent_a, &["ls", sock]).await?;
             assert_ne!(
                 probe.code, 0,
                 "infrastructure socket path {sock} must not exist inside"
@@ -210,8 +251,8 @@ async fn podman_provisioned_parcels_enforce_the_spec4_isolation_invariants() {
         }
 
         // --- graceful teardown through the runtime seam ---------------------
-        runtime.stop(AGENT_A, Duration::from_secs(10)).await?;
-        runtime.stop(AGENT_B, Duration::from_secs(10)).await?;
+        runtime.stop(&agent_a, Duration::from_secs(10)).await?;
+        runtime.stop(&agent_b, Duration::from_secs(10)).await?;
         Ok::<(), PodmanError>(())
     }
     .await;

@@ -10,13 +10,15 @@
 #       daemon .env reads confined to dispatch.rs's single seam, forbidden
 #       podman flags exist ONLY in the podman.rs audit/test sections.
 #   T3  Committed golden vectors are privilege-free and secret-free.
-#   T4  Guarded real-podman escape suite (only when HAMLET_PODMAN_TESTS=1
-#       AND podman is on PATH; subuid preflight first). Skips with a
-#       recorded reason otherwise — ci.sh step 5 runs the full guarded
-#       battery separately, so this harness never double-runs the cold
-#       (~200 MB) bootstrap integrity test unless the operator asks.
+#   T4  Guarded real-podman escape suite. Runs the suite directly when this
+#       host/user can (see ci_guarded_direct_viable); otherwise the battery is
+#       handed to scripts/guarded-entry.sh, which measures with
+#       guarded-service-user.sh --doctor and runs it as the dedicated service
+#       user. A skip is only recorded when NEITHER route can run — with the
+#       remedy printed (ADR-0032 cl. 5), never a silent vacuous green.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+. ./scripts/ci-guarded-job.sh
 
 FAILURES=0
 step()  { printf '\033[1m==> %s\033[0m\n' "$*"; }
@@ -116,6 +118,59 @@ else
   fail "containerfile() no longer emits ENTRYPOINT [] / CMD [] — a parent body (alpine:3.24 ships CMD [\"/bin/sh\"]) would be inherited (QA04-06)"
 fi
 
+# chown traversal ratchet (ADR-0034 cl. 5, QA04-29). The manor-home brace is
+# `podman unshare chown -RP` over an AGENT-WRITABLE tree: `-R` recurses and
+# `-P` says never dereference. Drop `-P` and the safety reverts to an unpinned
+# GNU flag default; add `-L`/`-H` and the brace chowns whatever a symlink
+# inside the home points at — a privileged, attacker-chosen chown with rc=0
+# and no warning (measured). The golden unit test pins the argv; this ratchet
+# pins the *source* so a rewrite of that golden cannot quietly re-open it.
+PODMAN_RS="crates/hamlet-daemon/src/podman.rs"
+CHOWN_ARGV_FN="$(sed -n '/^fn unshare_chown_argv_inner(/,/^}/p' "$PODMAN_RS")"
+if [ -z "$CHOWN_ARGV_FN" ]; then
+  fail "chown-traversal ratchet broken: unshare_chown_argv_inner is gone from $PODMAN_RS"
+elif printf '%s' "$CHOWN_ARGV_FN" | grep -q 'argv.push("-RP".to_owned())'; then
+  pass "the recursive userns chown emits -RP (ADR-0034 cl. 5: recurse, never dereference)"
+else
+  fail "the recursive userns chown no longer emits '-RP' — the manor-home brace must not \
+dereference (ADR-0034 cl. 5 / QA04-29); a bare -R is an unpinned coreutils default"
+fi
+if printf '%s' "$CHOWN_ARGV_FN" | grep -qE '"-(L|H)"|--dereference'; then
+  fail "the userns chown argv contains a dereferencing flag — see ADR-0034 cl. 5"
+else
+  pass "no dereference flag (-L/-H/--dereference) anywhere in the userns chown argv"
+fi
+
+# Guarded container names are per-run (QA04-26): podman names are global to
+# the store, so a fixed test name means two overlapping batteries provision
+# each other's parcels and the loser's failure text reads like a SPEC §4
+# defect. Every guarded suite's names must go through `support::scoped`, and
+# no guarded suite may declare a bare name constant again. `manor` is the
+# product identity (MAYOR_IDENTITY, ADR-0028) and is never scoped.
+GUARDED_SUITES="escape_guarded bootstrap_guarded freight_guarded provision_guarded \
+supervise_guarded podman_guarded manor_guarded"
+NAME_BAD=""
+for suite in $GUARDED_SUITES; do
+  f="crates/hamlet-daemon/tests/${suite}.rs"
+  [ -f "$f" ] || { NAME_BAD="$NAME_BAD\n  missing $f"; continue; }
+  grep -q 'support::scoped(' "$f" || NAME_BAD="$NAME_BAD\n  $suite: no support::scoped() call — container names are not per-run (QA04-26)"
+  # A bare name constant (one that is NOT a documented `*_BASE` fed to
+  # support::scoped) is the pre-QA04-26 shape.
+  bare="$(grep -nE '^const [A-Z_]+: &str = "(qa-|hamlet-)' "$f" | grep -v '_BASE: &str' || true)"
+  [ -z "$bare" ] || NAME_BAD="$NAME_BAD\n  $suite: unscoped container-name constant(s):\n$(printf '%s\n' "$bare" | sed 's/^/    /')"
+  # The identity container must stay literal, not derived from a base const.
+  if grep -qE '"manor"' "$f"; then
+    grep -q 'MAYOR_IDENTITY' "$f" \
+      || NAME_BAD="$NAME_BAD\n  $suite: uses the literal \"manor\" without referencing MAYOR_IDENTITY (ADR-0028)"
+  fi
+done
+if [ -z "$NAME_BAD" ]; then
+  pass "guarded container names are per-run; the Mayor identity name is untouched (QA04-26)"
+else
+  fail "guarded container-name ratchet (QA04-26):"
+  printf "$NAME_BAD\n"
+fi
+
 # --- T3: golden vectors are privilege-free and secret-free -------------------
 step "T3: committed golden vectors"
 GOLDEN_BAD="$(grep -rn -- '--privileged\|--userns\|\.sock\|BEGIN [A-Z ]*PRIVATE KEY\|sk-[A-Za-z0-9]\{8\}' crates/*/tests/golden || true)"
@@ -128,10 +183,18 @@ fi
 
 # --- T4: guarded real-podman escape suite ------------------------------------
 step "T4: guarded podman escape suite (SPEC §4)"
-if [ "${HAMLET_PODMAN_TESTS:-0}" != "1" ]; then
-  skip "HAMLET_PODMAN_TESTS != 1 (export it on a podman-capable host)"
-elif ! command -v podman >/dev/null 2>&1; then
-  skip "podman not on PATH"
+if ! why="$(ci_guarded_direct_viable)"; then
+  # The direct route is closed on this host/user. Before recording a skip, ask
+  # the entry point: it re-measures as the service user and may run the whole
+  # guarded battery there (ADR-0032 cl. 4) — which is the difference between
+  # "T4 asserted nothing" and "T4 ran on another user".
+  skip "direct route closed: ${why}"
+  drc=0; ci_guarded_delegate "escape_guarded (via the service-user entry point)" || drc=$?
+  case "$drc" in
+    0) pass "escape_guarded: guarded battery green via the service-user entry point" ;;
+    3) skip "escape_guarded: no route on this host (remedy printed above — nothing asserted)" ;;
+    *) fail "guarded battery: a suite genuinely failed (log above)" ;;
+  esac
 else
   # Preflight: ADR-0011 needs a subuid range covering all 1000 slots, and
   # podman must be rootless. Fail loudly here — a guarded suite that fails
@@ -139,7 +202,7 @@ else
   USER_NAME="$(id -un)"
   SUBUID_LINE="$(grep "^${USER_NAME}:" /etc/subuid 2>/dev/null || true)"
   if [ -z "$SUBUID_LINE" ]; then
-    fail "no /etc/subuid entry for ${USER_NAME} — ADR-0011 subuid chown cannot work"
+    skip "no /etc/subuid entry for ${USER_NAME} — ADR-0011 subuid chown cannot work (QA04-07 remedy: a dedicated hamlet service user)"
   else
     SUBUID_COUNT="$(echo "$SUBUID_LINE" | head -1 | cut -d: -f3)"
     if [ "$SUBUID_COUNT" -ge 2001 ]; then
@@ -154,11 +217,27 @@ else
   else
     fail "podman reports rootless=${ROOTLESS} (SPEC §4: rootless only)"
   fi
-  if cargo test -p hamlet-daemon --test escape_guarded -- --ignored podman --nocapture; then
-    pass "escape_guarded suite"
+  # One guarded job per host (QA05-09): this suite's container names are
+  # global per podman user, so a concurrent guarded job would delete this
+  # one's containers mid-assertion and the failure would read as a product
+  # defect. Refuse rather than collide.
+  if ! ci_guarded_lock_or_report; then
+    skip "another guarded job holds the host lock (see above) — not run concurrently"
+  elif E2E_OUT="$(cargo test -p hamlet-daemon --test escape_guarded -- --ignored podman --nocapture 2>&1)"; then
+    printf '%s\n' "$E2E_OUT" | tail -3
+    # A suite that skipped every test has not passed anything: report the
+    # recorded reasons instead of a green line (CI04-01 doctrine).
+    if printf '%s\n' "$E2E_OUT" | grep -q '^SKIP '; then
+      printf '%s\n' "$E2E_OUT" | grep '^SKIP ' | sed 's/^/  SKIP: /'
+      skip "escape_guarded: host precondition unmet (reason above; see tests/support/mod.rs)"
+    else
+      pass "escape_guarded suite"
+    fi
   else
+    printf '%s\n' "$E2E_OUT"
     fail "escape_guarded suite"
   fi
+  ci_guarded_lock_release
 fi
 
 if [ "$FAILURES" -eq 0 ]; then

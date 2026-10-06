@@ -8,6 +8,12 @@
 //! Coverage: one real `run_detached` + `state` + `exec` (userns-mapped UID,
 //! ro `/var/git/` invariant) + `stop`, per the Sprint 02 step 02 verify
 //! contract. Subuid/gid runtime verification proper is step 03's addendum.
+//!
+//! The smoke container's name is **per-run** (QA04-26): podman names are
+//! global to the store, so two overlapping runs would address each other's
+//! container and one would `rm -f` the other's mid-assertion.
+
+mod support;
 
 use std::fs;
 use std::process::Command as StdCommand;
@@ -38,7 +44,11 @@ fn podman_guard() -> Option<String> {
 
 const TEST_UID: u32 = 1001;
 const TEST_COMMISSION: u64 = 99;
-const CONTAINER: &str = "hamlet-podman-smoke";
+/// Container name base; the name actually used is **per-run** (QA04-26):
+/// podman names are global to the store, so a second overlapping run of this
+/// suite would adopt (and then `rm -f`) this run's container and fail inside
+/// an assertion. `support::scoped` suffixes it with this process's pid.
+const CONTAINER_BASE: &str = "hamlet-podman-smoke";
 
 #[tokio::test]
 #[ignore = "guarded: needs HAMLET_PODMAN_TESTS=1 + podman on PATH (CONVENTIONS §5)"]
@@ -47,6 +57,7 @@ async fn podman_smoke_run_state_exec_stop() {
         eprintln!("SKIP podman_smoke_run_state_exec_stop: {reason}");
         return;
     }
+    let container = support::scoped(CONTAINER_BASE);
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let tree = HamletTree::ensure(tmp.path().join(".hamlet")).expect("village tree");
@@ -68,7 +79,7 @@ async fn podman_smoke_run_state_exec_stop() {
     let image = blueprint.meta().base_image().to_owned();
 
     let spec = RunSpec::for_agent(
-        &sanitize_name(CONTAINER).unwrap(),
+        &sanitize_name(&container).unwrap(),
         TEST_UID,
         TEST_COMMISSION,
         &blueprint,
@@ -79,7 +90,7 @@ async fn podman_smoke_run_state_exec_stop() {
     // Cleanup helper: whatever happens, the smoke container must not leak.
     let cleanup = || {
         let _ = StdCommand::new("podman")
-            .args(["rm", "-f", CONTAINER])
+            .args(["rm", "-f", &container])
             .output();
     };
     cleanup();
@@ -89,11 +100,11 @@ async fn podman_smoke_run_state_exec_stop() {
         let id = runtime.run_detached(&spec, &tree).await?;
         assert!(!id.is_empty(), "podman run -d must print a container id");
 
-        assert_eq!(runtime.state(CONTAINER).await?, ContainerState::Running);
+        assert_eq!(runtime.state(&container).await?, ContainerState::Running);
 
         // Userns mapping: the container user IS the charter UID slot.
         let out = runtime
-            .exec(CONTAINER, &["id".to_owned(), "-u".to_owned()], None)
+            .exec(&container, &["id".to_owned(), "-u".to_owned()], None)
             .await?;
         assert_eq!(
             out.stdout_lossy().trim(),
@@ -104,15 +115,15 @@ async fn podman_smoke_run_state_exec_stop() {
         // SPEC §4 isolation invariant: /var/git/ is ro.
         let denied = runtime
             .exec(
-                CONTAINER,
+                &container,
                 &["touch".to_owned(), "/var/git/escape".to_owned()],
                 None,
             )
             .await?;
         assert_ne!(denied.code, 0, "/var/git must be read-only inside");
 
-        runtime.stop(CONTAINER, Duration::from_secs(10)).await?;
-        assert_eq!(runtime.state(CONTAINER).await?, ContainerState::Exited);
+        runtime.stop(&container, Duration::from_secs(10)).await?;
+        assert_eq!(runtime.state(&container).await?, ContainerState::Exited);
         Ok::<(), hamlet_daemon::podman::PodmanError>(())
     }
     .await;

@@ -13,7 +13,7 @@
 //! - no named *group* grants (group membership is not charter state).
 //!
 //! Violations are pure-data verdicts from [`hamlet_core::freight::audit`]
-//! over `getfacl -p -n -c` listings obtained through `podman unshare`
+//! over `getfacl -p -n` listings obtained through `podman unshare`
 //! (ADR-0011 cl. 4: the daemon is root-equivalent inside its own userns,
 //! so agent-owned 0700 sandboxes are always inspectable). A violation
 //! writes a **quarantine flag** (`.quarantine/<name>.json`, daemon-owned,
@@ -262,6 +262,13 @@ pub struct FreightEscalation {
     pub owner: u32,
     /// Every quarantined dir attributed to that owner, sorted.
     pub quarantined: Vec<String>,
+    /// When this escalation was raised, unix ms. The plane's *event
+    /// identity* (QA05-06): two audits of the same violation for the same
+    /// owner serialize byte-identically, and without this the wake queue
+    /// would fold them into one wake — so the Mayor would never be told the
+    /// second one happened. Re-delivering the *same* escalation (a hook
+    /// retry) keeps the same id and still dedupes.
+    pub audit_id: u64,
 }
 
 /// The hook seam Sprint 05 plugs the Mayor wake loop into.
@@ -389,6 +396,35 @@ pub struct FreightGuard {
     fired: Mutex<BTreeSet<u32>>,
     /// Temp-file serial for atomic flag writes.
     tmp_serial: AtomicU64,
+}
+
+/// What a promotion-read path must be, checked with `lstat` semantics — never
+/// a followed link (SPEC §4 traversal invariant).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Expected {
+    /// The sandbox itself: must be a real directory.
+    Directory,
+    /// The artifact inside it: must be a regular file.
+    RegularFile,
+}
+
+/// Classify an already-stat'ed file type. Pure; shared by the host-side and
+/// userns-escalated paths so both refuse identically.
+fn check_kind(file_type: &fs::FileType, path: &Path, expect: Expected) -> Result<(), FreightError> {
+    if file_type.is_symlink() {
+        return Err(FreightError::SymlinkRefused {
+            path: path.to_owned(),
+        });
+    }
+    match expect {
+        Expected::Directory if !file_type.is_dir() => Err(FreightError::NotADirectory {
+            path: path.to_owned(),
+        }),
+        Expected::RegularFile if !file_type.is_file() => Err(FreightError::NotAFile {
+            path: path.to_owned(),
+        }),
+        _ => Ok(()),
+    }
 }
 
 impl FreightGuard {
@@ -667,30 +703,58 @@ impl FreightGuard {
         file: &SafeName,
     ) -> Result<Vec<u8>, FreightError> {
         let dir = self.tree.courier_freight_sandbox(sandbox);
-        let meta = fs::symlink_metadata(&dir).map_err(|source| FreightError::Io {
-            context: format!("lstat {}", dir.display()),
-            source,
-        })?;
-        if meta.file_type().is_symlink() {
-            return Err(FreightError::SymlinkRefused { path: dir });
-        }
-        if !meta.file_type().is_dir() {
-            return Err(FreightError::NotADirectory { path: dir });
-        }
+        self.expect_kind(&dir, Expected::Directory).await?;
         let target = dir.join(file.as_str());
-        let meta = fs::symlink_metadata(&target).map_err(|source| FreightError::Io {
-            context: format!("lstat {}", target.display()),
-            source,
-        })?;
-        if meta.file_type().is_symlink() {
-            return Err(FreightError::SymlinkRefused { path: target });
-        }
-        if !meta.file_type().is_file() {
-            return Err(FreightError::NotAFile { path: target });
-        }
+        self.expect_kind(&target, Expected::RegularFile).await?;
         let cmd = podman::cat_cmd(&target).map_err(FreightError::Podman)?;
         let out = self.unshare(&cmd, "cat").await?;
         Ok(out.stdout)
+    }
+
+    /// The pre-read kind check, escalated through the userns when the host
+    /// user may not look (QA04-13).
+    ///
+    /// The daemon's own `lstat` is the cheap path and the whole job for
+    /// daemon-owned sandboxes — every fake-runtime test exercises exactly
+    /// that. But a sandbox an agent secured is **0700 subuid-owned** (ADR-0011
+    /// cl. 2), so `other` has no `r`/`x` and the host lstat returns
+    /// `EACCES` for the very artifacts promotion-read exists to serve. The
+    /// traversal invariant is therefore checked with the same userns
+    /// capability the read uses: `podman unshare stat -c %F -- <path>`
+    /// (`stat` is lstat-shaped unless asked to dereference, so a symlinked
+    /// target is still *seen* as a symlink).
+    ///
+    /// Escalation is deliberately narrow: only `PermissionDenied` escalates,
+    /// because every other errno means the same thing it would have meant
+    /// before — see ADR-0030 cl. 2 for the identical precedent in the decree
+    /// executor's write path.
+    async fn expect_kind(&self, path: &Path, expect: Expected) -> Result<(), FreightError> {
+        match fs::symlink_metadata(path) {
+            Ok(meta) => return check_kind(&meta.file_type(), path, expect),
+            Err(source) if source.kind() == io::ErrorKind::PermissionDenied => {}
+            Err(source) => {
+                return Err(FreightError::Io {
+                    context: format!("lstat {}", path.display()),
+                    source,
+                })
+            }
+        }
+        let cmd = podman::stat_cmd(path).map_err(FreightError::Podman)?;
+        let out = self.unshare(&cmd, "stat").await?;
+        let kind = out.stdout_lossy().trim().to_owned();
+        match (expect, kind.as_str()) {
+            (Expected::Directory, "directory") => Ok(()),
+            (Expected::RegularFile, "regular file") => Ok(()),
+            (_, "symbolic link") => Err(FreightError::SymlinkRefused {
+                path: path.to_owned(),
+            }),
+            (Expected::Directory, _) => Err(FreightError::NotADirectory {
+                path: path.to_owned(),
+            }),
+            (Expected::RegularFile, _) => Err(FreightError::NotAFile {
+                path: path.to_owned(),
+            }),
+        }
     }
 
     // --- plane wiring -------------------------------------------------------
@@ -751,7 +815,7 @@ impl FreightGuard {
         Ok(out)
     }
 
-    /// `getfacl -p -n -c` through the userns (numeric in-ns UIDs) → parsed
+    /// `getfacl -p -n` through the userns (numeric in-ns UIDs) → parsed
     /// listing. Strict UTF-8: corrupt output is an error, never lossy.
     async fn listing(&self, path: &Path) -> Result<hamlet_core::freight::AclListing, FreightError> {
         let cmd = podman::getfacl_cmd(path).map_err(FreightError::Podman)?;
@@ -821,7 +885,11 @@ impl FreightGuard {
             return Ok(false); // already escalated this lifetime
         }
         drop(fired);
-        let escalation = FreightEscalation { owner, quarantined };
+        let escalation = FreightEscalation {
+            owner,
+            quarantined,
+            audit_id: unix_now_ms(),
+        };
         self.trace(
             owner,
             "freight-escalation",

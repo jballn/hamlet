@@ -24,10 +24,12 @@
 //! | [`mayor`] | Mayor wake loop, context packets, decree interpretation | §7 | 05 |
 //! | [`ledger`] | commission lifecycle, git mediation, convergence | §9 | 06 |
 //! | [`census`] | parcel provisioning (02); hibernation, awakening | §10 | 02/07 |
+//! | [`decrees`] | decree interpretation: validate → replay-check → execute → ack | §7 | 05 |
 //! | [`telemetry`] | sled metrics sink (never orchestration state) | §11.2 | 01 |
 
 pub mod bootstrap;
 pub mod census;
+pub mod decrees;
 pub mod delivery;
 pub mod dispatch;
 pub mod freight;

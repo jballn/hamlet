@@ -120,7 +120,7 @@ fn out(code: i32, stdout: &str) -> ExecOutput {
     }
 }
 
-/// Committed ACL-listing fixture shape (`getfacl -p -n -c` output).
+/// Committed ACL-listing fixture shape (`getfacl -p -n` output).
 fn listing(owner: u32, entries: &str) -> String {
     format!("# file: var/freight/sandbox\n# owner: {owner}\n# group: {owner}\n{entries}")
 }
@@ -607,6 +607,114 @@ async fn promotion_read_goes_through_the_userns_and_refuses_symlinks() {
         .await
         .unwrap_err();
     assert!(matches!(err, FreightError::NotAFile { .. }), "{err}");
+}
+
+/// QA04-13: a real agent sandbox is 0700 **subuid-owned**, so the daemon's
+/// own `lstat` of a file *inside* it returns EACCES — for exactly the
+/// artifacts promotion-read exists to serve. The kind check must therefore
+/// escalate to the same userns capability the read uses. Reproduced here
+/// without podman: `chmod 000` on the sandbox denies the host user traversal
+/// the same way subuid ownership does.
+#[tokio::test]
+async fn promotion_read_escalates_the_kind_check_through_the_userns() {
+    if host_uid() == 0 {
+        eprintln!("SKIP: root bypasses directory permissions; the EACCES shape cannot be built");
+        return;
+    }
+    let fx = fixture();
+    let sandbox = fx.tree.courier_freight_sandbox(&name("exchange"));
+    fs::create_dir(&sandbox).unwrap();
+    fs::write(sandbox.join("payload.md"), "artifact bytes").unwrap();
+    // No traversal for "other" ⇒ lstat(sandbox/payload.md) is EACCES.
+    fs::set_permissions(&sandbox, fs::Permissions::from_mode(0o000)).unwrap();
+    fx.runtime.script_exec_for("stat", out(0, "regular file\n"));
+    fx.runtime
+        .script_exec_for("cat", out(0, "PROMOTED-ARTIFACT"));
+
+    let bytes = fx
+        .guard
+        .promotion_read(&name("exchange"), &name("payload.md"))
+        .await
+        .unwrap();
+    assert_eq!(bytes, b"PROMOTED-ARTIFACT");
+
+    let log = fx.runtime.argv_log();
+    let stat_argv = log
+        .iter()
+        .find(|argv| argv.iter().any(|tok| tok == "stat"))
+        .expect("the kind check escalated to `podman unshare stat`");
+    assert_eq!(
+        stat_argv,
+        &vec![
+            "podman",
+            "unshare",
+            "stat",
+            "-c",
+            "%F",
+            "--",
+            sandbox.join("payload.md").to_str().unwrap()
+        ],
+        "escalation golden: lstat semantics, numeric-free, behind --"
+    );
+    assert!(
+        !stat_argv.iter().any(|tok| tok == "-L"),
+        "no dereference: a symlinked target must still be SEEN as a symlink"
+    );
+
+    // Restore so the tempdir is reclaimable.
+    fs::set_permissions(&sandbox, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+/// The escalated probe must refuse exactly what the host-side path refuses
+/// (SPEC §4 traversal invariant holds on both routes).
+#[tokio::test]
+async fn promotion_read_escalated_kind_check_refuses_links_and_directories() {
+    if host_uid() == 0 {
+        eprintln!("SKIP: root bypasses directory permissions; the EACCES shape cannot be built");
+        return;
+    }
+    for (kind, refusal) in [
+        ("symbolic link", 0),
+        ("directory", 1),
+        ("character special file", 1),
+    ] {
+        let fx = fixture();
+        let sandbox = fx.tree.courier_freight_sandbox(&name("exchange"));
+        fs::create_dir(&sandbox).unwrap();
+        fs::write(sandbox.join("payload.md"), "artifact bytes").unwrap();
+        fs::set_permissions(&sandbox, fs::Permissions::from_mode(0o000)).unwrap();
+        fx.runtime
+            .script_exec_for("stat", out(0, &format!("{kind}\n")));
+        let err = fx
+            .guard
+            .promotion_read(&name("exchange"), &name("payload.md"))
+            .await
+            .unwrap_err();
+        if refusal == 0 {
+            assert!(
+                matches!(err, FreightError::SymlinkRefused { .. }),
+                "{kind}: {err}"
+            );
+        } else {
+            assert!(
+                matches!(err, FreightError::NotAFile { .. }),
+                "{kind}: {err}"
+            );
+        }
+        fs::set_permissions(&sandbox, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+}
+
+/// `libc` is not a workspace dependency (check-deps allowlist), so `id -u` is
+/// the portable way to ask whether the EACCES shape is constructible at all:
+/// root ignores directory permissions, so the escalation would never trigger.
+fn host_uid() -> u32 {
+    std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
+        .unwrap_or(0)
 }
 
 #[tokio::test]

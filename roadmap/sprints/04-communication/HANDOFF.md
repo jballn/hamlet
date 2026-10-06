@@ -1107,3 +1107,833 @@ new failure, no product defect: `main` is byte-identical to the gated branch.
 Carry-forward unchanged: QA04-07/08/09 to the CI-agent (host provisioning —
 dedicated `hamlet` service user, disk-backed `TMPDIR`, ≥4 GB RAM headroom) and
 QA04-09's assertion policy to the container/QA owners.
+
+---
+
+## Sprint 04 blocker-resolution pass — daemon-engineer: QA04-07/08/09
+
+Status: **done**. The three carry-forward blockers are resolved *in the repo*
+(two as host preconditions the battery now states, one as a settled assertion
+policy), and making the guarded battery honest about both its skips and its
+vacuous passes exposed **two real product defects in the freight plane**, now
+fixed.
+
+### Done
+
+- **QA04-07 — the userns precondition is a stated precondition, not a red
+  assertion** (ADR-0032 cl. 1–2), **and the precondition itself was
+  restated once the remedy host was stood up.** New shared test-side module
+  `crates/hamlet-daemon/tests/support/mod.rs`: `podman_env_guard`,
+  `userns_precondition` (the test user must not own the podman store — podman
+  maps `0 → <owner uid>` by construction, so the ADR-0011 cl. 2 disjointness
+  assertion is unreachable on such a host — **and** `podman unshare chown`
+  must be able to reach a subuid), `work_area_precondition`, `same_device`,
+  `is_exdev`, `skip`. Every skip line names the finding and the host remedy.
+  **No assertion was weakened**: on a compliant host the suites run verbatim.
+  Applied **only where the invariant needs it** — escape suite, provision,
+  supervise and manor carry QA04-07; the freight ACL suite, the derived-image
+  suites and the secret scan deliberately do *not* (a blanket gate would trade
+  a host-shaped red for a silent coverage hole).
+- **QA04-08 — the work area must be disk-backed, and it is measured, not
+  guessed** (ADR-0032 cl. 1). `work_area_precondition` rejects a RAM-backed
+  filesystem outright and requires ≥ 4 GiB free otherwise. Reproduced live
+  first: on this host the cold bootstrap dies `exit 137` **and then**
+  `tar: Unexpected EOF in archive` *with 7.5 GB free* — the tmpfs pages are
+  charged against the parcel's `--memory` limit, so free space was never the
+  real variable. Remedy, stated by the tool that needs it: `TMPDIR` must point
+  at disk.
+- **QA04-09 — assertion policy decided and implemented** (ADR-0032 cl. 3).
+  `bootstrap_guarded` measures `same_device(parcel_home, market_pkgcache)`
+  once, before any assertion:
+  *same device* → the mirror must warm, `publish_failures` empty, the second
+  parcel downloads nothing (the existing claims, unchanged);
+  *different device* → every publish failure must be **EXDEV and only EXDEV**
+  (so a digest/permission failure cannot hide behind the host excuse), the
+  mirror must be empty, and the second parcel must legitimately re-download.
+  The zero-download claim is stated only in the shape that supports it — the
+  compromise the finding asked for, without letting the claim evaporate.
+- **CI04-01 doctrine applied in the other direction too — no vacuous green.**
+  `scripts/e2e-04-comms.sh` T3 ran `cargo test --test freight_guarded`
+  **without `-- --ignored`** on a file whose only test is `#[ignore]`d: zero
+  tests ran, exit 0, `pass` printed — and the sprint-04 gate recorded that as
+  "T3 guarded freight GREEN on real podman". Fixed (`-- --ignored podman
+  --nocapture`), and `ci.sh` step 5 plus `e2e-02`/`e2e-04` now scan the test
+  output for the recorded `SKIP` lines and report a skip as a skip.
+- **QA04-12 (HIGH, product) — `getfacl -c` suppressed the state the audit
+  reads** (ADR-0031). With the suite finally executing for real it failed on
+  the first listing: `ACL listing has no '# owner:' line`. `getfacl -p -n -c`
+  — `-c/--omit-header` is *precisely* what removes `# owner:`/`# group:`, the
+  two lines the audit's first rules are derived from, so **no real listing on
+  any host could ever parse**; the 17 FakeRuntime tests were green because
+  their fixtures carry the headers. Fix: `getfacl -p -n` (the parser stays
+  strict — "owner is a charter slot" cannot be audited without an owner), the
+  flag pinned by a new test so a tidy-up cannot re-add it, argv golden
+  updated.
+- **QA04-13 (MEDIUM, product) — promotion-read's pre-read check could not see
+  what it guards** (ADR-0033). `promotion_read` decided its SPEC §4 traversal
+  refusals with the daemon's own `lstat`, but a sandbox an agent secured is
+  **0700 subuid-owned** (ADR-0011 cl. 2): `EACCES` for exactly the artifacts
+  the function exists to serve (`lstat .../exchange/payload.md: Permission
+  denied`). Fix: the host `lstat` stays first and cheap; **only**
+  `PermissionDenied` escalates (ADR-0030 cl. 2's precedent) to a typed
+  `stat -c %F -- <path>` behind `--` through `podman unshare`, with **no `-L`**
+  so a symlinked target is still *seen* as a symlink; both routes refuse
+  through one pure `check_kind` table, so the escalation cannot weaken the
+  invariant. 2 new tests (19 in `tests/freight.rs`) build the EACCES shape
+  without podman (`chmod 000` sandbox).
+- **QA04-15 fixed test-side** (see findings): the idle-window pid assertion
+  was process-wide rather than per-village.
+- One more test-side shape, same family: the integrity suite's host-side tree
+  walk panicked on `read_dir` of the 0700 subuid-owned mail spool. It now
+  tolerates **only** `EACCES` (the isolation invariant; those subtrees are
+  agent-private and never a build context) and stays loud for everything else.
+
+### Findings raised by this pass
+
+- **QA04-12 (HIGH, product, freight).** The audit could never parse a real
+  listing — a defect that 17 fixture tests and one vacuously-passing harness
+  step both hid. Only observable by running the guarded suite for real.
+- **QA04-13 (MEDIUM, product, freight).** `promotion_read` failed on every
+  real agent-secured sandbox; its refusal logic was written against a
+  capability the daemon does not have in that case.
+- **QA04-14 (MEDIUM, test/CI).** `e2e-04` T3's "guarded freight green" was
+  zero tests executed. The same class as CI04-01 one layer deeper, and the
+  reason both product defects above survived a gate.
+- **QA04-07 restated (this pass, second cut).** The first form of the
+  precondition — "the daemon user must not be the podman owner" — is
+  **satisfiable by no host**: rootless podman maps `0 → <invoking uid> 1` in
+  every container, so the invoking user always appears in its own
+  containers' `uid_map`, and `escape_guarded`'s disjointness assertion
+  demanded exactly that. Proved on this host (`0 1000 1` / `1 100000 65536`)
+  while standing up the remedy user. Corrected in two places: the escape
+  assertion is now exempt for that single-uid owner row (and asserts instead
+  that it maps container root onto the invoking user — rootless podman's
+  documented identity model, ADR-0010), and `userns_precondition` is now the
+  satisfiable question it should have been: *can `podman unshare chown` reach
+  a subuid?* A host requirement phrased as an impossibility is worse than no
+  requirement — it manufactures a permanent skip and hides the part that was
+  genuinely achievable. Same failure class as QA04-10/11, one layer out: a
+  claim that looked precise but nobody had tried to satisfy.
+- **QA04-15 (MEDIUM, test · sprint-05 suite, found by running the harness).**
+  `adversarial_mayor::the_idle_window_holds_no_process_and_writes_nothing`
+  asserted on `live_mayor_pids()` — *every* `fakeagent` child of the test
+  process, unscoped by village. The binary runs its tests in parallel threads
+  and all spawn the same `CARGO_BIN_EXE_fakeagent`, so the assertion went red
+  whenever a sibling test's Mayor exited during the 1.5 s idle window
+  (reproducible on the disk-backed `TMPDIR`, not on the RAM-backed one — a
+  timing shape, not a TMPDIR defect). Fixed test-side: the pid set is now
+  scoped to the village by the `FAKEAGENT_SCRIPT` path in the child's
+  `environ`, so the assertion is about *this* Mayor. Disclosed as
+  out-of-scope-but-hit: it is Sprint 05 code, not Sprint 04.
+
+### Decisions
+
+- **Two blockers became preconditions, one became a shape** — and none of
+  them was "relax the assertion": every guarded assertion still runs verbatim
+  on a host that can satisfy it. What changed is *who says so*, and the answer
+  is the code, with the finding id and the remedy in the message.
+- **Four ADRs, one decision each** (house rule): ADR-0031 (`-c` is gone and
+  stays gone), ADR-0032 (host preconditions + no vacuous green; amends
+  CONVENTIONS §5), ADR-0033 (userns escalation for the kind check). README
+  index updated in the same commit; ADR-0021 cl. 1/6 carry "amended by"
+  pointers.
+- **Host prerequisite, unchanged from the original findings** and now stated
+  by the tool: a `hamlet` service user whose uid is outside the subuid range
+  and is not the podman owner, **plus** a disk-backed `TMPDIR`. On this host
+  neither holds, so the guarded battery is now mostly *recorded skips* with
+  remedies, and the parts that can run do — `freight_guarded` and the
+  bootstrap-integrity suite are green on real podman.
+
+### Verify
+
+**Full battery, this host, with the documented remedy
+(`TMPDIR=/home/dock/tmp-ci HAMLET_PODMAN_TESTS=1 ./scripts/ci-local.sh`):
+`CI battery: PASS` (exit 0)** — fmt, clippy `-D warnings`, 40/40 workspace
+binaries, check-deps, all five e2e harnesses, and the guarded podman step
+green for the first time: the freight ACL suite and the bootstrap-integrity
+suite genuinely execute and pass on real podman, and the six suites that
+cannot run here are recorded skips with their remedy, printed by `ci.sh` as a
+NOTE. (Before this pass the same command ended `FAIL (1)` on the guarded
+step.)
+
+```sh
+cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace                 # 40 binaries green
+./scripts/check-deps.sh
+for s in scripts/e2e-0*.sh; do "$s"; done                       # all PASS
+HAMLET_PODMAN_TESTS=1 ./scripts/e2e-04-comms.sh                  # T3 green on real podman
+TMPDIR=/home/dock/tmp-ci HAMLET_PODMAN_TESTS=1 \
+  cargo test -p hamlet-daemon --test freight_guarded -- --ignored podman --nocapture   # green
+TMPDIR=/home/dock/tmp-ci HAMLET_PODMAN_TESTS=1 \
+  cargo test -p hamlet-daemon --test escape_guarded -- --ignored podman_bootstrap_integrity --nocapture  # green
+```
+
+### Host remedy (now provided, not just described)
+
+`scripts/guarded-service-user.sh` makes the remedy a one-liner instead of
+tribal knowledge. `--prepare` grants the service user **execute-only ACLs** on
+the build tree (`rX`, never world-readable, never writable — no `chmod o+x`
+on the developer's home); the run itself needs no cargo, executes the
+already-built binaries with `TMPDIR` on a disk-backed work area, prints every
+recorded `SKIP` line, and fails only on a suite that genuinely failed. As the
+developer:
+
+```sh
+./scripts/guarded-service-user.sh --prepare
+sudo -H -u hamlet env TMPDIR=/var/hamlet/tmp HAMLET_PODMAN_TESTS=1 \
+  ./scripts/guarded-service-user.sh
+```
+
+### Findings from exercising the remedy
+
+- **QA04-16 (LOW, script · mine, found by running my own remedy).**
+  `guarded-service-user.sh` printed `PASS` having executed **nothing**:
+  `ls -t "$TARGET_DIR/deps/${name}-*"` quoted the glob, so `ls` — which does
+  not glob — received a literal `*` and every suite resolved to "not built",
+  which the script had (wrongly) counted as a skip. Two defects in one line,
+  both of them the CI04-01 shape I had just spent this pass removing:
+  a quoted glob, and a "could not even start" state treated as benign.
+  Fixed: the glob stays unquoted past the variable parts (the variables stay
+  quoted, so spaces are still safe), an unrunnable suite is now a **failure**
+  with a mechanical remedy printed, `--prepare` rebuilds *before* granting
+  ACLs (cargo relinking a binary drops them), and a `--check` mode resolves
+  the binaries without spending a battery run.
+- **Note on the ACL trap:** execute rights on `target/debug` are a snapshot,
+  not a property. Any `cargo build` after `--prepare` relinks binaries and
+  drops the grant, so the run's "not executable here" branch prints the
+  re-prepare remedy instead of failing obscurely.
+
+### Findings from the remedy host (hamlet, uid 3000)
+
+- **QA04-17 (MEDIUM, test · mine) — my QA04-07 probe reported "unmet" on
+  every host, including ones whose subuids work perfectly.** The probe chowned
+  to *inside* uid `100001`, but rootless podman maps the subuid range as
+  `1 → <base> <count>`, so the inside uids that exist at all are
+  `1 ..= count` (65536). `100001` is outside that window, `chown` returns
+  `EINVAL`, and `userns_precondition` therefore skipped the entire battery
+  unconditionally. Measured on this host: inside uid 1000 → host uid 100999,
+  subuids working, precondition "failing". Fixed to probe inside 1000 and to
+  require the file to end up owned by something other than the daemon's own
+  uid, so a chown that no-ops inside the namespace cannot read as support.
+  Same failure class as QA04-10/11 and the QA04-07 restatement: a check
+  nobody had ever watched pass is not a check. Three of this pass's own
+  "guards" were wrong in this direction before this one.
+- **QA04-18 (LOW, script · mine) — two over-strict doctor checks, both false
+  alarms.** `newuidmap` here carries `cap_setuid=ep` rather than the setuid
+  bit (equivalent privilege) and was reported as "NOT setuid"; and a missing
+  `systemd --user` session was treated as fatal when it is not (this host
+  starts containers with lingering on and no session bus). Both corrected —
+  a precondition that cries wolf gets ignored, which is worse than not
+  checking.
+- **QA04-19 (host, new — the actual hamlet blocker, root action).** With the
+  probe fixed, hamlet's remaining failure is **not** subuid mapping (its
+  range is fine) but cgroups: podman is configured `cgroup_manager=systemd`
+  and hamlet has no lingering, so runc cannot create its transient scope —
+  `unable to start unit "runc-*.scope" ... Access denied`, and container
+  *build* fails at the `apk add` step. Remedy (root): `loginctl
+  enable-linger hamlet`. `scripts/guarded-service-user.sh --doctor` reports
+  this, with the remedy, instead of leaving a 2 KB podman error in a test
+  log.
+
+### What the un-skipping exposed (the real payoff of QA04-17)
+
+With the false skip gone, five suites ran for the first time on this host and
+every one of them found something:
+
+- **QA04-20 (MEDIUM, test).** Container-name collisions: `escape_guarded`'s
+  two parallel tests both provisioned `qa-escape-a`; `manor_guarded`'s both
+  start `manor` — and `manor` is the *production* Mayor identity
+  (`MAYOR_IDENTITY`, ADR-0028), so it cannot be renamed away. Fixed by giving
+  the integrity suite its own name and serialising the manor suites behind an
+  async-aware `tokio::sync::Mutex` (a `std` guard held across `.await` is
+  both a clippy error and wrong).
+- **QA04-21 (MEDIUM, test).** Three guarded assertions observed subuid-owned
+  trees **from the host**, which is EACCES on exactly the hosts where the
+  invariant is real — the same wall `promotion_read` hit (ADR-0033):
+  `provision_guarded`'s host-side `Path::exists()` on the parcel home (now
+  asked through `podman unshare stat`), `supervise_guarded`'s daemon-owned
+  home fixture (now built through `HostPermissions::apply_parcel_home`, the
+  seam provisioning uses — a daemon-owned home is only "working" where
+  subuids silently failed, QA04-07c), and the manor seam's read-back (now
+  `unshare cat`). Each was silently vacuous, not red, before.
+- **QA04-22 (LOW, test · mine).** My QA04-09 branch predicted the mirror shape
+  from a host-side `same_device()` probe. That predictor is wrong: btrfs gives
+  each subvolume its own `st_dev`, and runc's bind-mount result is not
+  derivable from the host — this host reported "same device" and every
+  container still produced EXDEV. The branch now follows the **observed**
+  publish outcome: the strong claim (mirror warms, parcel B installs offline)
+  is asserted only when publishing actually succeeded, and every failure is
+  still classified so only EXDEV may excuse an empty mirror.
+
+**Battery state on this host** (`TMPDIR=/home/dock/tmp-ci`,
+`HAMLET_PODMAN_TESTS=1`, run as dock): `podman_guarded`, `bootstrap_guarded`
+(4/4 incl. the cold mirror-warming test), `provision_guarded`,
+`escape_guarded` (2/2 incl. the secret scan), `freight_guarded`,
+`supervise_guarded` all **green**. `manor_guarded` 1/2 green.
+
+### Open finding — needs its own pass
+
+- **QA04-23 (HIGH, product, OPEN).** `manor_guarded::the_Mayor_can_write_its_
+  own_decree_directory` fails as `sh` in the real Mayor container cannot
+  create `/home/1000/decrees`. The host is **not** the cause: reproduced by
+  hand — `podman unshare chown 1000:1000` on a temp dir, mounted into
+  `alpine --user 1000:1000`, `echo hi > /home/1000/probe` succeeds
+  (`WRITE_OK`), with the host owner landing exactly where ADR-0011 cl. 2
+  expects (inside 1000 → host 100999). So the gap is in the provisioning
+  path — most likely the ordering of `ManorProvisioner`'s start against
+  `HostPermissions::apply_manor_home`, or the `decrees/` subdirectory being
+  created before the ownership is applied. Not guessed at here: it needs a
+  focused pass with the container's `ls -ln /home/1000` output.
+
+Carry-forward: nothing in the daemon/test layers for QA04-07/08/09. Both
+remedies are now expressed as code — the preconditions the suites need
+(subuid reachability, a disk-backed work area) and the script that supplies
+the one the operator must provide (a user to run as).
+
+---
+
+## QA re-gate pass — QA Engineer — after the QA04-23 resolution (`26a6ccc`)
+
+Re-gate of the full battery plus an adversarial **mutation pass against the three
+new guards** (`support::userns_precondition`, `support::work_area_precondition`,
+the `mirror_warms` branch). QA04-10/11 proved the pattern and I wrote all three
+guards, so they got the same treatment as the dispatch plane.
+
+### Gate verdict: **FAIL — 1 HIGH test/CI, 1 HIGH test, 3 MEDIUM, 2 LOW**
+
+The QA04-23 **product** resolution is verified green on live podman and I have
+no product finding against it. What fails the gate is the harness around it.
+
+### Battery state (this host: btrfs `TMPDIR`, real rootless podman)
+
+| step | result |
+|---|---|
+| fmt / clippy `-D warnings` | PASS |
+| `cargo test --workspace` | PASS (all binaries) |
+| `check-deps.sh` | PASS |
+| guarded battery, **as `hamlet`** (TMPDIR `/home/dock/tmp-ci`) | **PASS — 11/11 tests, 0 skips**: `bootstrap_guarded` 4/4, `provision_guarded` 1/1, `escape_guarded` 2/2, `freight_guarded` 1/1, `supervise_guarded` 1/1, **`manor_guarded` 2/2** |
+| `e2e-01-safename-compile-fail`, `e2e-01-topology-state`, `e2e-03`, `e2e-04` (incl. `adversarial_comms`, 29 committed tests), `e2e-05` | PASS |
+| `e2e-02-isolation` T4 (escape) | **FAIL** — QA04-27 (red 2 runs in 3; green when serialised) |
+| `scripts/ci.sh` end-to-end | **ABORTED** — QA04-31 |
+
+`manor_guarded` 2/2 on live podman is the QA04-23 acceptance result: claim 1
+(the Mayor writes `/home/1000/decrees`) and claim 2 (no other slot can) both
+hold after `26a6ccc`. The recursion was the right fix.
+
+---
+
+### Findings
+
+#### QA04-26 (HIGH, test/CI) — the guarded battery has no run lock; two runs destroy each other
+
+`scripts/guarded-service-user.sh` takes no `flock`/`mkdir` lock, and the suites
+provision **fixed global container names**: `escape_guarded.rs:115-121`
+(`qa-escape-a/b`, `qa-escape-integrity`), `bootstrap_guarded.rs:71-72`
+(`hamlet-boot-a/b`), `freight_guarded.rs:53-55` (`hamlet-freight-a/b/c`),
+`manor_guarded` (`manor` — the production identity, ADR-0028).
+`MANOR_CONTAINER_LOCK` (manor_guarded.rs:66) serialises *within* one binary —
+QA04-20's fix — and nothing serialises *across* runs.
+
+Repro (deterministic, both runs RED, no product involvement):
+
+```sh
+export TMPDIR=/home/dock/tmp-ci HAMLET_PODMAN_TESTS=1
+cargo test -p hamlet-daemon --test manor_guarded -- --ignored podman & \
+cargo test -p hamlet-daemon --test manor_guarded -- --ignored podman & wait
+```
+
+* run 1 → `manor_guarded.rs:313`: `own resources must stay writable: 'touch
+  /home/1001/probe' (Error: can only create exec sessions on running
+  containers: container state improper)`
+* run 2 → `manor_guarded.rs:329`: `the container name "manor" is already in
+  use … You have to remove that container`
+
+Expected: a second invocation waits, or is refused with a recorded reason.
+Actual: both fail, and **the assertion text reads like a SPEC §4 product
+defect** ("own resources must stay writable") when it is pure interference.
+This is the CI04-01 shape (a harness lie) with a product mask on it. Observed
+live twice: it also explains the pre-existing flake at
+`escape_guarded.rs:679` in the stale `logs/guarded-job.log` run.
+Remedy: `flock` on `$TMPDIR/.hamlet-guarded.lock` in
+`guarded-entry.sh`, plus per-run name suffixes for the non-identity names.
+
+#### QA04-27 (HIGH, test) — `escape_guarded`'s integrity container dies mid-suite, and the failure is reported as a product defect
+
+`cargo test -p hamlet-daemon --test escape_guarded -- --ignored podman` fails
+**2 runs in 3** on this host with:
+
+```
+escape_guarded.rs:679: guarded bootstrap integrity: SPEC §11.4 / ADR-0012:
+"podman: no such container … no container with ID d268cc… found in database"
+```
+
+`podman events` for that window (the container dies 353 s in, unprompted):
+
+```
+1791144092 create qa-escape-integrity   1791144093 start
+1791144439 create qa-escape-a / qa-escape-b   ← the sibling test, in parallel
+1791144446 died   qa-escape-integrity
+1791144447 remove qa-escape-integrity
+```
+
+The two suites run in parallel (cargo's default threads) and **each performs a
+full cold bootstrap** (~1 GB extract, 350–600 s). The container's PID 1 dies
+under that contention; the suite surfaces `no such container` and the gate log
+reads like a SPEC §11.4 violation. Two further facts: the same suite is green
+in the `hamlet` battery run (2/2) and in a serialised run, and a memory probe
+over a passing run peaked at **54 % of the 536 MB cap** — so this is *not* the
+in-container `--memory` limit (QA04-08's story) and *not* proved to be host
+RAM; it is proved only to be a mid-run death of PID 1 under parallel
+provisioning. I am filing what I measured, not the cause I would like.
+Expected: either serialise the two escape suites behind the same async-aware
+mutex `manor_guarded` uses (QA04-20's own remedy), or classify "PID 1 died
+during provisioning" as a host precondition with the remedy, never as a §11.4
+assertion failure.
+
+#### QA04-28 (MEDIUM, test) — the QA04-23 diagnosis assertion is a tautology
+
+`crates/hamlet-daemon/tests/manor_guarded.rs:257-263`:
+
+```rust
+"ls -ln /home/1000 /home/1000/decrees", …
+assert!(ls.stdout_lossy().contains("1000"),
+        "the decree directory must be owned by UID 1000 …");
+```
+
+The output of that `ls` **always** contains `1000` — it is in the path
+`/home/1000`. Under the exact QA04-23 bug (`decrees/` = `0 0 0755`) the
+assertion still passes. The claim was introduced as "the Mayor's own `ls -ln`
+is the diagnosis shape for QA04-23 (ownership, not inference)" and does not
+test ownership. It is pinned only by the *host-side* FakeRuntime unit test
+(`hostperm.rs:369`), so the in-container view is unchecked.
+Expected: `stat -c '%u %a' /home/1000/decrees` == `1000 700`.
+Severity is bounded by that unit test, but the comment promises a check the
+assertion does not perform — the QA04-10 class.
+
+#### QA04-29 (MEDIUM, product · ADR-0034) — `-R` is safe only by an unpinned coreutils default
+
+QA04-23's fix makes `apply_manor_home` (`hostperm.rs:180-190`, via
+`chown_recursive` at `:240`) run `podman unshare chown -R 1000:1000` over the
+manor home — a tree that is, by design, **agent-writable** (that is the whole
+point of the fix). Measured on this host:
+
+```
+$ podman unshare chown -R 1000:1000 -- /tmp/qa-symprobe/root   # contains link -> /tmp/qa-symprobe/target (mode 101999)
+rc=0 ; target stays 101999, target/f1 stays 1000, link itself -> 100999
+$ podman unshare chown -RL 1000:1000 -- /tmp/qa-symprobe/root   # the "hardened" variant
+rc=1 ; target/f1 -> 100999   (cross-tree chown: the escalation)
+```
+
+So `-R` does **not** dereference (GNU default `-P`) and there is **no**
+cross-tree escalation today; a dangling symlink is not even an error (`rc=0`).
+That is the good news. The finding is that the safety property is *entirely*
+an unpinned coreutils default: nothing in the test suite, the ADR, or a
+ratchet asserts "must not dereference", and a `-L`/`-h` "fix", a switch to
+BusyBox `chown`, or a different host's coreutils would silently re-open a
+privileged chown of an attacker-chosen tree. SPEC §4 / ADR-0011 cl. 2 make
+ownership the isolation boundary; that boundary should not rest on an
+undocumented flag default. Expected: ADR-0034 states the `-P` requirement
+explicitly and `podman.rs`'s golden test pins the exact argv **and** a
+"symlink inside the manor home is not traversed" case (buildable on the
+FakeRuntime by asserting the flag, or on a real host with the probe above).
+
+#### QA04-30 (MEDIUM, test · **the deliverable**) — the guards had no acceptance test; four mutations survived
+
+`tests/support/mod.rs` shipped with `#![allow(dead_code)]` and **no tests at
+all**: `userns_precondition`, `work_area_precondition`, `is_ram_backed`,
+`same_device`, `is_exdev` were each wrong in the skip direction at least once
+(QA04-07 restated twice, QA04-17) and nothing watched any of them pass. That is
+QA04-10/11's pattern one layer out, and it is my own code.
+
+Delivered:
+
+* `crates/hamlet-daemon/tests/guard_acceptance.rs` — 10 cases, both
+  directions, **deterministic and hermetic**: `podman` shims for the subuid
+  probe (no-op chown / failing chown) and `df` shims for the work-area shapes
+  (tmpfs-with-room, btrfs-without-room, btrfs-with-room). No container, no root,
+  0.3 s.
+* `scripts/e2e-06-guard-mutations.sh` — grades each historical defect as a
+  mutation: reintroduce it, the acceptance suite must go RED; **and** grades the
+  one mutation that must *survive* (a dead `podman` is still caught by the
+  ownership self-validation — defence in depth, asserted so the two checks
+  cannot silently collapse into one).
+
+Mutation results on the current tree (`TMPDIR=/home/dock/tmp-ci
+HAMLET_PODMAN_TESTS=1 ./scripts/e2e-06-guard-mutations.sh`):
+
+| mutation | result |
+|---|---|
+| M1 QA04-17 probe uid back outside the subuid window (`100001`) | killed |
+| M2 QA04-07 self-validation (`m.uid() != own`) dropped | killed |
+| M2b QA04-07 owner check reduced to a `MAX` sentinel | killed |
+| M3 QA04-07 ignores the chown exit status | **survives by design** — absorbed by the ownership check; asserted, not tolerated |
+| M4 QA04-08 tmpfs no longer rejected | killed |
+| M5 QA04-08 free-space floor removed | killed |
+| M6 QA04-09 `is_exdev` excuses everything | killed |
+| M7 QA04-09 device comparison inverted | killed |
+
+T3 records this host's QA04-09 arm, which was previously unstated anywhere:
+`guarded bootstrap host shape: home/pkgcache SPLIT device -> mirror stays empty
+(EXDEV publish)`.
+
+Note for the next pass: M1 is killed **only** by the real-podman positive case
+(`a_compliant_host_is_not_skipped`) — a shim cannot make an out-of-window chown
+fail while an in-window one succeeds. The harness therefore runs with
+`HAMLET_PODMAN_TESTS=1` whenever podman is present and treats a *skipped*
+positive as a harness failure, not a pass.
+
+#### QA04-31 (MEDIUM, CI) — the battery can die without printing a verdict, and skip the e2e phase entirely
+
+`scripts/ci.sh` aborted mid-run with `line 81: syntax error` and exit 2. The
+cause was environmental (this working tree is being edited by another session
+while the battery runs — `scripts/ci.sh` changed mtime four times during my
+run), but the *gate behaviour* is the finding: the e2e harness loop lives
+**after** step 5, so a step-5 abort means **no e2e script runs at all**, and
+`set -e` + a parse error means the `failures`/`CI battery: FAIL` summary is
+never printed either. A gate that can exit non-zero having printed no verdict,
+and having silently skipped six harnesses, is the CI04-01 shape at the top
+level. Expected: run the e2e phase unconditionally (accumulate its failures,
+report after step 5), and trap `ERR`/parse failures into the same summary.
+(I re-ran the e2e phase by hand: 5 PASS, 1 FAIL = QA04-27.)
+
+#### QA04-32 (LOW, test) — the `mirror_warms` warm arm is never exercised anywhere
+
+Per QA04-22 the branch follows the observed publish outcome. This host takes
+the **EXDEV** arm (above), so `mirror_warms == true` — "mirror warms, parcel B
+installs offline" — is asserted **nowhere**, on this host or (as far as the
+suite shows) any. The claim is not wrong, it is unpinned; there is no fault-
+injection seam (e.g. an injected publisher or a forced device split) that could
+exercise it on demand. Low, because the EXDEV arm is the conservative one; but
+"the strong claim is asserted only where it holds" should not quietly become
+"the strong claim is asserted nowhere".
+
+### Also verified (no finding)
+
+* **`podman unshare chown -R` does not traverse symlinks** — see QA04-29; this
+  was the one escalation path I went looking for in the QA04-23 diff and it is
+  closed.
+* The 0700 hardening of `decrees/` (`hostperm.rs:188`) *is* pinned, host-side,
+  by `hostperm.rs:369` — the gap is only the in-container view (QA04-28).
+* `manor_guarded`'s within-binary serialisation (QA04-20) works: both manor
+  tests pass in the battery run.
+
+### Verify
+
+```sh
+export TMPDIR=/home/dock/tmp-ci HAMLET_PODMAN_TESTS=1
+./scripts/e2e-06-guard-mutations.sh                    # T1 + 8 graded mutations + T3 host shape
+cargo test -p hamlet-daemon --test guard_acceptance -- --test-threads=1 --nocapture   # 10/10, 0.3 s
+./scripts/ci-local.sh                                  # the gate itself — see QA04-31
+# QA04-26 repro (both runs RED, no product involved):
+cargo test -p hamlet-daemon --test manor_guarded -- --ignored podman &
+cargo test -p hamlet-daemon --test manor_guarded -- --ignored podman & wait
+```
+
+### Decisions requested
+
+1. **QA04-26 / QA04-31 (owners: CI-agent).** A lock on the guarded battery and
+   an e2e phase that runs regardless of step 5's outcome. Until then the gate
+   is not trustworthy on a machine where two batteries can overlap — which is
+   every developer laptop with a background job.
+2. **QA04-27 (owners: container/QA).** Serialise `escape_guarded`'s two suites
+   (the `manor_guarded` mutex is the precedent) and stop reporting a dead
+   PID 1 as a §11.4 assertion failure.
+3. ~~QA04-28 (owner: QA, mine).~~ **FIXED** — tautological `ls` assert replaced
+   with `stat -c '%u %a'` asserting `1000 700` per path (`manor_guarded.rs:261`,
+   ADR-0034 cl. 4/6).
+4. **QA04-29 (owner: hostperm).** State the `-P` requirement in ADR-0034 and
+   pin it. Nothing to fix in the code today.
+
+### Fixed in this pass
+
+* **QA04-28** — `manor_guarded.rs` line 261: replaced `ls -ln … | contains("1000")`
+  with per-path `stat -c '%u %a'` asserting `1000 700`. ADR-0034 cl. 4 amended
+  to prescribe `stat`, cl. 6 records the correction.
+* **QA04-32** — `mirror_warms` warm arm now exercised via fault-injection seam
+  (ADR-0035). `tests/support/mod.rs` gains `PublishSeamRuntime` decorator
+  rewriting publish argv from `ln` to `cp --` (`PublishArm::ForceWarm`).
+  `bootstrap_guarded.rs` gains `podman_bootstrap_forced_warm_mirror...` test
+  asserting full warm-arm contract (mirror file count, zero downloads, all
+  cache hits, digest re-verification, parcel B offline toolchain operation).
+
+---
+
+## Container-engineer pass — QA04-26 (name half), QA04-27, QA04-29
+
+Three findings out of the QA re-gate, taken by the container/security layer.
+Two are harness shape, one is a product hole I chose to close rather than
+document: **the manor-home brace no longer rests on a coreutils flag default.**
+
+### QA04-26 (container-name half) — guarded container names are per-run
+
+Podman container names are **global to the podman store**, not scoped to a
+test binary, a village tree, or a run. Every guarded suite provisioned fixed
+names, so two overlapping batteries address *each other's* containers: one's
+cleanup `rm -f`s the container the other is asserting in, and the loser's
+failure text reads like a SPEC §4 defect (`own resources must stay writable:
+… container state improper`).
+
+- **`support::scoped(base)` → `<base>-r<pid>`** (`tests/support/mod.rs`), with
+  the constraint stated where it is used: the joined name must survive
+  `sanitize_name` (it becomes a charter slot name, a brief filename *and* a
+  `podman --name`), and the identity name is never scoped.
+- **Every non-identity name in the guarded battery is scoped**:
+  `escape_guarded` (`qa-escape-a/b`, `qa-escape-integrity`), `bootstrap_guarded`
+  (`hamlet-boot-a/b`), `freight_guarded` (`hamlet-freight-a/b/c`),
+  `provision_guarded` (`hamlet-guard-a/b`), `supervise_guarded`
+  (`hamlet-supervise-smoke`), `podman_guarded` (`hamlet-podman-smoke`), and
+  `manor_guarded`'s two non-identity parcels. Each file keeps the stable
+  `*_BASE` constant and binds a per-run name at the top of the test.
+- **`manor` is untouched, deliberately.** It is `MAYOR_IDENTITY` (ADR-0028) —
+  the product's name, provisioned by `ManorProvisioner` and asserted as the
+  Mayor's hostname. Renaming it would be renaming the product; that binary
+  serialises behind `MANOR_CONTAINER_LOCK` instead (QA04-20). Pinned by
+  `guard_acceptance::the_mayor_identity_name_is_never_a_scoped_name`.
+- **Ratchet** (`scripts/e2e-02-isolation.sh` T2): every guarded suite must
+  call `support::scoped`, may not declare a bare `const …: &str = "qa-…"` /
+  `"hamlet-…"` again, and any suite touching the literal `"manor"` must
+  reference `MAYOR_IDENTITY`. Hermetic pins:
+  `a_scoped_container_name_is_sanitizer_safe_and_still_distinct`.
+- **The other half is not mine:** the battery-wide `flock` (`ci_guarded_lock`
+  in `scripts/ci-guarded-job.sh`) has since landed from the CI side. Names
+  stop colliding; two batteries still fight over RAM, the podman store and the
+  pkgcache, which is what the lock is for.
+
+### QA04-27 — `escape_guarded`'s two cold bootstraps serialise, and a dead PID 1 is a host precondition
+
+Reproduced shape: two suites in one binary running **in parallel**, each doing a
+full cold bootstrap (~1 GB extracted, 350–600 s), and the integrity
+container's PID 1 dying unprompted at ~353 s (`podman events`: `died`,
+`remove`). The suite then surfaced `podman: no such container …` **inside a
+SPEC §11.4 secrets assertion**. Same suite green serialised and green in the
+battery; a memory probe over a passing run peaked at 54 % of the 536 MB cap, so
+this is not the in-container limit either. What is *proved* is only "PID 1 died
+mid-provisioning on this host under parallel provisioning" — which is a host
+precondition, not a product claim.
+
+- **`support::COLD_BOOTSTRAP_LOCK`** (a `tokio::sync::Mutex` held across
+  awaits, the `manor_guarded` precedent) serialises the cold-bootstrap suites:
+  both arms of `escape_guarded`, plus `bootstrap_guarded`'s cold-bootstrap
+  test, which is the battery's other ~1 GB step and had the same trap waiting
+  in it. Per-run names do not fix this half — host RAM is shared.
+- **The suite can no longer report a dead parcel as a product failure.**
+  `escape_guarded` now returns `Failure::{Product, HostPrecondition}` instead
+  of `String`: every `podman exec` error is passed through
+  `support::dead_parcel_precondition`, which matches podman's gone/not-running
+  wordings *and requires podman to confirm the container is not running*, so a
+  genuine failure that happens to mention a container name is never classified
+  away. `Product` still panics (a plain RED); `HostPrecondition` prints
+  `SKIP <test>: QA04-27 … Remedy: …`.
+- **Liveness is probed before the first assertion**, between provisioning and
+  the first §11.4 claim, so the failure is reported where it happened rather
+  than three checks later.
+- **Pinned both ways** in `guard_acceptance.rs`:
+  `only_a_dead_parcel_is_classified_as_a_host_precondition` (the narrow
+  direction — a secrets/§4 message is never classified), and
+  `a_live_container_is_never_classified_as_a_host_precondition` (a container
+  podman reports as running stays a product failure) plus
+  `a_dead_parcel_is_reported_as_a_host_precondition_with_a_remedy` (all four
+  wordings, remedy printed per ADR-0032 cl. 1).
+
+### QA04-29 — `chown -R` no longer relies on an unpinned coreutils default
+
+The finding is right that "nothing to fix in the code today" is a choice, and
+I did not take it. `apply_manor_home` walks the **Mayor's own home** — a tree
+that is agent-writable by design (that is ADR-0034 cl. 1's whole point) — with
+`-R`. Whether `-R` chowns what a symlink *points at* decides between "rename
+the Mayor's subtree" and "**privileged chown of an attacker-chosen path**",
+executed root-equivalent inside the daemon's userns (ADR-0011 cl. 4). SPEC §4
+and ADR-0011 cl. 2 make ownership *the* isolation boundary; it must not rest
+on a flag default nobody wrote down.
+
+Re-measured live on this host before changing anything (rootless podman,
+`/tmp` probe as in the finding):
+
+| flag | rc | `link` itself | `target/`, `target/f1` |
+|---|---|---|---|
+| `-RP` | 0 | → Mayor's host uid | **untouched** |
+| `-RL` | 0, silent | → Mayor's host uid | **→ Mayor's host uid** (the escalation) |
+
+- **ADR-0034 cl. 5 (new)**, amending ADR-0011 cl. 2, which now carries the
+  same sentence: the recursive form must not dereference, and the policy lives
+  in the argv. The clause states the trade honestly — on a host whose `chown`
+  is BusyBox (no `-P`) manor provisioning now **fails loudly** instead of
+  dereferencing silently, which is the intended direction.
+- **`unshare_chown_recursive_argv` emits `-RP`** as one fixed operand. The
+  non-recursive brace carries no traversal flag at all (pinned too, so the two
+  forms cannot be confused).
+- **Pinned hermetically**: `podman.rs::chown_recursive_argv_pins_no_dereference`
+  asserts the option set is *exactly* `["-RP"]` and that no `-L`/`-H`/
+  `--dereference` token can appear, so both a dropped `-P` and an added `-L`
+  are red. Golden + `hostperm.rs` FakeRuntime argv + `mayor.rs` ordering test
+  all updated. **Ratchet** in `e2e-02-isolation.sh` T2 pins the source, so a
+  rewrite of the golden cannot quietly re-open it.
+- **Pinned on a live host** (new guarded test):
+  `manor_guarded::podman_manor_home_brace_does_not_follow_symlinks_out_of_the_tree`
+  plants `link -> <dir outside the village>` inside the manor home, applies
+  the real brace, and asserts from the daemon's userns that the real file
+  inside moved to UID 1000 (otherwise the test proves nothing) while the
+  target dir and a file under it still belong to the daemon.
+- The test-side `reclaim` helpers (guarded suites handing a subuid-owned
+  tempdir back) now use `-RP` too — they walk agent-writable trees for the
+  same reason.
+
+### Also fixed (found on the way, disclosed)
+
+- **`guard_acceptance.rs` could not be run outside its own script.**
+  `shim_bin()` `expect()`ed `QA_GUARD_SHIM_DIR` and the disk arm
+  `expect()`ed `QA_GUARD_DISK_AREA`, so a bare `cargo test --workspace` — what
+  the CI battery actually runs — failed **8 tests red**, and under parallel
+  threads the `PATH` mutations raced (5–8 failures depending on scheduling).
+  Both now fall back to self-created directories, and every case that spawns
+  `df`/`podman` takes a process-wide `host_probe_lock`, so the file is correct
+  standalone. `e2e-06` behaviour is unchanged (it exports both variables).
+  This is test-infra in a QA-owned file; flagging it rather than quietly
+  leaving the workspace battery red.
+- **`mayor.rs::manor_home_brace_reaches_decrees_and_precedes_the_container`**
+  matched the bare `-R` operand and went red on the `-RP` change (a good sign:
+  the assertion was specific). Updated in both places it pins the brace.
+
+### Not done here (owners unchanged)
+
+- **QA04-26 lock half / QA04-31** — CI-agent (`ci.sh` is untouched by this
+  pass, as instructed).
+- **QA04-28** (the tautological `ls -ln` containment assert) — QA's.
+
+### Verify
+
+```sh
+cargo test -p hamlet-daemon --lib podman            # argv golden + the -RP pin
+cargo test -p hamlet-daemon --lib hostperm          # FakeRuntime argv for the brace
+cargo test -p hamlet-daemon --test mayor             # brace-before-container ordering
+cargo test -p hamlet-daemon --test guard_acceptance # 15: guards both directions, bare run
+./scripts/e2e-02-isolation.sh                        # T2 now ratchets -RP + per-run names
+cargo test --workspace                               # full battery green
+
+# guarded (podman-capable host):
+HAMLET_PODMAN_TESTS=1 cargo test -p hamlet-daemon --test escape_guarded -- --ignored podman
+# live-run verification on this host (TMPDIR must be disk-backed — QA04-08):
+TMPDIR=/home/dock/tmp-ci HAMLET_PODMAN_TESTS=1 \
+  cargo test -p hamlet-daemon --test escape_guarded -- --ignored podman_escape_suite   # green, 34 s
+TMPDIR=/home/dock/tmp-ci HAMLET_PODMAN_TESTS=1 \
+  cargo test -p hamlet-daemon --test manor_guarded -- --ignored \
+  podman_manor_home_brace_does_not_follow                                             # green (QA04-29)
+HAMLET_PODMAN_TESTS=1 cargo test -p hamlet-daemon --test manor_guarded -- --ignored \
+  podman_manor_home_brace_does_not_follow_symlinks_out_of_the_tree
+```
+
+## ci-agent pass — QA04-26 (lock half) + QA04-31 (a verdict on every abort path)
+
+### Done
+
+**QA04-31 — `scripts/ci.sh` can no longer die without a verdict.** The battery
+was rebuilt around three layers, each pinning a death mode measured on bash 5.3:
+
+1. **No `set -e`, and no `set -u`.** Both have death paths the ERR trap cannot
+   catch (verified: an unbound-variable exit under `-u` prints nothing; a
+   main-body syntax error exits rc=2 with no trap at all). Every variable that
+   can be absent has an explicit default instead.
+2. **Self `bash -n` before anything else.** A syntax error anywhere in the file
+   (the QA04-31 repro was one mid-run, from a concurrent edit) is caught first;
+   even then the e2e phase still runs and `CI battery: FAIL (n)` is still
+   printed — steps 1–5 cannot run, but the gate refuses loudly instead of
+   dying.
+3. **ERR backstop (`on_err`).** Any other unexpected failure (a sourced helper
+   dying, step 5 aborting) is recorded with its line number and the battery
+   *continues* to the e2e phase. The e2e phase now runs unconditionally after
+   step 5 and accumulates its failures into the same verdict — a red step 5 can
+   no longer suppress it, and an aborted step 5 can no longer skip it.
+
+`ci-local.sh` and `hooks/pre-push` also `bash -n` the battery before exec (a
+syntax error in ci.sh's *first* lines is unreachable even by its own self-check)
+and print the same verdict there.
+
+**QA04-26 — the guarded battery is serialized, and refusal is recorded.** The
+flock design (`ci_guarded_lock`, one lock per podman user, holder named in the
+lock file) was already wired into `guarded-entry.sh` and the e2e-02/04/05
+direct routes; this pass closed the remaining holes:
+
+- **`e2e-06-guard-mutations.sh` T3** ran a real guarded suite with NO lock — it
+  now takes the same lock, and on refusal records a SKIP with the holder named
+  (never a FAIL).
+- `ci_guarded_lock` no longer *silently proceeds* when the lock file cannot be
+  opened: it refuses with a recorded reason. Absence of flock itself is now a
+  printed note (previously a silent no-op).
+- The lock's pid line uses `$BASHPID`: inside a subshell `$$` names the parent
+  script — the refusal used to name the wrong holder (measured in e2e-07 T3a).
+
+**Regression pin: `scripts/e2e-07-ci-abort.sh`** (new harness, run by the
+battery's e2e phase):
+
+- **T1** injects a syntax error into a *sandboxed* ci.sh at the step-5 anchor
+  (the exact QA04-31 shape) → asserts the e2e phase ran AND `CI battery: FAIL (`
+  was printed, even though steps 1–5 cannot run.
+- **T2** corrupts the sandboxed `ci-guarded-job.sh` (source-death mid-battery)
+  → same assertions via the ERR-backstop path.
+- **T3** holds the real host lock → asserts `ci_guarded_lock` refuses rc=3, the
+  refusal names the live holder's pid, and `guarded-entry.sh` exits 3 + SKIP
+  under the lock; then verifies the lock is free again.
+
+The sandbox excludes e2e-07 itself (self-inclusion recurses — measured: ~700
+nested generations filling /tmp before the first kill) and stubs the guarded
+entry point so no real battery can start from inside it.
+
+### PASS/FAIL table (full battery, `./scripts/ci-local.sh`, 2026-10-05)
+
+| # | Step | Result | Note |
+|---|------|--------|------|
+| 1 | `cargo fmt --all --check` | **FAIL** | working tree: `bootstrap_guarded.rs` unformatted (in-progress sprint-05 edits) |
+| 2 | `cargo clippy --workspace --all-targets -- -D warnings` | **FAIL** | working tree: `tests/support/mod.rs` — 64 compile errors |
+| 3 | `cargo test --workspace` | **FAIL** | same build failure (`support/mod.rs` compiles for every daemon test) |
+| 4 | `scripts/check-deps.sh` | PASS | allowlist intact |
+| 5a | village-tree disk policy | PASS | floor met; no stranded trees |
+| 5b | guarded podman battery (when available) | **SKIP** | dock doctor FAILs on tmpfs `/tmp`; `sudo -n` needs a password → exit 3 + remedy printed. Never a FAIL (QA04-26). |
+| 6–11 | `e2e-01` … `e2e-05` | PASS | guarded sections SKIP via the delegate (recorded) |
+| 12 | `scripts/e2e-06-guard-mutations.sh` | **FAIL** | refuses to mutate a dirty working tree (`support/mod.rs` modified) — by design |
+| 13 | `scripts/e2e-07-ci-abort.sh` (new) | PASS | T1/T2/T3 all green, ~60 s |
+
+**Verdict: `CI battery: FAIL (4)`, exit 1, verdict line printed** — the gate is
+working as intended. All four reds share one cause: the **uncommitted
+sprint-05 test edits** in the working tree (`tests/support/mod.rs`,
+`tests/bootstrap_guarded.rs` and eight other guarded suites, plus
+`hostperm.rs`/`podman.rs`). None is a product defect or a CI defect, and none
+is a file this role may edit.
+
+### Minimal failing output (captured)
+
+```
+[1/5] fmt — first diff:
+Diff in crates/hamlet-daemon/tests/bootstrap_guarded.rs:980:
+-        let _ = StdCommand::new("podman").args(["rm", "-f", &agent]).output();
++        let _ = StdCommand::new("podman")
++            .args(["rm", "-f", &agent])
++            .output();
+
+[2/5] clippy + [3/5] test — first errors (64 total, all in one file):
+error[E0405]: cannot find trait `Runtime` in this scope
+   --> crates/hamlet-daemon/tests/support/mod.rs:453:34
+error[E0425]: cannot find type `Arc` in this scope
+   --> crates/hamlet-daemon/tests/support/mod.rs:454:12
+
+[12] e2e-06:
+refusing to mutate: crates/hamlet-daemon/tests/support/mod.rs is modified in the working tree
+```
+
+### Carry-forward (test role)
+
+- The working-tree `tests/support/mod.rs` does not compile (E0405/E0425/E0433:
+  `Runtime`, `Arc`, `BoxFuture`, `PodmanError`, … not in scope) and
+  `bootstrap_guarded.rs` is unformatted. Until the in-progress edits are
+  finished, steps 1–3 and e2e-06 stay red. The committed HEAD state was green
+  on all of these (sprint-05 gate), so this is a transient mid-pass state, not
+  a regression on main.
+- With a clean tree the expected table: steps 1/2 PASS, step 3 FAIL only in
+  `guard_acceptance.rs`'s env panic (known carry-forward), e2e-06 PASS.
+
+### Verify
+
+```sh
+./scripts/ci-local.sh                 # full battery; the verdict is always printed
+./scripts/e2e-07-ci-abort.sh          # QA04-31/26 regression, ~60 s
+bash -n scripts/ci.sh                 # the self-check ci-local.sh runs for you
+```

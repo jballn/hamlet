@@ -230,6 +230,74 @@ impl From<QueueError> for SuperviseError {
 }
 
 // ---------------------------------------------------------------------------
+// Crash hook (SPEC §6, §7; ADR-0029 cl. 2)
+// ---------------------------------------------------------------------------
+
+/// What a supervision task reports when a session life dies: the dead
+/// [`SessionId`], how much of the restart budget it had already spent, and
+/// whether the daemon is giving up on it.
+///
+/// This is **telemetry-shaped notification data**, never state (CONVENTIONS
+/// §2): the charter already holds the terminal record, and the hook only
+/// decides whether the Mayor should be woken (`mayor.crash_wake`,
+/// ADR-0029 cl. 2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrashNotice {
+    /// Charter slot whose session died.
+    pub uid: u32,
+    /// The dead life.
+    pub session: SessionId,
+    /// Consecutive auto-restarts already spent before this crash.
+    pub restarts: u32,
+    /// True when the restart budget is exhausted — the daemon will not
+    /// revive the agent and the parcel carries its permanent `TITLE.md`
+    /// stamp.
+    pub permanent: bool,
+    /// One-line, scrubbed reason (never stderr verbatim, never secrets —
+    /// `scrub_detail`).
+    pub detail: String,
+}
+
+/// The crash hook seam (ADR-0029 cl. 2): the supervisor notifies, the
+/// Mayor plane decides. Implementations must not block the supervision
+/// task — the production bridge hands the notice to its own task.
+pub trait CrashWake: Send + Sync {
+    /// One life died. Called on the supervision task, so keep it cheap.
+    fn crashed(&self, notice: &CrashNotice);
+}
+
+/// Recording hook for tests: the notices a supervision chain emitted.
+#[derive(Default)]
+pub struct RecordingCrashWake {
+    notices: std::sync::Mutex<Vec<CrashNotice>>,
+}
+
+impl RecordingCrashWake {
+    /// An empty recorder.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Every notice, in order.
+    pub fn notices(&self) -> Vec<CrashNotice> {
+        self.notices
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+}
+
+impl CrashWake for RecordingCrashWake {
+    fn crashed(&self, notice: &CrashNotice) {
+        self.notices
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(notice.clone());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Spawner seam
 // ---------------------------------------------------------------------------
 
@@ -531,6 +599,11 @@ struct Inner {
     /// Per-life kill senders (`SessionId::as_u64` → sender) so
     /// [`Supervisor::abandon`] can SIGKILL children without charter writes.
     killers: Mutex<BTreeMap<u64, mpsc::UnboundedSender<()>>>,
+    /// Optional crash hook (ADR-0029 cl. 2). Installed after construction so
+    /// the supervision plane and the Mayor plane can be wired in either
+    /// order; absence is not an error (a village without a Mayor still
+    /// supervises).
+    crash_wake: Mutex<Option<Arc<dyn CrashWake>>>,
     generation: AtomicU64,
 }
 
@@ -602,6 +675,20 @@ impl Inner {
             .unwrap_or_else(|e| e.into_inner())
             .remove(&session.as_u64());
     }
+
+    /// Hand one crash notice to the installed hook (ADR-0029 cl. 2). The
+    /// charter record is already written by the caller — this is a wake
+    /// signal, never a state transition, so a missing or panicking-free
+    /// hook changes nothing about what the village believes.
+    fn notify_crash(&self, notice: CrashNotice) {
+        let hook = {
+            let guard = self.crash_wake.lock().unwrap_or_else(|e| e.into_inner());
+            guard.clone()
+        };
+        if let Some(hook) = hook {
+            hook.crashed(&notice);
+        }
+    }
 }
 
 /// The session supervisor (SPEC §6): one instance per village tree, held
@@ -632,6 +719,7 @@ impl Supervisor {
                 queues,
                 charter_lock: Mutex::new(()),
                 killers: Mutex::new(BTreeMap::new()),
+                crash_wake: Mutex::new(None),
                 generation: AtomicU64::new(0),
             }),
             live: Arc::new(Mutex::new(BTreeMap::new())),
@@ -688,6 +776,18 @@ impl Supervisor {
     #[must_use]
     pub fn queues(&self) -> &QueueStore {
         &self.inner.queues
+    }
+
+    /// Install the crash hook (ADR-0029 cl. 2). Wiring order is free: the
+    /// Mayor plane may attach before or after sessions start. Replacing an
+    /// installed hook is allowed (one writer at boot); a supervisor with no
+    /// hook supervises exactly as before.
+    pub fn set_crash_wake(&self, hook: Arc<dyn CrashWake>) {
+        *self
+            .inner
+            .crash_wake
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(hook);
     }
 
     // --- live metrics query surface (SPEC §11.2; Sprint 03 step 04) --------
@@ -1466,6 +1566,13 @@ async fn supervise_lives(
                 match ctx.inner.config.sessions.restart.backoff_ms(restarts) {
                     None => {
                         permanent_crash(&ctx, session, restarts, &detail);
+                        ctx.inner.notify_crash(CrashNotice {
+                            uid,
+                            session,
+                            restarts,
+                            permanent: true,
+                            detail: scrub_detail(&detail),
+                        });
                         break 'chain;
                     }
                     Some(delay_ms) => {
@@ -1519,6 +1626,16 @@ async fn supervise_lives(
                             BackoffWait::Control(None) => break 'chain,
                         }
                         restarts += 1;
+                        // The daemon will revive this life: a restartable
+                        // crash is *observable*, but it is not a Mayor wake
+                        // under the default policy (ADR-0029 cl. 2).
+                        ctx.inner.notify_crash(CrashNotice {
+                            uid,
+                            session,
+                            restarts,
+                            permanent: false,
+                            detail: scrub_detail(&detail),
+                        });
                         match session.next_incarnation() {
                             Ok(next) => session = next,
                             Err(e) => {

@@ -11,8 +11,9 @@
 //! additively): [`slots`](crate::slots) (uid → identity record), `agents`
 //! (registry refs), `commissions` (id → state placeholder), `parcels` (uid
 //! lease records), `sessions` (uid → supervised session record, charter v2,
-//! ADR-0015), `decrees` (queue status placeholder), `webhooks` (config ref
-//! names).
+//! ADR-0015), `decrees` (decree sequence → queue status) + `decree_receipts`
+//! (decree sequence → admitted content digest, charter v3, ADR-0026),
+//! `webhooks` (config ref names).
 //!
 //! **Persistence protocol** (CONVENTIONS §3 rule 2; ADR-0006):
 //! [`Charter::save_atomic`] serializes to a *unique* temp file in the same
@@ -46,8 +47,12 @@ use crate::slots::{self, SlotError, SlotTable, FIRST_AGENT_UID, LAST_AGENT_UID, 
 /// v1 → v2 (Sprint 03, ADR-0015): additive `sessions` group — supervised
 /// session identity/status/restart counter per UID slot. v1 files still
 /// load: the migration step stamps the version; serde defaults fill the
-/// group.
-pub const CHARTER_VERSION: u32 = 2;
+/// group. v2 → v3 (Sprint 05, ADR-0026 cl. 3): additive
+/// `decree_receipts` group — the content digest each admitted decree id was
+/// recorded with, so replaying an id with different content is *refused*
+/// rather than silently dropped. `decrees` (id → status) is untouched, so
+/// v2 files still load.
+pub const CHARTER_VERSION: u32 = 3;
 
 /// Master state map — the typed form of `.hamlet/charter.json`.
 ///
@@ -90,10 +95,19 @@ pub struct Charter {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub sessions: BTreeMap<u32, SessionRecord>,
 
-    /// Decree queue status: decree id → placeholder. Sprint 05 owns the
-    /// decree vocabulary (SPEC §7); v1 records queue position only.
+    /// Decree queue status: decree sequence → lifecycle status. The sequence
+    /// is the monotonic ordering key assigned by [`Charter::next_decree_seq`]
+    /// (ADR-0026 cl. 3) — never a clock reading.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub decrees: BTreeMap<u64, DecreeStatus>,
+
+    /// Admitted decree receipts: decree sequence → the content digest it was
+    /// admitted with (ADR-0026 cl. 3, charter v3). The *idempotent replay
+    /// record*: a repeated decree with the same digest is a no-op, the same
+    /// sequence with a different digest is refused. Keys mirror `decrees`
+    /// exactly (load-time invariant).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub decree_receipts: BTreeMap<u64, String>,
 
     /// Webhook config refs: sanitized names pointing at webhook config
     /// (delivery wiring lands in a later sprint). Placeholder shape.
@@ -129,6 +143,15 @@ pub struct ParcelLease {
     /// True while the patron's home is parked in stasis
     /// (`tavern/patrons/PROPRIETOR<name>/home.uid.bak/`).
     pub stasis: bool,
+}
+
+/// Outcome of [`Charter::admit_decree`] (ADR-0026 cl. 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecreeAdmission {
+    /// First sighting: receipt + queued status recorded; the executor runs.
+    Admitted,
+    /// Already executed with identical content: idempotent no-op.
+    Replayed,
 }
 
 /// Decree queue status placeholder (sprint 05 extends).
@@ -241,6 +264,7 @@ impl Charter {
             parcels: BTreeMap::new(),
             sessions: BTreeMap::new(),
             decrees: BTreeMap::new(),
+            decree_receipts: BTreeMap::new(),
             webhooks: BTreeSet::new(),
         }
     }
@@ -391,6 +415,85 @@ impl Charter {
         })
     }
 
+    // --- decree admission (ADR-0026 cl. 3–4) ---------------------------
+
+    /// The next decree sequence to use (1-based): one past the highest
+    /// admitted sequence, or `1` for a fresh village. This is the *only*
+    /// ordering source for decrees — no wall-clock, no mtime, no filename
+    /// timestamp ever participates (CONVENTIONS §3 r4).
+    #[must_use]
+    pub fn next_decree_seq(&self) -> u64 {
+        self.decrees.keys().next_back().map_or(1, |seq| seq + 1)
+    }
+
+    /// Admit a decree id (ADR-0026 cl. 3–4), the idempotent gate every
+    /// execution passes through:
+    ///
+    /// - **unknown sequence** → it must be exactly [`Charter::next_decree_seq`];
+    ///   the receipt and the [`DecreeStatus::Queued`] status are recorded in
+    ///   one mutation, so a crash between the two is impossible (the next
+    ///   save is atomic, ADR-0006).
+    /// - **known sequence, same digest** → [`DecreeAdmission::Replayed`]: an
+    ///   idempotent no-op (the daemon re-acknowledges `done`).
+    /// - **known sequence, different digest** → `Err`: the sequence was
+    ///   reused for different content, which the daemon acks as
+    ///   `rejected: replay_mismatch` rather than executing.
+    ///
+    /// # Errors
+    ///
+    /// [`CharterError::Invariant`] naming which rule refused the id.
+    pub fn admit_decree(
+        &mut self,
+        id: &crate::decree::DecreeId,
+    ) -> std::result::Result<DecreeAdmission, CharterError> {
+        match self.decree_receipts.get(&id.seq()) {
+            Some(recorded) if recorded == id.digest() => Ok(DecreeAdmission::Replayed),
+            Some(recorded) => Err(invariant(format!(
+                "decree sequence {} was already admitted with a different content digest \
+                 (recorded {recorded}, offered {}) — refusing to reuse a decree id \
+                 (ADR-0026 cl. 3)",
+                id.seq(),
+                id.digest()
+            ))),
+            None => {
+                let expected = self.next_decree_seq();
+                if id.seq() != expected {
+                    return Err(invariant(format!(
+                        "decree sequence {} is not the next charter sequence {expected} — \
+                         ordering is the charter counter, never the clock \
+                         (CONVENTIONS §3 r4)",
+                        id.seq()
+                    )));
+                }
+                self.decree_receipts
+                    .insert(id.seq(), id.digest().to_owned());
+                self.decrees.insert(id.seq(), DecreeStatus::Queued);
+                Ok(DecreeAdmission::Admitted)
+            }
+        }
+    }
+
+    /// Record the terminal status of an admitted decree.
+    ///
+    /// # Errors
+    ///
+    /// [`CharterError::Invariant`] when `seq` was never admitted (its receipt
+    /// must exist).
+    pub fn set_decree_status(
+        &mut self,
+        seq: u64,
+        status: DecreeStatus,
+    ) -> std::result::Result<(), CharterError> {
+        if !self.decree_receipts.contains_key(&seq) {
+            return Err(invariant(format!(
+                "decree sequence {seq} has no admission receipt (status cannot precede \
+                 admission, ADR-0026 cl. 3)"
+            )));
+        }
+        self.decrees.insert(seq, status);
+        Ok(())
+    }
+
     // --- slot operations (delegate to crate::slots over self.slots) ---
 
     /// Reserve UID 1000 for the Mayor/manor identity (idempotent).
@@ -505,6 +608,37 @@ impl Charter {
                 )));
             }
         }
+        for (&seq, digest) in &self.decree_receipts {
+            if seq < 1 {
+                return Err(invariant(format!(
+                    "decree sequence {seq} is not a 1-based sequence"
+                )));
+            }
+            if digest.len() != crate::decree::DIGEST_HEX_LEN
+                || !digest
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            {
+                return Err(invariant(format!(
+                    "decree receipt for sequence {seq} is not a {} hex-char digest",
+                    crate::decree::DIGEST_HEX_LEN
+                )));
+            }
+            if !self.decrees.contains_key(&seq) {
+                return Err(invariant(format!(
+                    "decree receipt {seq} has no matching decrees entry (receipts and \
+                     status records must mirror each other)"
+                )));
+            }
+        }
+        for &seq in self.decrees.keys() {
+            if !self.decree_receipts.contains_key(&seq) {
+                return Err(invariant(format!(
+                    "decree status {seq} has no admission receipt (status without a receipt \
+                     means an id was executed without being admitted)"
+                )));
+            }
+        }
         Ok(())
     }
 }
@@ -538,6 +672,9 @@ fn migrate(charter: Charter) -> Result<Charter> {
     if current.charter_version == 1 {
         current = step_1_to_2(current)?;
     }
+    if current.charter_version == 2 {
+        current = step_2_to_3(current)?;
+    }
     if current.charter_version != CHARTER_VERSION {
         return Err(invariant(format!(
             "no migration step from charter_version {} to {CHARTER_VERSION}",
@@ -556,7 +693,15 @@ fn step_1_to_2(mut charter: Charter) -> Result<Charter> {
     Ok(charter)
 }
 
-/// Unknown-fields-strict wire mirror of [`Charter`] (v2 schema). Public
+/// v2 → v3 (Sprint 05, ADR-0026 cl. 3): additive `decree_receipts` group.
+/// Serde defaults already populated the group at parse time; the step only
+/// stamps the new version — never renames, retypes, or drops state.
+fn step_2_to_3(mut charter: Charter) -> Result<Charter> {
+    charter.charter_version = 3;
+    Ok(charter)
+}
+
+/// Unknown-fields-strict wire mirror of [`Charter`] (v3 schema). Public
 /// parsing is lenient *only* for documents declaring an older version —
 /// additive migration (CONVENTIONS §3 r3) means a v1 file simply lacks the
 /// newer groups; it must never mean new fields are silently dropped from a
@@ -578,6 +723,8 @@ struct StrictCharter {
     #[serde(default)]
     decrees: BTreeMap<u64, DecreeStatus>,
     #[serde(default)]
+    decree_receipts: BTreeMap<u64, String>,
+    #[serde(default)]
     webhooks: BTreeSet<SafeName>,
 }
 
@@ -591,6 +738,7 @@ impl From<StrictCharter> for Charter {
             parcels: wire.parcels,
             sessions: wire.sessions,
             decrees: wire.decrees,
+            decree_receipts: wire.decree_receipts,
             webhooks: wire.webhooks,
         }
     }
@@ -685,6 +833,9 @@ mod tests {
             },
         );
         charter.decrees.insert(1, DecreeStatus::Queued);
+        charter
+            .decree_receipts
+            .insert(1, "c0225c3b8fabf543".to_string());
         charter.webhooks.insert(name("github"));
         charter.sessions.insert(
             ada,
@@ -703,7 +854,7 @@ mod tests {
     fn empty_charter_render_golden() {
         assert_eq!(
             Charter::empty().render(),
-            "{\n  \"charter_version\": 2\n}\n"
+            "{\n  \"charter_version\": 3\n}\n"
         );
     }
 
@@ -716,11 +867,11 @@ mod tests {
         assert_eq!(Charter::default(), Charter::empty());
     }
 
-    /// Committed migration vector (ADR-0015 cl. 4): a v1-rendered charter
-    /// loads as v2 with the empty `sessions` group defaulted in; all other
-    /// state untouched.
+    /// Committed migration vector (ADR-0015 cl. 4 + ADR-0026 cl. 3): a
+    /// v1-rendered charter loads as v3 with the empty `sessions` and
+    /// `decree_receipts` groups defaulted in; all other state untouched.
     #[test]
-    fn v1_charter_migrates_to_v2_additively() {
+    fn v1_charter_migrates_to_v3_additively() {
         let v1 = br#"{
   "agents": { "ada": { "slot": 1001 } },
   "charter_version": 1,
@@ -730,11 +881,12 @@ mod tests {
   }
 }"#;
         let mut charter = Charter::from_bytes(v1).unwrap();
-        assert_eq!(charter.charter_version, 2);
+        assert_eq!(charter.charter_version, 3);
         assert!(charter.sessions.is_empty());
+        assert!(charter.decree_receipts.is_empty());
         assert_eq!(charter.slots.len(), 2);
         // The supervisor writes the first session record; save/load
-        // round-trips the v2 shape.
+        // round-trips the v3 shape.
         charter.sessions.insert(
             1001,
             SessionRecord {
@@ -744,8 +896,149 @@ mod tests {
             },
         );
         let rendered = charter.render();
-        assert!(rendered.contains("\"charter_version\": 2"));
+        assert!(rendered.contains("\"charter_version\": 3"));
         assert_eq!(Charter::from_bytes(rendered.as_bytes()).unwrap(), charter);
+    }
+
+    /// v2 → v3 (ADR-0026 cl. 3) is additive: a v2 document that already
+    /// carries `decrees` but no `decree_receipts` still parses. Such a
+    /// document is only loadable if it carries no `decrees` entries (status
+    /// without a receipt is the v2 placeholder shape, which the receipt
+    /// invariant refuses) — that refusal is the documented migration edge.
+    #[test]
+    fn v2_charter_without_decrees_migrates_to_v3() {
+        let v2 = br#"{
+  "charter_version": 2,
+  "slots": {
+    "1000": { "identity": "manor", "status": "active" }
+  }
+}"#;
+        let charter = Charter::from_bytes(v2).unwrap();
+        assert_eq!(charter.charter_version, 3);
+        assert!(charter.decrees.is_empty());
+        assert!(charter.decree_receipts.is_empty());
+        // A v2 document that already recorded a decree status is refused
+        // rather than repaired (no silent state invention, CONVENTIONS §3 r3).
+        let v2_with_decrees = br#"{
+  "charter_version": 2,
+  "decrees": { "1": "queued" }
+}"#;
+        assert!(matches!(
+            Charter::from_bytes(v2_with_decrees),
+            Err(CharterError::Invariant { .. })
+        ));
+    }
+
+    /// ADR-0026 cl. 3–4: the decree admission gate. Sequence ordering comes
+    /// from the charter counter (never a clock), an identical re-emission is
+    /// an idempotent no-op, and a reused sequence with different content is
+    /// refused.
+    #[test]
+    fn decree_admission_is_monotonic_and_replay_protected() {
+        use crate::decree::DecreeId;
+
+        let mut charter = Charter::empty();
+        assert_eq!(charter.next_decree_seq(), 1, "1-based sequence");
+
+        let first = DecreeId::new(1, "c0225c3b8fabf543").unwrap();
+        assert_eq!(
+            charter.admit_decree(&first).unwrap(),
+            DecreeAdmission::Admitted
+        );
+        assert_eq!(charter.decrees[&1], DecreeStatus::Queued);
+        assert_eq!(charter.decree_receipts[&1], "c0225c3b8fabf543");
+        assert_eq!(charter.next_decree_seq(), 2);
+
+        // Identical re-emission: idempotent no-op, no state change.
+        let before = charter.clone();
+        assert_eq!(
+            charter.admit_decree(&first).unwrap(),
+            DecreeAdmission::Replayed
+        );
+        assert_eq!(charter, before, "a replay must not mutate state");
+
+        // Same sequence, different content: refused (not silently executed).
+        let forged = DecreeId::new(1, "0000000000000001").unwrap();
+        match charter.admit_decree(&forged) {
+            Err(CharterError::Invariant { message }) => {
+                assert!(message.contains("already admitted"), "{message}")
+            }
+            other => panic!("expected replay-mismatch refusal, got {other:?}"),
+        }
+
+        // Skipping a sequence is refused: ordering is the charter counter.
+        let skipped = DecreeId::new(5, "0000000000000002").unwrap();
+        match charter.admit_decree(&skipped) {
+            Err(CharterError::Invariant { message }) => {
+                assert!(
+                    message.contains("not the next charter sequence"),
+                    "{message}"
+                )
+            }
+            other => panic!("expected out-of-order refusal, got {other:?}"),
+        }
+
+        // Terminal status is only reachable for an admitted sequence.
+        charter
+            .set_decree_status(1, DecreeStatus::Delivered)
+            .unwrap();
+        assert_eq!(charter.decrees[&1], DecreeStatus::Delivered);
+        assert!(matches!(
+            charter.set_decree_status(2, DecreeStatus::Failed),
+            Err(CharterError::Invariant { .. })
+        ));
+        assert!(charter.validate().is_ok());
+
+        // Kill/restart: admission survives the atomic save (CONVENTIONS §3 r6).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("charter.json");
+        charter.save_atomic(&path).unwrap();
+        let mut recovered = Charter::load(&path).unwrap();
+        assert_eq!(recovered.decree_receipts, charter.decree_receipts);
+        assert_eq!(
+            recovered.admit_decree(&first).unwrap(),
+            DecreeAdmission::Replayed,
+            "a replayed decree is still idempotent after restart"
+        );
+        assert!(
+            matches!(
+                recovered.admit_decree(&forged),
+                Err(CharterError::Invariant { .. })
+            ),
+            "a reused sequence with different content stays refused after restart"
+        );
+    }
+
+    /// Receipt/status mirroring and digest shape are load-time invariants
+    /// (ADR-0026 cl. 3).
+    #[test]
+    fn decree_receipt_invariants_reject_lying_charters() {
+        let bad_digest = br#"{
+  "charter_version": 3,
+  "decrees": { "1": "queued" },
+  "decree_receipts": { "1": "NOT-HEX" }
+}"#;
+        assert!(matches!(
+            Charter::from_bytes(bad_digest),
+            Err(CharterError::Invariant { .. })
+        ));
+        let zero_seq = br#"{
+  "charter_version": 3,
+  "decrees": { "0": "queued" },
+  "decree_receipts": { "0": "c0225c3b8fabf543" }
+}"#;
+        assert!(matches!(
+            Charter::from_bytes(zero_seq),
+            Err(CharterError::Invariant { .. })
+        ));
+        let receipt_only = br#"{
+  "charter_version": 3,
+  "decree_receipts": { "1": "c0225c3b8fabf543" }
+}"#;
+        assert!(matches!(
+            Charter::from_bytes(receipt_only),
+            Err(CharterError::Invariant { .. })
+        ));
     }
 
     /// Unknown fields are corruption at every supported version — union-
@@ -822,9 +1115,12 @@ mod tests {
       \"slot\": 1001
     }
   },
-  \"charter_version\": 2,
+  \"charter_version\": 3,
   \"commissions\": {
     \"1\": \"open\"
+  },
+  \"decree_receipts\": {
+    \"1\": \"c0225c3b8fabf543\"
   },
   \"decrees\": {
     \"1\": \"queued\"
@@ -910,21 +1206,21 @@ mod tests {
 
     #[test]
     fn future_version_is_rejected_before_migration() {
-        let err = Charter::from_bytes(br#"{"charter_version": 3}"#).unwrap_err();
+        let err = Charter::from_bytes(br#"{"charter_version": 4}"#).unwrap_err();
         assert!(
             matches!(
                 err,
                 CharterError::UnsupportedVersion {
-                    found: 3,
+                    found: 4,
                     supported: CHARTER_VERSION
                 }
             ),
             "{err}"
         );
         let err =
-            Charter::from_bytes(br#"{"charter_version": 3, "brand_new_group": 42}"#).unwrap_err();
+            Charter::from_bytes(br#"{"charter_version": 4, "brand_new_group": 42}"#).unwrap_err();
         assert!(
-            matches!(err, CharterError::UnsupportedVersion { found: 3, .. }),
+            matches!(err, CharterError::UnsupportedVersion { found: 4, .. }),
             "{err}"
         );
         let err = Charter::from_bytes(br#"{"charter_version": 0}"#).unwrap_err();

@@ -38,6 +38,9 @@
 //!   "usage": { "input": 10, "output": 5, "totalTokens": 15 },
 //!   "expect_env": { "ANTHROPIC_API_KEY": "test-key-do-not-use" },
 //!
+//!   // --- step 03: file side effects (a Mayor writes decrees during a turn) ---
+//!   "emit_files": [ { "path": "/abs/path", "content": "..." } ],
+//!
 //!   // --- step 04: configurable metric streams (all additive/defaulted) ---
 //!   "usage_sequence": [ { "input": 10, "output": 2, "totalTokens": 12 },
 //!                       { "input": 10, "output": 5, "totalTokens": 15 } ],
@@ -159,6 +162,21 @@ struct Script {
     malformed_every_n: u32,
     #[serde(default)]
     unknown_records: Vec<String>,
+    // --- step 03: file side effects during the run ---
+    #[serde(default)]
+    emit_files: Vec<EmitFile>,
+}
+
+/// One file the fake agent writes **during** its run (step 03): the scripted
+/// stand-in for an agent that does work on disk — e.g. a Mayor decree file
+/// in `keep/census/manor/home/decrees/`. Written atomically (temp + rename,
+/// like the real daemon) as soon as the run starts, so any watcher reaction
+/// can observe it while the turn is still in flight.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmitFile {
+    path: PathBuf,
+    content: String,
 }
 
 /// One scripted tool execution inside a turn.
@@ -232,6 +250,7 @@ impl Default for Script {
             flood_usage: None,
             malformed_every_n: 0,
             unknown_records: Vec::new(),
+            emit_files: Vec::new(),
         }
     }
 }
@@ -421,9 +440,33 @@ impl State {
         self.emit_value(json!({ "type": "turn_end" }));
     }
 
+    /// Write the scripted run side effects (step 03): atomic temp + rename
+    /// so a watcher sees either no file or the complete one, exactly as the
+    /// real Mayor writes decrees.
+    fn emit_files(&mut self) {
+        // Collect first: the loop body mutably borrows `self` for logging.
+        let files: Vec<(std::path::PathBuf, String)> = self
+            .script
+            .emit_files
+            .iter()
+            .map(|f| (f.path.clone(), f.content.clone()))
+            .collect();
+        for (path, content) in files {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let temp = path.with_extension("tmp-fakeagent");
+            if std::fs::write(&temp, &content).is_ok() {
+                let _ = std::fs::rename(&temp, &path);
+            }
+            self.log_line(&format!("emit-file {}", path.display()));
+        }
+    }
+
     fn start_run(&mut self) {
         self.streaming = true;
         self.emit_value(json!({ "type": "agent_start" }));
+        self.emit_files();
         for _ in 0..self.script.turns_per_run.max(1) {
             self.run_turn();
         }

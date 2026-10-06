@@ -36,11 +36,17 @@
 #         - dispatch.rs: the backoff sleep is the bare deterministic schedule
 #           value — no jitter arithmetic (QA04-11 — a jittered sleep kept all
 #           36 workspace test binaries green).
-#   T3  Guarded real-podman freight suite (only when HAMLET_PODMAN_TESTS=1
-#       AND podman is on PATH; subuid preflight first). Skips with a
-#       recorded reason otherwise — ci.sh runs the guarded battery separately.
+#   T3  Guarded real-podman freight suite. Runs the suite directly when this
+#       host/user can (ci_guarded_direct_viable); otherwise the battery is
+#       handed to scripts/guarded-entry.sh, which measures with
+#       guarded-service-user.sh --doctor and runs it as the dedicated service
+#       user. Only when NEITHER route can run is a skip recorded — with the
+#       remedy printed (ADR-0032 cl. 5), never as a suite pass.
+#       A host precondition the suite itself cannot satisfy (QA04-07/08) is
+#       reported as a SKIP with its remedy, never as a suite pass.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+. ./scripts/ci-guarded-job.sh
 
 FAILURES=0
 step()  { printf '\033[1m==> %s\033[0m\n' "$*"; }
@@ -137,25 +143,43 @@ fi
 
 # --- T3: guarded real-podman freight suite -----------------------------------
 step "T3: guarded podman freight suite (SPEC §8.6; ADR-0011)"
-if [ "${HAMLET_PODMAN_TESTS:-0}" != "1" ]; then
-  skip "HAMLET_PODMAN_TESTS != 1 (export it on a podman-capable host)"
-elif ! command -v podman >/dev/null 2>&1; then
-  skip "podman not on PATH"
+if ! why="$(ci_guarded_direct_viable)"; then
+  skip "direct route closed: ${why}"
+  drc=0; ci_guarded_delegate "freight_guarded (via the service-user entry point)" || drc=$?
+  case "$drc" in
+    0) pass "freight_guarded: guarded battery green via the service-user entry point" ;;
+    3) skip "freight_guarded: no route on this host (remedy printed above — nothing asserted)" ;;
+    *) fail "guarded battery: a suite genuinely failed (log above)" ;;
+  esac
 else
   # Preflight: ADR-0011 needs a subuid range for the slot UIDs, and podman
   # must be rootless. Fail loudly before a cold (~200 MB) bootstrap.
   USER_NAME="$(id -un)"
   SUBUID_LINE="$(grep "^${USER_NAME}:" /etc/subuid 2>/dev/null || true)"
   if [ -z "$SUBUID_LINE" ]; then
-    fail "no /etc/subuid entry for ${USER_NAME} — ADR-0011 subuid chown cannot work"
+    skip "no /etc/subuid entry for ${USER_NAME} — ADR-0011 subuid chown cannot work (QA04-07 remedy: a dedicated hamlet service user)"
   else
-    if T3_OUT="$(cargo test -p hamlet-daemon --test freight_guarded --quiet 2>&1)"; then
+    # --ignored is REQUIRED: the suite is #[ignore]d (CONVENTIONS §5), so a
+    # run without it executes ZERO tests and reports a vacuous green — the
+    # CI04-01 class of lie, one step deeper. --nocapture so the suites'
+    # recorded skip reasons reach the log instead of being swallowed.
+    # The host lock (QA05-09) keeps a concurrent guarded job from deleting
+    # this suite's containers mid-assertion.
+    if ! ci_guarded_lock_or_report; then
+      skip "another guarded job holds the host lock (see above) — not run concurrently"
+    elif T3_OUT="$(cargo test -p hamlet-daemon --test freight_guarded -- --ignored podman --nocapture 2>&1)"; then
       printf '%s\n' "$T3_OUT" | tail -3
-      pass "freight_guarded: real-podman quarantine/promotion suite green"
+      if printf '%s\n' "$T3_OUT" | grep -q '^SKIP '; then
+        printf '%s\n' "$T3_OUT" | grep '^SKIP ' | sed 's/^/  SKIP: /'
+        skip "freight_guarded: host precondition unmet (reason above; see tests/support/mod.rs)"
+      else
+        pass "freight_guarded: real-podman quarantine/promotion suite green"
+      fi
     else
       printf '%s\n' "$T3_OUT"
       fail "freight_guarded suite"
     fi
+    ci_guarded_lock_release
   fi
 fi
 

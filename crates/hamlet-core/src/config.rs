@@ -36,8 +36,20 @@ use serde::{Deserialize, Serialize};
 /// `dispatch` keys — `url_allowlist`, `max_attempts`, `backoff_initial_ms`,
 /// `backoff_max_ms` (dispatch protocol policy). Older documents still parse
 /// — new fields carry `#[serde(default)]`, so migration is "parse old,
-/// write new"; no rewrite of existing trees is required.
-pub const CONFIG_VERSION: u32 = 6;
+/// write new"; no rewrite of existing trees is required. v6 → v7 (Sprint
+/// 05, ADR-0026 cl. 5): additive `mayor` block — the decree
+/// acknowledgment timeout that wakes the Mayor. v7 → v8 (Sprint 05 step
+/// 02, ADR-0028 cl. 3): additive `mayor.wake_queue_depth` and
+/// `mayor.turn_timeout_ms` — the bounded wake queue and the single-turn
+/// evaluation bound. v8 → v9 (Sprint 05 step 03, ADR-0029): additive
+/// `mayor.crash_wake` (which agent-session crashes wake the Mayor) and
+/// `mayor.escalation_webhook_url` (optional dispatch POST for
+/// `escalate_to_human`). v9 → v10 (Sprint 05 step 05, ADR-0030 cl. 3):
+/// additive `mayor.ack_retry_ms` — the re-notification interval for an
+/// acknowledged-never decree, so an ack timeout wakes the Mayor **once per
+/// timeout** with a bounded, operator-visible cadence instead of once per
+/// process lifetime.
+pub const CONFIG_VERSION: u32 = 10;
 
 /// Default daemon data dir (sled telemetry location). Relative paths
 /// resolve against the *working directory containing* the village root —
@@ -91,6 +103,29 @@ const DEFAULT_SESSION_MAX_RESTARTS: u32 = 5;
 const DEFAULT_SESSION_BACKOFF_INITIAL_MS: u64 = 1_000;
 /// Default restart-backoff cap (ADR-0015 cl. 4).
 const DEFAULT_SESSION_BACKOFF_MAX_MS: u64 = 60_000;
+/// Default decree-acknowledgment timeout, ms (ADR-0026 cl. 5): a decree
+/// without its `<decree_id>.ack` after this window wakes the Mayor with a
+/// `decree_ack_timeout` event.
+const DEFAULT_MAYOR_ACK_TIMEOUT_MS: u64 = 30_000;
+/// Bound on the pending Mayor wake queue: how many events may wait for the
+/// next single-turn evaluation before further events are refused as
+/// `overflow` (ADR-0028 cl. 3). Bounded because the Mayor is stateless —
+/// an unbounded queue is an unbounded memory of events nobody will read.
+const DEFAULT_MAYOR_WAKE_QUEUE_DEPTH: usize = 16;
+/// Hard bound on one Mayor evaluation (spawn → readiness → one prompt →
+/// task boundary → exit). A Mayor turn that overruns is abandoned, not
+/// retried in place (ADR-0028 cl. 3).
+const DEFAULT_MAYOR_TURN_TIMEOUT_MS: u64 = 120_000;
+/// Default crash-wake policy: only a session whose restart budget is
+/// exhausted — an agent the village can no longer revive on its own — wakes
+/// the Mayor (SPEC §6 restart policy, SPEC §7 executive loop).
+const DEFAULT_MAYOR_CRASH_WAKE: CrashWakePolicy = CrashWakePolicy::BudgetExhausted;
+/// Default re-notification interval for a still-unacknowledged decree, ms
+/// (ADR-0030 cl. 3). Deliberately much longer than
+/// [`DEFAULT_MAYOR_ACK_TIMEOUT_MS`]: the first timeout says "I am waiting",
+/// each retry says "still waiting", so the Mayor is not re-prompted into the
+/// same unanswered decision every poll tick.
+const DEFAULT_MAYOR_ACK_RETRY_MS: u64 = 600_000;
 
 /// Orchestrator/engine settings — the typed form of `.hamlet/config.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,6 +169,11 @@ pub struct Config {
     /// documents; defaults apply.
     #[serde(default)]
     pub webhooks: WebhooksConfig,
+    /// Mayor loop settings (SPEC §7; policy per ADR-0026 cl. 5): the
+    /// decree acknowledgment timeout that wakes the Mayor when a decree
+    /// goes unacknowledged. Absent in ≤v6 documents; the default applies.
+    #[serde(default)]
+    pub mayor: MayorConfig,
 }
 
 impl Default for Config {
@@ -149,6 +189,7 @@ impl Default for Config {
             resources: ResourcesConfig::default(),
             sessions: SessionsConfig::default(),
             webhooks: WebhooksConfig::default(),
+            mayor: MayorConfig::default(),
         }
     }
 }
@@ -225,7 +266,8 @@ impl Config {
         self.dispatch.validate()?;
         self.resources.validate()?;
         self.sessions.validate()?;
-        self.webhooks.validate()
+        self.webhooks.validate()?;
+        self.mayor.validate()
     }
 
     /// Resolve [`Config::daemon_data_dir`] for the village rooted at
@@ -349,6 +391,177 @@ impl DispatchConfig {
             initial_ms: self.backoff_initial_ms,
             max_ms: self.backoff_max_ms,
         }
+    }
+}
+
+/// Mayor loop settings (`config.json` `mayor`; keys fixed by ADR-0026
+/// cl. 5). The timeout is daemon-side wall-clock *behavior* (how long the
+/// Mayor sleeps before being woken by an unacknowledged decree), never a
+/// state input (CONVENTIONS §3 r4) — decree ordering comes from the charter
+/// counter alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MayorConfig {
+    /// How long a decree may sit without a `<decree_id>.ack` before the
+    /// Mayor is woken with a `decree_ack_timeout` wake. Range
+    /// 1_000..=600_000.
+    pub ack_timeout_ms: u64,
+    /// Bound on the pending wake queue (ADR-0028 cl. 3): events accepted
+    /// while no evaluation can run. Range 1..=256, default 16. Overflow is a
+    /// typed refusal the caller records — events are never silently
+    /// reordered or dropped mid-batch.
+    #[serde(default = "default_mayor_wake_queue_depth")]
+    pub wake_queue_depth: usize,
+    /// Hard bound on one single-turn evaluation, milliseconds (ADR-0028
+    /// cl. 3). Range 5_000..=1_800_000, default 120_000.
+    #[serde(default = "default_mayor_turn_timeout_ms")]
+    pub turn_timeout_ms: u64,
+    /// Which agent-session crashes wake the Mayor (ADR-0029 cl. 2). Default
+    /// [`CrashWakePolicy::BudgetExhausted`]: the Mayor is a zero-token
+    /// sleeper, so it is woken for the crashes a decision would change —
+    /// not for every auto-restart.
+    #[serde(default)]
+    pub crash_wake: CrashWakePolicy,
+    /// Optional https URL a Mayor `escalate_to_human` decree POSTs to as a
+    /// dispatch outbox request (ADR-0029 cl. 4). `None` (the default) means
+    /// the escalation lands only in the watched escalation inbox. When
+    /// present it must pass [`crate::dispatch::validate_url`] — https only,
+    /// and the dispatch allowlist is re-checked at send time (ADR-0020).
+    #[serde(default)]
+    pub escalation_webhook_url: Option<String>,
+    /// How long after one ack timeout the *next* timeout wake for the same
+    /// still-unacknowledged decree may fire (ADR-0030 cl. 3). Range
+    /// 1_000..=7_200_000, default 600_000. This is the knob that makes
+    /// "once per timeout" observable and operator-tunable instead of an
+    /// accident of process lifetime: set it to `ack_timeout_ms` for a wake
+    /// on every threshold crossing, or raise it for a quieter Mayor. The
+    /// retry counter is carried in the wake artifact body.
+    #[serde(default = "default_mayor_ack_retry_ms")]
+    pub ack_retry_ms: u64,
+}
+
+/// Which agent-session crashes wake the Mayor (SPEC §6, §7; ADR-0029
+/// cl. 2). Tokens are stable identities — rename only by superseding ADR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CrashWakePolicy {
+    /// No crash ever wakes the Mayor: the tree + sled traces carry it and
+    /// the operator polls.
+    Never,
+    /// Every crash wakes the Mayor, including ones the restart policy
+    /// recovers transparently — chatty, and the bounded wake queue is the
+    /// only brake (ADR-0028 cl. 3).
+    Every,
+    /// Only a crash whose restart budget is exhausted wakes the Mayor: the
+    /// agent cannot be revived by the daemon alone. The default.
+    BudgetExhausted,
+}
+
+impl CrashWakePolicy {
+    /// Every policy in declaration order.
+    pub const ALL: &'static [CrashWakePolicy] = &[
+        CrashWakePolicy::Never,
+        CrashWakePolicy::Every,
+        CrashWakePolicy::BudgetExhausted,
+    ];
+
+    /// The stable wire token.
+    #[must_use]
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Never => "never",
+            Self::Every => "every",
+            Self::BudgetExhausted => "budget_exhausted",
+        }
+    }
+
+    /// Does a crash with this disposition wake the Mayor under this policy?
+    /// `permanent` is true when the restart budget is exhausted (the daemon
+    /// will not retry the life).
+    #[must_use]
+    pub fn wakes(self, permanent: bool) -> bool {
+        match self {
+            Self::Never => false,
+            Self::Every => true,
+            Self::BudgetExhausted => permanent,
+        }
+    }
+}
+
+impl Default for CrashWakePolicy {
+    fn default() -> Self {
+        DEFAULT_MAYOR_CRASH_WAKE
+    }
+}
+
+#[must_use]
+fn default_mayor_wake_queue_depth() -> usize {
+    DEFAULT_MAYOR_WAKE_QUEUE_DEPTH
+}
+
+#[must_use]
+fn default_mayor_turn_timeout_ms() -> u64 {
+    DEFAULT_MAYOR_TURN_TIMEOUT_MS
+}
+
+#[must_use]
+fn default_mayor_ack_retry_ms() -> u64 {
+    DEFAULT_MAYOR_ACK_RETRY_MS
+}
+
+impl Default for MayorConfig {
+    fn default() -> Self {
+        Self {
+            ack_timeout_ms: DEFAULT_MAYOR_ACK_TIMEOUT_MS,
+            wake_queue_depth: DEFAULT_MAYOR_WAKE_QUEUE_DEPTH,
+            turn_timeout_ms: DEFAULT_MAYOR_TURN_TIMEOUT_MS,
+            crash_wake: DEFAULT_MAYOR_CRASH_WAKE,
+            escalation_webhook_url: None,
+            ack_retry_ms: DEFAULT_MAYOR_ACK_RETRY_MS,
+        }
+    }
+}
+
+impl MayorConfig {
+    /// # Errors
+    ///
+    /// [`ConfigError::Invalid`] when `ack_timeout_ms` is out of range.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if !(1_000..=600_000).contains(&self.ack_timeout_ms) {
+            return Err(ConfigError::Invalid(format!(
+                "mayor.ack_timeout_ms must be in 1000..=600000, got {}",
+                self.ack_timeout_ms
+            )));
+        }
+        if !(1..=256).contains(&self.wake_queue_depth) {
+            return Err(ConfigError::Invalid(format!(
+                "mayor.wake_queue_depth must be in 1..=256, got {}",
+                self.wake_queue_depth
+            )));
+        }
+        if !(5_000..=1_800_000).contains(&self.turn_timeout_ms) {
+            return Err(ConfigError::Invalid(format!(
+                "mayor.turn_timeout_ms must be in 5000..=1800000, got {}",
+                self.turn_timeout_ms
+            )));
+        }
+        if !(1_000..=7_200_000).contains(&self.ack_retry_ms) {
+            return Err(ConfigError::Invalid(format!(
+                "mayor.ack_retry_ms must be in 1000..=7200000, got {}",
+                self.ack_retry_ms
+            )));
+        }
+        // An escalation webhook is only as trustworthy as the dispatch
+        // protocol: https, length-capped, re-checked against the allowlist
+        // at send time (ADR-0020 cl. 1).
+        if let Some(url) = &self.escalation_webhook_url {
+            crate::dispatch::validate_url(url).map_err(|e| {
+                ConfigError::Invalid(format!(
+                    "mayor.escalation_webhook_url is not a usable https dispatch URL: {e}"
+                ))
+            })?;
+        }
+        Ok(())
     }
 }
 
@@ -891,12 +1104,12 @@ mod tests {
     use super::*;
 
     /// Committed golden vector: the exact bytes `hamlet init` writes to
-    /// `config.json` (defaults, `config_version` 6).
+    /// `config.json` (defaults, `config_version` 10).
     #[test]
     fn default_config_render_golden() {
         let expected = "\
 {
-  \"config_version\": 6,
+  \"config_version\": 10,
   \"daemon_data_dir\": \".hamlet-data/sled\",
   \"podman_bin\": \"podman\",
   \"base_image\": \"docker.io/library/alpine:3.20\",
@@ -932,6 +1145,14 @@ mod tests {
     \"auth_env_key\": \"HAMLET_WEBHOOK_AUTH\",
     \"max_body_bytes\": 65536,
     \"routes\": {}
+  },
+  \"mayor\": {
+    \"ack_timeout_ms\": 30000,
+    \"wake_queue_depth\": 16,
+    \"turn_timeout_ms\": 120000,
+    \"crash_wake\": \"budget_exhausted\",
+    \"escalation_webhook_url\": null,
+    \"ack_retry_ms\": 600000
   }
 }
 ";
@@ -1076,6 +1297,297 @@ mod tests {
         assert_eq!(parsed.webhooks, WebhooksConfig::default());
         assert!(!parsed.webhooks.enabled); // default posture: closed
         assert!(parsed.webhooks.routes.is_empty()); // deny-all routing
+    }
+
+    /// v6 → v7 migration is additive: a v6 document (no `mayor` block) still
+    /// parses and the ack timeout takes its default (CONVENTIONS §3 r3 — no
+    /// silent rewrites).
+    #[test]
+    fn v6_config_parses_with_default_mayor_block() {
+        let v6 = "\
+{
+  \"config_version\": 6,
+  \"daemon_data_dir\": \".hamlet-data/sled\",
+  \"podman_bin\": \"podman\",
+  \"base_image\": \"docker.io/library/alpine:3.20\",
+  \"web_listen_addr\": \"127.0.0.1:8787\",
+  \"log_level\": \"info\",
+  \"dispatch\": {
+    \"enabled\": false,
+    \"timeout_secs\": 30
+  }
+}
+";
+        let parsed = Config::parse(v6).expect("v6 must still parse");
+        assert_eq!(parsed.config_version, 6);
+        assert_eq!(parsed.mayor, MayorConfig::default());
+        assert_eq!(parsed.mayor.ack_timeout_ms, 30_000);
+    }
+
+    /// v7 → v8 migration is additive: a v7 document (a `mayor` block with
+    /// only the ack timeout) still parses and the wake-queue / turn-timeout
+    /// defaults fill in (CONVENTIONS §3 r3 — no silent rewrites).
+    #[test]
+    fn v7_config_parses_with_default_wake_queue_and_turn_timeout() {
+        let v7 = "\
+{
+  \"config_version\": 8,
+  \"daemon_data_dir\": \".hamlet-data/sled\",
+  \"podman_bin\": \"podman\",
+  \"base_image\": \"docker.io/library/alpine:3.20\",
+  \"web_listen_addr\": \"127.0.0.1:8787\",
+  \"log_level\": \"info\",
+  \"mayor\": {
+    \"ack_timeout_ms\": 45000
+  },
+  \"dispatch\": {
+    \"enabled\": false,
+    \"timeout_secs\": 30
+  }
+}
+";
+        let parsed = Config::parse(v7).expect("v7 must still parse");
+        // Parse preserves the document's own declared version (no silent
+        // rewrite); only freshly written documents carry v9.
+        assert_eq!(parsed.config_version, 8);
+        assert_eq!(parsed.mayor.ack_timeout_ms, 45_000);
+        assert_eq!(parsed.mayor.wake_queue_depth, 16);
+        assert_eq!(parsed.mayor.turn_timeout_ms, 120_000);
+        // v8 → v9 (ADR-0029 cl. 2/4): crash-wake policy + no escalation
+        // webhook unless the operator configured one.
+        assert_eq!(parsed.mayor.crash_wake, CrashWakePolicy::BudgetExhausted);
+        assert_eq!(parsed.mayor.escalation_webhook_url, None);
+    }
+
+    /// v8 → v9 migration is additive: a v8 document parses and picks up the
+    /// crash-wake policy + escalation webhook defaults (ADR-0029 cl. 2/4).
+    #[test]
+    fn v8_config_parses_with_default_crash_wake_and_no_escalation_webhook() {
+        // The strict schema has no nullable policy: a v8 document simply
+        // omits both new keys, so build it by hand rather than by mutation.
+        let v8 = r#"{
+  "config_version": 8,
+  "daemon_data_dir": ".hamlet-data/sled",
+  "podman_bin": "podman",
+  "base_image": "docker.io/library/alpine:3.20",
+  "web_listen_addr": "127.0.0.1:8787",
+  "log_level": "info",
+  "mayor": {
+    "ack_timeout_ms": 30000,
+    "wake_queue_depth": 16,
+    "turn_timeout_ms": 120000
+  },
+  "dispatch": {
+    "enabled": false,
+    "timeout_secs": 30,
+    "url_allowlist": [],
+    "max_attempts": 5,
+    "backoff_initial_ms": 5000,
+    "backoff_max_ms": 900000
+  },
+  "resources": { "memory": "512m", "cpus": "1.0", "pids_limit": 256 },
+  "sessions": {
+    "ready_timeout_ms": 30000,
+    "stop_grace_ms": 10000,
+    "queue_depth": 64,
+    "latency_spike_ms": 30000,
+    "continue_on_restart": true,
+    "restart": { "max_restarts": 5, "backoff_initial_ms": 1000, "backoff_max_ms": 60000 }
+  },
+  "webhooks": { "enabled": false, "auth_env_key": "HAMLET_WEBHOOK_AUTH", "max_body_bytes": 65536, "routes": {} }
+}
+"#;
+        let parsed = Config::parse(v8).expect("v8 must still parse");
+        assert_eq!(parsed.config_version, 8);
+        assert_eq!(parsed.mayor.crash_wake, CrashWakePolicy::BudgetExhausted);
+        assert_eq!(parsed.mayor.escalation_webhook_url, None);
+    }
+
+    /// v9 → v10 is additive: a v9 document (ADR-0029's mayor block, no retry
+    /// knob) parses and gets the default re-notification interval, so an
+    /// existing village is never silently given a different ack-timeout
+    /// cadence than it was deployed with.
+    #[test]
+    fn v9_config_parses_with_default_ack_retry() {
+        let v9 = r#"{
+  "config_version": 9,
+  "daemon_data_dir": ".hamlet-data/sled",
+  "podman_bin": "podman",
+  "base_image": "docker.io/library/alpine:3.20",
+  "web_listen_addr": "127.0.0.1:8787",
+  "log_level": "info",
+  "mayor": {
+    "ack_timeout_ms": 30000,
+    "wake_queue_depth": 16,
+    "turn_timeout_ms": 120000,
+    "crash_wake": "every",
+    "escalation_webhook_url": null
+  },
+  "dispatch": {
+    "enabled": false,
+    "timeout_secs": 30,
+    "url_allowlist": [],
+    "max_attempts": 5,
+    "backoff_initial_ms": 5000,
+    "backoff_max_ms": 900000
+  },
+  "resources": { "memory": "512m", "cpus": "1.0", "pids_limit": 256 },
+  "sessions": {
+    "ready_timeout_ms": 30000,
+    "stop_grace_ms": 10000,
+    "queue_depth": 64,
+    "latency_spike_ms": 30000,
+    "continue_on_restart": true,
+    "restart": { "max_restarts": 5, "backoff_initial_ms": 1000, "backoff_max_ms": 60000 }
+  },
+  "webhooks": { "enabled": false, "auth_env_key": "HAMLET_WEBHOOK_AUTH", "max_body_bytes": 65536, "routes": {} }
+}
+"#;
+        let parsed = Config::parse(v9).expect("v9 must still parse");
+        assert_eq!(parsed.config_version, 9);
+        assert_eq!(parsed.mayor.crash_wake, CrashWakePolicy::Every);
+        assert_eq!(parsed.mayor.ack_retry_ms, 600_000);
+    }
+
+    /// The retry interval is the only thing standing between "once per
+    /// process" and "once per timeout" (ADR-0030 cl. 3): out of range is a
+    /// refusal, not a clamp.
+    #[test]
+    fn ack_retry_range_is_enforced() {
+        for bad in [0, 999, 7_200_001] {
+            let config = Config {
+                mayor: MayorConfig {
+                    ack_retry_ms: bad,
+                    ..MayorConfig::default()
+                },
+                ..Config::default()
+            };
+            assert!(
+                config.validate().is_err(),
+                "ack_retry_ms {bad} must be refused"
+            );
+        }
+        for good in [1_000, 30_000, 600_000, 7_200_000] {
+            let config = Config {
+                mayor: MayorConfig {
+                    ack_retry_ms: good,
+                    ..MayorConfig::default()
+                },
+                ..Config::default()
+            };
+            assert!(config.validate().is_ok(), "ack_retry_ms {good} is legal");
+        }
+    }
+
+    /// The crash-wake policy decides, per crash, whether the Mayor is woken
+    /// (ADR-0029 cl. 2) — a pure truth table, so it is pinned.
+    #[test]
+    fn crash_wake_policy_truth_table_is_pinned() {
+        assert_eq!(CrashWakePolicy::ALL.len(), 3);
+        assert_eq!(
+            CrashWakePolicy::ALL
+                .iter()
+                .copied()
+                .map(CrashWakePolicy::token)
+                .collect::<Vec<_>>(),
+            ["never", "every", "budget_exhausted"]
+        );
+        assert!(!CrashWakePolicy::Never.wakes(true));
+        assert!(!CrashWakePolicy::Never.wakes(false));
+        assert!(CrashWakePolicy::Every.wakes(false));
+        assert!(CrashWakePolicy::Every.wakes(true));
+        assert!(CrashWakePolicy::BudgetExhausted.wakes(true));
+        assert!(
+            !CrashWakePolicy::BudgetExhausted.wakes(false),
+            "an auto-restarted crash does not wake the Mayor by default"
+        );
+        for token in ["never", "every", "budget_exhausted"] {
+            let parsed: CrashWakePolicy = serde_json::from_str(&format!("{token:?}")).unwrap();
+            assert_eq!(parsed.token(), token);
+        }
+        assert!(serde_json::from_str::<CrashWakePolicy>("\"sometimes\"").is_err());
+    }
+
+    /// The escalation webhook must be a real dispatch URL (https, capped):
+    /// a Mayor decree can never point the daemon at an arbitrary sink
+    /// (ADR-0029 cl. 4, ADR-0020 cl. 1).
+    #[test]
+    fn escalation_webhook_url_is_validated() {
+        let mayor = MayorConfig {
+            escalation_webhook_url: Some("https://ops.example/hook".to_owned()),
+            ..MayorConfig::default()
+        };
+        assert!(mayor.validate().is_ok());
+        for bad in ["http://ops.example/hook", "not a url", "https://"] {
+            let mayor = MayorConfig {
+                escalation_webhook_url: Some(bad.to_owned()),
+                ..MayorConfig::default()
+            };
+            assert!(
+                mayor.validate().is_err(),
+                "{bad:?} must be refused as an escalation webhook"
+            );
+        }
+    }
+
+    /// Mayor ack-timeout validation (ADR-0026 cl. 5).
+    #[test]
+    fn mayor_config_validation() {
+        assert!(MayorConfig::default().validate().is_ok());
+        assert_eq!(MayorConfig::default().ack_timeout_ms, 30_000);
+        for bad in [0, 999, 600_001, u64::MAX] {
+            let config = MayorConfig {
+                ack_timeout_ms: bad,
+                ..MayorConfig::default()
+            };
+            assert!(config.validate().is_err(), "{bad} must fail");
+        }
+        for good in [1_000, 30_000, 600_000] {
+            let config = MayorConfig {
+                ack_timeout_ms: good,
+                ..MayorConfig::default()
+            };
+            assert!(config.validate().is_ok(), "{good} must pass");
+        }
+        for bad in [0, 257] {
+            let config = MayorConfig {
+                wake_queue_depth: bad,
+                ..MayorConfig::default()
+            };
+            assert!(
+                config.validate().is_err(),
+                "wake_queue_depth {bad} must fail"
+            );
+        }
+        for bad in [0, 4_999, 1_800_001, u64::MAX] {
+            let config = MayorConfig {
+                turn_timeout_ms: bad,
+                ..MayorConfig::default()
+            };
+            assert!(
+                config.validate().is_err(),
+                "turn_timeout_ms {bad} must fail"
+            );
+        }
+        for good in [5_000, 120_000, 1_800_000] {
+            let config = MayorConfig {
+                turn_timeout_ms: good,
+                ..MayorConfig::default()
+            };
+            assert!(
+                config.validate().is_ok(),
+                "turn_timeout_ms {good} must pass"
+            );
+        }
+        // the field is unknown-field strict, like every other block
+        let unknown = Config::default().render().replace(
+            "\"ack_timeout_ms\": 30000",
+            "\"ack_timeout_ms\": 30000, \"typo\": 1",
+        );
+        assert!(matches!(
+            Config::parse(&unknown),
+            Err(ConfigError::Syntax(_))
+        ));
     }
 
     /// Webhook routing-table validation (ADR-0022 cl. 1–3, 5).

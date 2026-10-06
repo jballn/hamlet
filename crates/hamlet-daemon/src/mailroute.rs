@@ -196,6 +196,20 @@ impl MailActor {
     }
 }
 
+/// The Mayor-mail hook seam (SPEC §7, §8.1).
+///
+/// Mail addressed to UID 1000 is not queued for a stdin the Mayor does not
+/// have: the Mayor is woken with the message as a packet artifact
+/// ([`crate::mayor::WakeEvent::from_mail_spool`], ADR-0028 cl. 1 — one
+/// process per wake). The router owns the *routing* decision (charter
+/// cross-checks, bounce rules) and hands the untouched spool path to this
+/// hook, which is where the wake happens — before the ack-rename, so the
+/// artifact is always loaded from a file that still exists.
+pub trait MayorMail: Send + Sync {
+    /// Hand one routed spool file (path + recipient slot) to the Mayor.
+    fn mayor_mail(&self, spool: &Path);
+}
+
 /// What one spool-file route ended in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouteOutcome {
@@ -216,6 +230,13 @@ pub enum RouteOutcome {
         reason: BounceReason,
         /// Bounce recipient, when one was routable.
         to: Option<u32>,
+    },
+    /// Delivered to the Mayor as a wake instead of the delivery queue: the
+    /// spool file was ack-renamed and the Mayor carries the message inside
+    /// its next single-turn context packet (SPEC §7).
+    WokenMayor {
+        /// The Mayor's slot (always [`MAYOR_UID`]).
+        uid: u32,
     },
     /// The spool file was already gone (acked by a previous run or a
     /// concurrent consumer) — idempotent no-op.
@@ -257,6 +278,10 @@ pub struct MailRouter {
     /// Direct recipient-rescan hints to the handler task ([`Self::send`]
     /// pushes here; the watcher reaction stream stays the external path).
     hints: Mutex<Option<mpsc::UnboundedSender<SafeName>>>,
+    /// Optional Mayor-mail hook (SPEC §7): installed by the Mayor plane.
+    /// `None` means no Mayor is wired, and UID-1000 mail keeps the normal
+    /// queue path so it is never lost.
+    mayor_mail: Mutex<Option<Arc<dyn MayorMail>>>,
 }
 
 impl MailRouter {
@@ -269,7 +294,16 @@ impl MailRouter {
             supervisor,
             tmp_serial: AtomicU64::new(0),
             hints: Mutex::new(None),
+            mayor_mail: Mutex::new(None),
         }
+    }
+
+    /// Install the Mayor-mail hook (SPEC §7). The Mayor plane calls this at
+    /// wiring time; without it, mail to UID 1000 falls back to the delivery
+    /// queue (never dropped, just not a wake).
+    pub fn with_mayor_mail(mut self, hook: Arc<dyn MayorMail>) -> Self {
+        self.mayor_mail = Mutex::new(Some(hook));
+        self
     }
 
     /// The village tree this router reads/writes.
@@ -403,6 +437,30 @@ impl MailRouter {
                     Some(&mail.header),
                     mail_sender_uid(mail),
                 );
+            }
+        }
+        // The Mayor has no stdin queue: its single-turn packet *is* the
+        // delivery channel (SPEC §7, ADR-0028 cl. 1). Hand the untouched
+        // spool path to the wake hook before the ack-rename.
+        let mayor_hook = self
+            .mayor_mail
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if uid == MAYOR_UID {
+            if let Some(hook) = mayor_hook {
+                let spool = self
+                    .tree
+                    .courier_mail_recipient(recipient)
+                    .join(file.as_str());
+                hook.mayor_mail(&spool);
+                self.ack(recipient, file)?;
+                self.trace(
+                    agent,
+                    "mail-woken-mayor",
+                    format!("{} → uid {MAYOR_UID}", file.as_str()),
+                );
+                return Ok(RouteOutcome::WokenMayor { uid });
             }
         }
         let correlation = match self
@@ -685,7 +743,9 @@ impl MailRouter {
             };
             report.scanned += 1;
             match self.route(recipient, &file)? {
-                RouteOutcome::Delivered { .. } => report.delivered += 1,
+                RouteOutcome::Delivered { .. } | RouteOutcome::WokenMayor { .. } => {
+                    report.delivered += 1;
+                }
                 RouteOutcome::Bounced { .. } => report.bounced += 1,
                 RouteOutcome::AlreadyConsumed => {}
             }

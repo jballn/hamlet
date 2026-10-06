@@ -18,7 +18,8 @@
 //! | [`watch`] | watcher event vocabulary (FsEvent → Reaction) | §8 |
 //! | [`dispatch`] | webhook outbox/inbox schemas, allowlist, retry policy | §8.4 |
 //! | [`freight`] | freight ACL listing parser + audit rules | §4, §8.3 |
-//! | [`decree`] | decree vocabulary + encoding | §7 |
+//! | [`decree`] | decree vocabulary, file encodings, acks, replay ids | §7 |
+//! | [`packet`] | context packet schema (MAYOR.md + state grid + event) | §7 |
 //! | [`commission`] | commission lifecycle state machine | §9 |
 //! | [`promote`] | DEED/vault promotion parsing | §9.4, §10 |
 //! | [`stasis`] | hibernation/census types | §10 |
@@ -42,6 +43,7 @@ pub mod dispatch;
 pub mod freight;
 pub mod mail;
 pub mod mount;
+pub mod packet;
 pub mod pins;
 pub mod promote;
 pub mod sanitize;

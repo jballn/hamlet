@@ -20,6 +20,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::decree::DecreeId;
 use crate::sanitize::SafeName;
 
 /// Name of the village tree inside a target working directory (SPEC §2).
@@ -55,6 +56,14 @@ const ARCHIVES: &str = "archives";
 const CENSUS: &str = "census";
 const MANOR: &str = "manor";
 const HOME: &str = "home";
+const DECREES: &str = "decrees";
+const REJECTED: &str = ".rejected";
+/// The watched human-escalation inbox written from a Mayor
+/// `escalate_to_human` decree (SPEC §7; ADR-0029 cl. 4). Outside the
+/// Mayor's rw home on purpose: the Mayor may write *only* `decrees/`, so
+/// the daemon — the singular governor — is what files the notice where a
+/// human (CLI, Sprint 08) will look for it.
+const ESCALATIONS: &str = "escalations";
 
 /// Static (identity-independent) directories created by [`HamletTree::ensure`].
 /// Per-UID and per-name directories are deliberately absent (lazy creation).
@@ -82,6 +91,8 @@ const ENSURE_DIRS: &[&[&str]] = &[
     &[KEEP, CENSUS],
     &[KEEP, CENSUS, MANOR],
     &[KEEP, CENSUS, MANOR, HOME],
+    &[KEEP, CENSUS, MANOR, HOME, DECREES],
+    &[KEEP, CENSUS, MANOR, ESCALATIONS],
 ];
 
 /// Typed handle on a village root (`.hamlet/`). Cheap to clone; holds only
@@ -212,6 +223,15 @@ impl HamletTree {
     #[must_use]
     pub fn guild_blueprints(&self) -> PathBuf {
         self.join(&[GUILD, BLUEPRINTS])
+    }
+
+    /// `guild/blueprints/<name>.toml` — one immutable environment
+    /// declaration (SPEC §5). A Mayor `provision_agent` decree names it
+    /// with a [`SafeName`](crate::sanitize::SafeName) `blueprint_ref`, so
+    /// the file name is built here and nowhere else (CONVENTIONS §4).
+    #[must_use]
+    pub fn guild_blueprint(&self, name: &crate::sanitize::SafeName) -> PathBuf {
+        self.join(&[GUILD, BLUEPRINTS, &format!("{name}.toml")])
     }
 
     /// `guild/register/<name>.md` — the immutable agent brief for `name`
@@ -537,6 +557,71 @@ impl HamletTree {
         self.manor().join("MAYOR.md")
     }
 
+    /// `keep/census/manor/home/decrees/` — the watched decree directory
+    /// (ADR-0026 cl. 2; `/home/1000/decrees/` in the Mayor container). The
+    /// Mayor may write nowhere else (SPEC §4 mounts only its home rw), so
+    /// this is the one place it emits decrees. Static: created by
+    /// [`HamletTree::ensure`] so a fresh-directory inotify race cannot
+    /// swallow the first decree (the Sprint 04 step-02 precedent).
+    #[must_use]
+    pub fn manor_decrees(&self) -> PathBuf {
+        self.join(&[KEEP, CENSUS, MANOR, HOME, DECREES])
+    }
+
+    /// `…/manor/home/decrees/<decree_id>.json` — one Mayor-written decree.
+    /// The name comes from the typed [`DecreeId`], so it is charset- and
+    /// traversal-safe by construction (CONVENTIONS §4).
+    #[must_use]
+    pub fn manor_decree_file(&self, id: &DecreeId) -> PathBuf {
+        self.manor_decrees().join(
+            id.decree_file_name()
+                .expect("DecreeId renders a SafeName")
+                .as_str(),
+        )
+    }
+
+    /// `…/manor/home/decrees/<decree_id>.ack` — the daemon-written
+    /// acknowledgment, next to its decree (ADR-0026 cl. 5).
+    #[must_use]
+    pub fn manor_decree_ack(&self, id: &DecreeId) -> PathBuf {
+        self.manor_decrees().join(
+            id.ack_file_name()
+                .expect("DecreeId renders a SafeName")
+                .as_str(),
+        )
+    }
+
+    /// `…/manor/home/decrees/.rejected/` — quarantine for decree files that
+    /// cannot be parsed into an identity (ADR-0026 cl. 5): daemon-renamed,
+    /// hidden (never watched, never rescanned as input), operator-visible.
+    #[must_use]
+    pub fn manor_decrees_rejected(&self) -> PathBuf {
+        self.manor_decrees().join(REJECTED)
+    }
+
+    /// `keep/census/manor/escalations/` — the watched escalation inbox
+    /// (SPEC §7; ADR-0029 cl. 4): one canonical JSON notice per Mayor
+    /// `escalate_to_human` decree. Daemon-written and operator-read; the
+    /// Mayor container cannot reach it (SPEC §4 mounts only its home rw),
+    /// which is exactly why the daemon writes it. Static for the same
+    /// fresh-directory inotify race reason as `decrees/`.
+    #[must_use]
+    pub fn manor_escalations(&self) -> PathBuf {
+        self.join(&[KEEP, CENSUS, MANOR, ESCALATIONS])
+    }
+
+    /// `…/manor/escalations/<decree_id>.json` — one escalation notice. The
+    /// name is the typed [`DecreeId`], so it is a valid [`SafeName`] and
+    /// sorts with the decree it answers (CONVENTIONS §4).
+    #[must_use]
+    pub fn manor_escalation_file(&self, id: &DecreeId) -> PathBuf {
+        self.manor_escalations().join(
+            id.decree_file_name()
+                .expect("DecreeId renders a SafeName")
+                .as_str(),
+        )
+    }
+
     /// The one place village paths are composed. Private by design
     /// (ADR-0003): nothing outside this module can concatenate tree paths.
     fn join(&self, parts: &[&str]) -> PathBuf {
@@ -748,6 +833,28 @@ mod tests {
             tree.manor_mayor_md(),
             PathBuf::from("/v/.hamlet/keep/census/manor/MAYOR.md")
         );
+        // decree directory layout (ADR-0026 cl. 2)
+        assert_eq!(
+            tree.manor_decrees(),
+            PathBuf::from("/v/.hamlet/keep/census/manor/home/decrees")
+        );
+        let id = crate::decree::DecreeId::new(7, "c0225c3b8fabf543").unwrap();
+        assert_eq!(
+            tree.manor_decree_file(&id),
+            PathBuf::from(
+                "/v/.hamlet/keep/census/manor/home/decrees/d-000000000007-c0225c3b8fabf543.json"
+            )
+        );
+        assert_eq!(
+            tree.manor_decree_ack(&id),
+            PathBuf::from(
+                "/v/.hamlet/keep/census/manor/home/decrees/d-000000000007-c0225c3b8fabf543.ack"
+            )
+        );
+        assert_eq!(
+            tree.manor_decrees_rejected(),
+            PathBuf::from("/v/.hamlet/keep/census/manor/home/decrees/.rejected")
+        );
         assert_eq!(tree.env_file(), PathBuf::from("/v/.hamlet/.env"));
         assert_eq!(tree.charter(), PathBuf::from("/v/.hamlet/charter.json"));
         assert_eq!(tree.config(), PathBuf::from("/v/.hamlet/config.json"));
@@ -768,7 +875,7 @@ mod tests {
         assert!(!statics.contains(&tree.parcel(1001)));
         assert!(!statics.contains(&tree.commission(1)));
         // count: root + ENSURE_DIRS
-        assert_eq!(statics.len(), 24);
+        assert_eq!(statics.len(), 26);
     }
 
     /// Every accessor stays inside the root — a SafeName can never escape.

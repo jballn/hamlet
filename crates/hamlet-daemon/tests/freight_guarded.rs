@@ -18,6 +18,14 @@
 //! agent-writable → repeated violations trip the Mayor-wake hook →
 //! daemon promotion-read succeeds on ALL sandboxes regardless of ACL,
 //! refusing symlink escapes, without touching any ACL.
+//!
+//! Unlike the SPEC §4 uid-policy suites, this one asserts nothing about the
+//! daemon user's own host uid: the real-ACL reads go through `podman unshare`
+//! against agent-owned sandboxes, which is exactly why it stays runnable on a
+//! host where the test user is also the podman owner. See
+//! `tests/support/mod.rs`.
+
+mod support;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -42,9 +50,14 @@ use hamlet_daemon::telemetry::{AgentKey, Telemetry};
 
 const FAKEAGENT: &str = env!("CARGO_BIN_EXE_fakeagent");
 const COMMISSION: u64 = 93;
-const AGENT_A: &str = "hamlet-freight-a"; // slot 1001
-const AGENT_B: &str = "hamlet-freight-b"; // slot 1002
-const AGENT_C: &str = "hamlet-freight-c"; // slot 1003
+/// Container names are **per-run** (QA04-26): podman names are global to the
+/// store, so two overlapping batteries provisioned each other's containers and
+/// then failed inside an isolation assertion with text that reads like a
+/// SPEC §4 defect. The constants are the stable *bases*; every container,
+/// brief and cleanup below uses the pid-scoped name.
+const AGENT_A_BASE: &str = "hamlet-freight-a"; // slot 1001
+const AGENT_B_BASE: &str = "hamlet-freight-b"; // slot 1002
+const AGENT_C_BASE: &str = "hamlet-freight-c"; // slot 1003
 const UID_A: u32 = 1001;
 const UID_B: u32 = 1002;
 
@@ -76,8 +89,8 @@ async fn sh(
 /// (ADR-0021 cl. 2 host prerequisite); otherwise skip with a recorded
 /// reason.
 fn podman_guard() -> Option<String> {
-    if std::env::var("HAMLET_PODMAN_TESTS").unwrap_or_default() != "1" {
-        return Some("HAMLET_PODMAN_TESTS != 1".to_owned());
+    if let Some(reason) = support::podman_env_guard() {
+        return Some(reason);
     }
     let found = StdCommand::new("podman")
         .arg("--version")
@@ -116,17 +129,31 @@ fn mode_of(path: &Path) -> u32 {
 #[tokio::test]
 #[ignore = "guarded: needs HAMLET_PODMAN_TESTS=1 + podman + host acl tools (CONVENTIONS §5)"]
 async fn podman_freight_acl_sandboxes_share_by_roster_and_audit() {
-    if let Some(reason) = podman_guard() {
-        eprintln!("SKIP podman_freight_acl_sandboxes_share_by_roster_and_audit: {reason}");
+    if let Some(reason) =
+        podman_guard().or_else(|| support::work_area_precondition(&std::env::temp_dir()))
+    {
+        support::skip(
+            "podman_freight_acl_sandboxes_share_by_roster_and_audit",
+            &reason,
+        );
         return;
     }
+
+    // QA04-26: podman container names are global to the store, so two
+    // overlapping batteries adopted (and `rm -f`ed) each other's parcels and
+    // then failed inside isolation assertions with text that reads like a
+    // SPEC §4 defect. Per-run names make concurrent runs coexist; the
+    // battery-wide lock is the CI layer's half (`guarded-entry.sh`).
+    let agent_a = support::scoped(AGENT_A_BASE);
+    let agent_b = support::scoped(AGENT_B_BASE);
+    let agent_c = support::scoped(AGENT_C_BASE);
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let tree = HamletTree::ensure(tmp.path().join(".hamlet")).expect("village tree");
     Charter::empty()
         .save_atomic(&tree.charter())
         .expect("seed charter");
-    for agent in [AGENT_A, AGENT_B, AGENT_C] {
+    for agent in [&agent_a, &agent_b, &agent_c] {
         let brief = tree.register_brief(&sanitize_name(agent).unwrap());
         fs::write(brief, format!("# {agent}\n\nGuarded-test brief.\n")).expect("brief");
     }
@@ -143,7 +170,7 @@ async fn podman_freight_acl_sandboxes_share_by_roster_and_audit() {
 
     // Whatever happens, the guard containers must not leak.
     let cleanup = || {
-        for name in [AGENT_A, AGENT_B, AGENT_C] {
+        for name in [&agent_a, &agent_b, &agent_c] {
             let _ = StdCommand::new("podman").args(["rm", "-f", name]).output();
         }
     };
@@ -166,7 +193,7 @@ async fn podman_freight_acl_sandboxes_share_by_roster_and_audit() {
 
     let result = async {
         // --- provision three real parcels (slots 1001..1003) --------------
-        for agent in [AGENT_A, AGENT_B, AGENT_C] {
+        for agent in [&agent_a, &agent_b, &agent_c] {
             provisioner
                 .provision_parcel(&sanitize_name(agent).unwrap(), COMMISSION, &blueprint)
                 .await
@@ -192,7 +219,7 @@ async fn podman_freight_acl_sandboxes_share_by_roster_and_audit() {
         // --- A secures a sandbox for B (real setfacl inside the container)
         let out = sh(
             &runtime,
-            AGENT_A,
+            &agent_a,
             "mkdir /var/freight/exchange && \
              setfacl -m u::rwx,u:1002:rwx,o::--- /var/freight/exchange && \
              echo payload-from-a > /var/freight/exchange/payload.md",
@@ -203,7 +230,7 @@ async fn podman_freight_acl_sandboxes_share_by_roster_and_audit() {
         // --- B reads and writes through the grant --------------------------
         let out = sh(
             &runtime,
-            AGENT_B,
+            &agent_b,
             "cat /var/freight/exchange/payload.md && \
              echo response-from-b > /var/freight/exchange/response.md",
         )
@@ -215,7 +242,7 @@ async fn podman_freight_acl_sandboxes_share_by_roster_and_audit() {
             out.stderr_lossy()
         );
         assert_eq!(out.stdout_lossy().trim(), "payload-from-a");
-        let out = sh(&runtime, AGENT_A, "cat /var/freight/exchange/response.md").await?;
+        let out = sh(&runtime, &agent_a, "cat /var/freight/exchange/response.md").await?;
         assert_eq!(out.code, 0, "A reads B's reply (owner)");
         assert_eq!(out.stdout_lossy().trim(), "response-from-b");
 
@@ -228,12 +255,12 @@ async fn podman_freight_acl_sandboxes_share_by_roster_and_audit() {
             "rm -rf /var/freight/exchange",                // sticky root: no cross-unlink
             "mv /var/freight/exchange /var/freight/stolen",
         ] {
-            let out = sh(&runtime, AGENT_C, denied).await?;
+            let out = sh(&runtime, &agent_c, denied).await?;
             assert_ne!(out.code, 0, "C must be denied `{denied}`");
         }
         // C still SEES the shared root (rwx root grant) — names are public,
         // contents are ACL-gated.
-        let out = sh(&runtime, AGENT_C, "ls /var/freight").await?;
+        let out = sh(&runtime, &agent_c, "ls /var/freight").await?;
         assert_eq!(out.code, 0, "freight root is listable for slots");
         assert!(out.stdout_lossy().contains("exchange"));
 
@@ -248,7 +275,7 @@ async fn podman_freight_acl_sandboxes_share_by_roster_and_audit() {
         // --- audit: a deliberately world-writable dir is flagged ------------
         let out = sh(
             &runtime,
-            AGENT_A,
+            &agent_a,
             "mkdir /var/freight/openbox && chmod 0777 /var/freight/openbox && \
              echo open-artifact > /var/freight/openbox/leak.md",
         )
@@ -279,7 +306,7 @@ async fn podman_freight_acl_sandboxes_share_by_roster_and_audit() {
         assert_eq!(flag.violations[0].kind, "world_writable");
         let out = sh(
             &runtime,
-            AGENT_C,
+            &agent_c,
             "cat /var/freight/.quarantine/openbox.json",
         )
         .await?;
@@ -290,7 +317,7 @@ async fn podman_freight_acl_sandboxes_share_by_roster_and_audit() {
             "rm /var/freight/.quarantine/openbox.json",
             "touch /var/freight/.quarantine/forged.json",
         ] {
-            let out = sh(&runtime, AGENT_C, denied).await?;
+            let out = sh(&runtime, &agent_c, denied).await?;
             assert_ne!(out.code, 0, "evidence is never agent-writable: `{denied}`");
         }
         // The sled trace landed under the owner's agent key.
@@ -313,7 +340,7 @@ async fn podman_freight_acl_sandboxes_share_by_roster_and_audit() {
         // --- audit: foreign-UID grant is flagged -----------------------------
         let out = sh(
             &runtime,
-            AGENT_A,
+            &agent_a,
             "mkdir /var/freight/rogue && setfacl -m u:4242:rwx /var/freight/rogue",
         )
         .await?;
@@ -328,7 +355,7 @@ async fn podman_freight_acl_sandboxes_share_by_roster_and_audit() {
         }
 
         // --- audit: symlink entry is flagged without a listing ---------------
-        let out = sh(&runtime, AGENT_A, "ln -s /etc /var/freight/evil").await?;
+        let out = sh(&runtime, &agent_a, "ln -s /etc /var/freight/evil").await?;
         assert_eq!(out.code, 0, "{}", out.stderr_lossy());
         let outcome = guard.audit(&name("evil")).await.map_err(err)?;
         match outcome {
@@ -347,7 +374,7 @@ async fn podman_freight_acl_sandboxes_share_by_roster_and_audit() {
         // threshold for UID_A.
         let out = sh(
             &runtime,
-            AGENT_A,
+            &agent_a,
             "mkdir /var/freight/leaky && chmod 0777 /var/freight/leaky",
         )
         .await?;
@@ -397,9 +424,9 @@ async fn podman_freight_acl_sandboxes_share_by_roster_and_audit() {
         );
         // Promotion-read relaxed NOTHING: B still reads, C still denied, and
         // the audit still calls the sandbox clean.
-        let out = sh(&runtime, AGENT_B, "cat /var/freight/exchange/payload.md").await?;
+        let out = sh(&runtime, &agent_b, "cat /var/freight/exchange/payload.md").await?;
         assert_eq!(out.code, 0, "agent-side ACL untouched by promotion-read");
-        let out = sh(&runtime, AGENT_C, "cat /var/freight/exchange/payload.md").await?;
+        let out = sh(&runtime, &agent_c, "cat /var/freight/exchange/payload.md").await?;
         assert_ne!(out.code, 0, "C still denied after promotion-read");
         assert_eq!(
             guard.audit(&name("exchange")).await.map_err(err)?,

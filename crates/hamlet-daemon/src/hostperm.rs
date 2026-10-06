@@ -156,6 +156,38 @@ impl<'a> HostPermissions<'a> {
         self.chown(uid, &[home]).await
     }
 
+    /// Manor `home/` (the Mayor's, SPEC §7): 0700 + owned by UID 1000 via
+    /// `podman unshare chown` — the same braces as a parcel home, on the one
+    /// slot that is not a parcel. The Mayor's decree directory lives inside
+    /// (`keep/census/manor/home/decrees/`), so its privacy is the whole
+    /// point: no other slot may read what the executive decided.
+    ///
+    /// The chown is **recursive** (ADR-0034, QA04-23). The provisioner
+    /// creates `home/decrees/` as the daemon user *before* calling this, and
+    /// a non-recursive chown leaves that child daemon-owned: on the host
+    /// nothing looks wrong, but inside the container the Mayor owns its home
+    /// and cannot write the one directory it governs, so every decree it
+    /// authors fails with `EACCES`. Ownership of a private home is a property
+    /// of the subtree, not of its root directory.
+    ///
+    /// # Errors
+    ///
+    /// [`HostPermError::UidPolicy`] unless `uid` is exactly [`MAYOR_UID`],
+    /// chmod failure, or unshare failure.
+    pub async fn apply_manor_home(&self, tree: &HamletTree, uid: u32) -> Result<(), HostPermError> {
+        if uid != MAYOR_UID {
+            return Err(HostPermError::UidPolicy { uid });
+        }
+        let home = tree.manor_home();
+        set_mode(&home, MODE_PARCEL_HOME)?;
+        // The decree directory is a normative dir ([`HamletTree::ensure`]
+        // creates it daemon-owned), so it inherits the home's privacy
+        // explicitly rather than by umask — and a missing one is a hard
+        // error, never a silently unbraced home.
+        set_mode(&tree.manor_decrees(), MODE_PARCEL_HOME)?;
+        self.chown_recursive(uid, &[home]).await
+    }
+
     /// Mail spool `courier/mail/<uid>/`: 0700 + owned by the slot uid, and
     /// the spool root 0755 so containers can traverse to it. The daemon
     /// writes spools from inside its userns (ADR-0011 cl. 4). Mayor spool
@@ -201,6 +233,17 @@ impl<'a> HostPermissions<'a> {
     async fn chown(&self, uid: u32, paths: &[std::path::PathBuf]) -> Result<(), HostPermError> {
         self.runtime
             .unshare_chown(uid, uid, paths)
+            .await
+            .map_err(HostPermError::Podman)
+    }
+
+    async fn chown_recursive(
+        &self,
+        uid: u32,
+        paths: &[std::path::PathBuf],
+    ) -> Result<(), HostPermError> {
+        self.runtime
+            .unshare_chown_recursive(uid, uid, paths)
             .await
             .map_err(HostPermError::Podman)
     }
@@ -300,6 +343,73 @@ mod tests {
             perms.apply_parcel_home(&tree, MAYOR_UID).await,
             Err(HostPermError::UidPolicy { uid: MAYOR_UID })
         ));
+    }
+
+    /// The manor home follows the same braces as a parcel home, but only for
+    /// UID 1000 — and the decree directory it contains stays unreadable to
+    /// every other slot.
+    ///
+    /// The chown is recursive (ADR-0034, QA04-23): the provisioner creates
+    /// `home/decrees/` as the daemon user *before* the brace is applied, so a
+    /// non-recursive chown would leave the Mayor unable to author a decree
+    /// inside its own container.
+    ///
+    /// The brace also names its traversal policy — `-RP`, never `-L`
+    /// (ADR-0034 cl. 5, QA04-29). The manor home is the Mayor's *writable*
+    /// home, so the walk is over a tree that can contain agent-planted
+    /// symlinks; dereferencing would hand the Mayor's subuid to an
+    /// attacker-chosen path outside the village.
+    #[tokio::test]
+    async fn manor_home_is_0700_and_chowned_recursively_for_the_mayor_slot() {
+        let (_tmp, tree) = village();
+        let fake = Arc::new(FakeRuntime::new());
+        let perms = HostPermissions::new(fake.as_ref());
+        for uid in [0u32, 999, 1001, 2000] {
+            assert!(
+                matches!(
+                    perms.apply_manor_home(&tree, uid).await,
+                    Err(HostPermError::UidPolicy { uid: u }) if u == uid
+                ),
+                "uid {uid} must not harden the manor home"
+            );
+        }
+        perms.apply_manor_home(&tree, MAYOR_UID).await.unwrap();
+        assert_eq!(mode_of(&tree.manor_home()), MODE_PARCEL_HOME);
+        assert_eq!(
+            mode_of(&tree.manor_decrees()),
+            MODE_PARCEL_HOME,
+            "the decree directory inherits the home's privacy explicitly, not by umask"
+        );
+        assert_eq!(
+            fake.argv_log().pop().unwrap(),
+            vec![
+                "podman",
+                "unshare",
+                "chown",
+                "-RP",
+                "1000:1000",
+                "--",
+                tree.manor_home().to_str().unwrap(),
+            ]
+        );
+    }
+
+    /// A recursive chown that fails is a provisioning failure, not a
+    /// warning: a manor that starts without its brace cannot author a
+    /// decree, and the container is already up by then.
+    #[tokio::test]
+    async fn manor_home_recursive_chown_failure_is_typed() {
+        let (_tmp, tree) = village();
+        let fake = Arc::new(FakeRuntime::new());
+        fake.fail_next_for(
+            "unshare",
+            crate::podman::PodmanErrorKind::NonZeroExit { code: Some(1) },
+        );
+        let err = HostPermissions::new(fake.as_ref())
+            .apply_manor_home(&tree, MAYOR_UID)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HostPermError::Podman(_)), "{err}");
     }
 
     #[tokio::test]

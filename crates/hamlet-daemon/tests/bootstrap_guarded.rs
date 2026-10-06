@@ -31,11 +31,27 @@
 //!    and no secret from `.env` anywhere in a home (SPEC §11.4 — secrets are
 //!    injected at session start, never baked in).
 //!
+//! # Host preconditions
+//!
+//! Two Sprint-04 findings shape this suite. **QA04-08**: the cold run writes
+//! ~200 MB of archives plus ~1 GB of extracted toolchains into the tempdir
+//! village, so the tree's filesystem must have room (a RAM-backed `TMPDIR`
+//! dies as `exit 137`). **QA04-09**: SPEC §4 mounts the parcel home and the
+//! pkgcache mirror as two separate bind mounts; when they land on different
+//! host devices the ADR-0013 cl. 3 hardlink publish is EXDEV — explicitly
+//! non-fatal, "it is a cache" — so the mirror legitimately stays empty and
+//! the zero-download claim does not apply. Both are checked up front: the
+//! first skips with the host remedy, the second *branches* on the measured
+//! device pair and asserts the claim each host shape actually supports.
+//! See `tests/support/mod.rs`.
+//!
 //! # Cost
 //!
 //! The cold run downloads ~200 MB of pinned artifacts into the tempdir
 //! village's mirror (rustc alone is ~100 MB compressed). That is the point of
 //! the mirror: it happens once per village, and every later parcel is offline.
+
+mod support;
 
 use std::fs;
 use std::process::Command as StdCommand;
@@ -49,11 +65,16 @@ use hamlet_core::sanitize::sanitize_name;
 use hamlet_core::tree::HamletTree;
 use hamlet_daemon::bootstrap::{BootstrapTarget, Bootstrapper, DEED_BASELINE_MARKER};
 use hamlet_daemon::census::Provisioner;
-use hamlet_daemon::podman::{ExecOutput, PodmanRuntime, Runtime as _};
+use hamlet_daemon::podman::{ExecOutput, PodmanRuntime, Runtime};
 
 const COMMISSION: u64 = 94;
-const AGENT_A: &str = "hamlet-boot-a"; // slot 1001
-const AGENT_B: &str = "hamlet-boot-b"; // slot 1002
+/// Container names are **per-run** (QA04-26): podman names are global to the
+/// store, so two overlapping batteries provisioned each other's containers and
+/// then failed inside an isolation assertion with text that reads like a
+/// SPEC §4 defect. The constants are the stable *bases*; every container,
+/// brief and cleanup below uses the pid-scoped name.
+const AGENT_A_BASE: &str = "hamlet-boot-a"; // slot 1001
+const AGENT_B_BASE: &str = "hamlet-boot-b"; // slot 1002
 const UID_A: u32 = 1001;
 const UID_B: u32 = 1002;
 /// Pinned versions from `defaults/toolchain-pins.toml` — the suite asserts
@@ -68,23 +89,13 @@ const FAKE_SECRET: &str = "test-key-do-not-use";
 /// CONVENTIONS §5 guard: run only with `HAMLET_PODMAN_TESTS=1` and podman on
 /// PATH; otherwise skip with a recorded reason.
 fn podman_guard() -> Option<String> {
-    if std::env::var("HAMLET_PODMAN_TESTS").unwrap_or_default() != "1" {
-        return Some("HAMLET_PODMAN_TESTS != 1".to_owned());
-    }
-    let found = StdCommand::new("podman")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if !found {
-        return Some("podman not on PATH".to_owned());
-    }
-    None
+    support::podman_env_guard()
 }
 
 /// One buffered `podman exec` against a guard container. Errors are Strings:
 /// this suite mixes provisioning, bootstrap and podman failures in one flow.
-async fn run(runtime: &PodmanRuntime, container: &str, cmd: &[&str]) -> Result<ExecOutput, String> {
+/// Generic over the runtime so the publish-arm seam (ADR-0035) can wrap it.
+async fn run<R: Runtime>(runtime: &R, container: &str, cmd: &[&str]) -> Result<ExecOutput, String> {
     let argv: Vec<String> = cmd.iter().map(|s| (*s).to_owned()).collect();
     runtime
         .exec(container, &argv, None)
@@ -94,8 +105,8 @@ async fn run(runtime: &PodmanRuntime, container: &str, cmd: &[&str]) -> Result<E
 
 /// `podman exec <c> sh -lc '<script>'` — the login-shell path an agent session
 /// takes, so the home profile is what makes the toolchain resolve.
-async fn login(
-    runtime: &PodmanRuntime,
+async fn login<R: Runtime>(
+    runtime: &R,
     container: &str,
     script: &str,
 ) -> Result<ExecOutput, String> {
@@ -484,17 +495,47 @@ async fn podman_derived_image_inherits_no_body_from_its_parent() {
 #[tokio::test]
 #[ignore = "guarded: needs HAMLET_PODMAN_TESTS=1 + podman on PATH (CONVENTIONS §5)"]
 async fn podman_bootstrap_installs_toolchains_and_reprovisions_with_zero_downloads() {
-    if let Some(reason) = podman_guard() {
-        eprintln!("SKIP podman_bootstrap_installs_toolchains_and_reprovisions_with_zero_downloads: {reason}");
+    // QA04-27: the guarded battery's single most memory-hungry step (~1 GB
+    // of pinned toolchains extracted inside a `--memory`-capped parcel).
+    // Running it beside another provisioning killed a parcel's PID 1 on hosts
+    // without headroom for both, and the failure reached the gate log wearing
+    // an isolation assertion. Serialised per binary with `escape_guarded`;
+    // across batteries it is the CI layer's flock.
+    let _serial = support::COLD_BOOTSTRAP_LOCK.lock().await;
+    if let Some(reason) = podman_guard()
+        .or_else(support::userns_precondition)
+        .or_else(|| support::work_area_precondition(&std::env::temp_dir()))
+    {
+        support::skip(
+            "podman_bootstrap_installs_toolchains_and_reprovisions_with_zero_downloads",
+            &reason,
+        );
         return;
     }
 
+    // QA04-26: podman container names are global to the store, so a second
+    // battery running this suite on the same host would otherwise adopt (and
+    // then `rm -f`) this run's parcels. Per-run names make concurrent runs
+    // coexist; the battery-wide lock is the CI layer's half (guarded-entry).
+    let agent_a = support::scoped(AGENT_A_BASE);
+    let agent_b = support::scoped(AGENT_B_BASE);
+
     let tmp = tempfile::tempdir().expect("tempdir");
     let tree = HamletTree::ensure(tmp.path().join(".hamlet")).expect("village tree");
+
+    // QA04-09 is decided from the observed publish outcome (see the
+    // `mirror_warms` binding next to the publish assertion). Hoisted into an
+    // atomic because the mirror-entry assertions live in the host-side
+    // records, after the async block completes. A host-side
+    // `same_device` probe cannot predict it: btrfs gives each subvolume its own
+    // st_dev and runc's bind-mount result is not derivable from the host at
+    // all (a host that reported "same device" still produced EXDEV inside
+    // every container).
+    let mirror_shape = Arc::new(std::sync::Mutex::new(None::<bool>));
     Charter::empty()
         .save_atomic(&tree.charter())
         .expect("seed charter");
-    for agent in [AGENT_A, AGENT_B] {
+    for agent in [&agent_a, &agent_b] {
         fs::write(
             tree.register_brief(&sanitize_name(agent).unwrap()),
             format!("# {agent}\n\nGuarded-bootstrap brief.\n"),
@@ -521,7 +562,7 @@ async fn podman_bootstrap_installs_toolchains_and_reprovisions_with_zero_downloa
 
     // Whatever happens, the guard containers must not leak.
     let cleanup = || {
-        for name in [AGENT_A, AGENT_B] {
+        for name in [&agent_a, &agent_b] {
             let _ = StdCommand::new("podman").args(["rm", "-f", name]).output();
         }
         // Give the tempdir back to the daemon user: parcel homes are 0700
@@ -541,7 +582,7 @@ async fn podman_bootstrap_installs_toolchains_and_reprovisions_with_zero_downloa
     let result = async {
         // --- 1. provision parcel A: cold mirror, full pinned download ------
         let a = provisioner
-            .provision_parcel_with_report(&sanitize_name(AGENT_A).unwrap(), COMMISSION, &blueprint)
+            .provision_parcel_with_report(&sanitize_name(&agent_a).unwrap(), COMMISSION, &blueprint)
             .await
             .map_err(|e| e.to_string())?;
         assert!(
@@ -562,11 +603,23 @@ async fn podman_bootstrap_installs_toolchains_and_reprovisions_with_zero_downloa
             a.bootstrap.probes
         );
         assert_eq!(a.bootstrap.manifest_sha256.len(), 64);
-        assert!(
-            a.bootstrap.publish_failures.is_empty(),
-            "the first parcel populates the mirror: {:?}",
-            a.bootstrap.publish_failures
-        );
+        // QA04-09 ground truth: did the mirror actually warm? Taken from the
+        // OBSERVED publish outcome, never predicted — every failure is
+        // classified so a digest or permission error cannot hide behind the
+        // EXDEV excuse, and the strong "parcel B installs offline" claim is
+        // asserted only in the shape that supports it.
+        let mirror_warms = a.bootstrap.publish_failures.is_empty();
+        *mirror_shape.lock().unwrap() = Some(mirror_warms);
+        if !mirror_warms {
+            // ADR-0013 cl. 3: EXDEV publish is explicitly non-fatal, so the
+            // mirror legitimately stays empty — but only EXDEV may say so.
+            for failure in &a.bootstrap.publish_failures {
+                assert!(
+                    support::is_exdev(failure),
+                    "publish failure must be EXDEV and nothing else: {failure}"
+                );
+            }
+        }
 
         // --- 2. the toolchains RUN inside, through the login profile -------
         for (script, expect) in [
@@ -576,7 +629,7 @@ async fn podman_bootstrap_installs_toolchains_and_reprovisions_with_zero_downloa
             ("cargo --version", RUST_VERSION),
             ("rustc --version", RUST_VERSION),
         ] {
-            let out = login(&runtime, AGENT_A, script).await?;
+            let out = login(&*runtime, &agent_a, script).await?;
             assert_eq!(
                 out.code,
                 0,
@@ -592,7 +645,7 @@ async fn podman_bootstrap_installs_toolchains_and_reprovisions_with_zero_downloa
         }
         // nvm resolves the pinned node from its own versions/ layout — i.e.
         // the runtime was materialized where the multiplexer expects it.
-        let via_nvm = login(&runtime, AGENT_A, "nvm which 22").await?;
+        let via_nvm = login(&*runtime, &agent_a, "nvm which 22").await?;
         assert_eq!(
             via_nvm.code,
             0,
@@ -616,14 +669,14 @@ async fn podman_bootstrap_installs_toolchains_and_reprovisions_with_zero_downloa
             ("echo $HAMLET_BLUEPRINT", "village-alpine".to_owned()),
             ("echo $HAMLET_BLUEPRINT_VERSION", "1".to_owned()),
         ] {
-            let out = login(&runtime, AGENT_A, script).await?;
+            let out = login(&*runtime, &agent_a, script).await?;
             assert_eq!(out.stdout_lossy().trim(), expect, "{script}");
         }
 
         // --- 4. SPEC §11.4: no secret was baked into the home -------------
         let leaked = run(
-            &runtime,
-            AGENT_A,
+            &*runtime,
+            &agent_a,
             &["grep", "-rIl", FAKE_SECRET, "/home/1001"],
         )
         .await?;
@@ -635,8 +688,8 @@ async fn podman_bootstrap_installs_toolchains_and_reprovisions_with_zero_downloa
             leaked.stdout_lossy()
         );
         let secret_exports = login(
-            &runtime,
-            AGENT_A,
+            &*runtime,
+            &agent_a,
             "grep -Ei '^export [A-Za-z_]*(KEY|SECRET|TOKEN|PASSW|CREDENTIAL)' /home/1001/.profile",
         )
         .await?;
@@ -655,7 +708,7 @@ async fn podman_bootstrap_installs_toolchains_and_reprovisions_with_zero_downloa
             format!("/home/{UID_A}/.profile"),
             format!("/home/{UID_A}/.hamlet/toolchain.json"),
         ] {
-            let owner = run(&runtime, AGENT_A, &["stat", "-c", "%u", &path]).await?;
+            let owner = run(&*runtime, &agent_a, &["stat", "-c", "%u", &path]).await?;
             assert_eq!(
                 owner.stdout_lossy().trim(),
                 UID_A.to_string(),
@@ -663,11 +716,11 @@ async fn podman_bootstrap_installs_toolchains_and_reprovisions_with_zero_downloa
             );
         }
         // …and the private staging dir is gone (~200 MB reclaimed per parcel).
-        let staged = run(&runtime, AGENT_A, &["ls", "/home/1001/.hamlet/stage"]).await?;
+        let staged = run(&*runtime, &agent_a, &["ls", "/home/1001/.hamlet/stage"]).await?;
         assert_ne!(staged.code, 0, "staging is dropped after extraction");
 
         // --- 6. SPEC §4: no systemd-class init, just the daemon's keep-alive
-        let pid1 = run(&runtime, AGENT_A, &["cat", "/proc/1/cmdline"]).await?;
+        let pid1 = run(&*runtime, &agent_a, &["cat", "/proc/1/cmdline"]).await?;
         assert_eq!(pid1.code, 0);
         assert!(
             pid1.stdout_lossy().contains("sleep"),
@@ -677,7 +730,7 @@ async fn podman_bootstrap_installs_toolchains_and_reprovisions_with_zero_downloa
 
         // --- 7. isolation invariants still hold after bootstrap -----------
         for denied in ["touch /var/git/escape", "touch /var/context/escape"] {
-            let out = login(&runtime, AGENT_A, denied).await?;
+            let out = login(&*runtime, &agent_a, denied).await?;
             assert_ne!(out.code, 0, "{denied} must fail (ro mount)");
         }
         // QA fix (F-02-02): probe SOCKET files, not `/var/run` (an Alpine
@@ -689,26 +742,34 @@ async fn podman_bootstrap_installs_toolchains_and_reprovisions_with_zero_downloa
             "/var/run/docker.sock",
             "/run/dbus/system_bus_socket",
         ] {
-            let out = run(&runtime, AGENT_A, &["ls", path]).await?;
+            let out = run(&*runtime, &agent_a, &["ls", path]).await?;
             assert_ne!(out.code, 0, "{path} must not be reachable");
         }
-        let freight = run(&runtime, AGENT_A, &["ls", "/var/freight"]).await?;
+        let freight = run(&*runtime, &agent_a, &["ls", "/var/freight"]).await?;
         assert_ne!(
             freight.code, 0,
             "freight stays ACL-gated (01770, other::---) without the freight plane"
         );
 
         // --- 8. the mirror holds every pinned artifact --------------------
-        let mirrored = login(&runtime, AGENT_A, "ls -1 /var/pkgcache/dist | wc -l").await?;
+        let mirrored = login(&*runtime, &agent_a, "ls -1 /var/pkgcache/dist | wc -l").await?;
         assert_eq!(
             mirrored.stdout_lossy().trim(),
-            ARTIFACT_COUNT.to_string(),
-            "every pinned artifact was published for the next parcel"
+            if mirror_warms {
+                ARTIFACT_COUNT.to_string()
+            } else {
+                // Cross-device publish: the cache stays empty by design. The
+                // guarantee that survives is not "the mirror is warm" but
+                // "the cold parcel installed and was digest-verified".
+                "0".to_owned()
+            },
+            "the mirror holds every pinned artifact exactly when home and \
+             pkgcache share a device (ADR-0013 cl. 3; SPEC §4 mounts)"
         );
 
         // --- 9. RE-RUN on the same home: verified no-op, zero downloads ----
         let bootstrapper = Bootstrapper::new(&tree, runtime.as_ref()).map_err(|e| e.to_string())?;
-        let target_a = BootstrapTarget::new(sanitize_name(AGENT_A).unwrap(), UID_A).unwrap();
+        let target_a = BootstrapTarget::new(sanitize_name(&agent_a).unwrap(), UID_A).unwrap();
         let again = bootstrapper
             .bootstrap_home(&target_a, &blueprint)
             .await
@@ -727,16 +788,29 @@ async fn podman_bootstrap_installs_toolchains_and_reprovisions_with_zero_downloa
 
         // --- 10. SECOND parcel off the warm mirror: zero downloads ---------
         let b = provisioner
-            .provision_parcel_with_report(&sanitize_name(AGENT_B).unwrap(), COMMISSION, &blueprint)
+            .provision_parcel_with_report(&sanitize_name(&agent_b).unwrap(), COMMISSION, &blueprint)
             .await
             .map_err(|e| e.to_string())?;
         assert!(!b.bootstrap.no_op, "a fresh home still installs");
-        assert_eq!(
-            b.bootstrap.downloads, 0,
-            "pkgcache hit instrumentation: the second parcel downloads NOTHING"
-        );
-        assert_eq!(b.bootstrap.cache_hits, ARTIFACT_COUNT);
-        assert_eq!(b.bootstrap.cache_misses, 0);
+        if mirror_warms {
+            assert_eq!(
+                b.bootstrap.downloads, 0,
+                "pkgcache hit instrumentation: the second parcel downloads NOTHING"
+            );
+            assert_eq!(b.bootstrap.cache_hits, ARTIFACT_COUNT);
+            assert_eq!(b.bootstrap.cache_misses, 0);
+        } else {
+            // QA04-09 on a cross-device host: with an empty mirror the second
+            // parcel MUST re-download — that is the cache behaving correctly,
+            // not a degradation. The zero-download claim is a property of the
+            // warm-mirror shape only, so it is stated only there.
+            assert_eq!(
+                b.bootstrap.downloads, ARTIFACT_COUNT,
+                "an empty (EXDEV-unwritable) mirror makes every artifact a miss"
+            );
+            assert_eq!(b.bootstrap.cache_hits, 0);
+            assert_eq!(b.bootstrap.cache_misses, ARTIFACT_COUNT);
+        }
         assert_eq!(
             b.bootstrap.verified_artifacts.len(),
             ARTIFACT_COUNT,
@@ -749,38 +823,47 @@ async fn podman_bootstrap_installs_toolchains_and_reprovisions_with_zero_downloa
         );
 
         // B's toolchain works and is B's own.
-        let out = login(&runtime, AGENT_B, "cargo --version").await?;
+        let out = login(&*runtime, &agent_b, "cargo --version").await?;
         assert!(
             out.stdout_lossy().contains(RUST_VERSION),
             "parcel B installed Rust from the mirror: {}",
             out.stdout_lossy()
         );
-        let out = login(&runtime, AGENT_B, "node --version").await?;
+        let out = login(&*runtime, &agent_b, "node --version").await?;
         assert!(out.stdout_lossy().contains(NODE_VERSION));
         let owner = run(
-            &runtime,
-            AGENT_B,
+            &*runtime,
+            &agent_b,
             &["stat", "-c", "%u", "/home/1002/.cargo/bin/cargo"],
         )
         .await?;
         assert_eq!(owner.stdout_lossy().trim(), UID_B.to_string());
         // …and neither parcel can reach the other's toolchain.
-        let cross = run(&runtime, AGENT_B, &["ls", "/home/1001"]).await?;
+        let cross = run(&*runtime, &agent_b, &["ls", "/home/1001"]).await?;
         assert_ne!(cross.code, 0, "cross-UID home read blocked");
-        let cross = run(&runtime, AGENT_A, &["ls", "/home/1002"]).await?;
+        let cross = run(&*runtime, &agent_a, &["ls", "/home/1002"]).await?;
         assert_ne!(cross.code, 0, "cross-UID home read blocked both ways");
         // The mirror is shared by design — but only as a cache: B reads A's
         // published artifact, and a tampered copy would fail its digest pin.
-        let shared = run(&runtime, AGENT_B, &["ls", "/var/pkgcache/dist"]).await?;
+        let shared = run(&*runtime, &agent_b, &["ls", "/var/pkgcache/dist"]).await?;
         assert_eq!(shared.code, 0, "the mirror is readable by every slot");
+        eprintln!(
+            "guarded bootstrap host shape: home/pkgcache {} device -> mirror {}",
+            if mirror_warms { "SHARE" } else { "SPLIT" },
+            if mirror_warms {
+                "warms"
+            } else {
+                "stays empty (EXDEV publish)"
+            }
+        );
 
         // --- 11. graceful teardown through the runtime seam ---------------
         runtime
-            .stop(AGENT_A, Duration::from_secs(10))
+            .stop(&agent_a, Duration::from_secs(10))
             .await
             .map_err(|e| e.to_string())?;
         runtime
-            .stop(AGENT_B, Duration::from_secs(10))
+            .stop(&agent_b, Duration::from_secs(10))
             .await
             .map_err(|e| e.to_string())?;
         Ok::<(), String>(())
@@ -823,10 +906,16 @@ async fn podman_bootstrap_installs_toolchains_and_reprovisions_with_zero_downloa
         .expect("mirror dir exists")
         .map(|e| e.expect("entry"))
         .collect();
+    let mirror_warms = mirror_shape
+        .lock()
+        .unwrap()
+        .expect("the run reached the publish step");
     assert_eq!(
         entries.len(),
-        ARTIFACT_COUNT,
-        "one file per pinned artifact"
+        if mirror_warms { ARTIFACT_COUNT } else { 0 },
+        "one file per pinned artifact when the mirror can be hardlink-published \\
+         (ADR-0013 cl. 3), and none when the publish is EXDEV — the cache is a \\
+         cache, so an unwritable mirror is empty, not partial"
     );
     for entry in &entries {
         let meta = fs::symlink_metadata(entry.path()).unwrap();
@@ -844,4 +933,161 @@ async fn podman_bootstrap_installs_toolchains_and_reprovisions_with_zero_downloa
 
     cleanup();
     result.expect("guarded bootstrap: SPEC §4/§5 toolchain contract");
+}
+
+// ---------------------------------------------------------------------------
+// QA04-32: force the warm mirror arm (ADR-0035)
+// ---------------------------------------------------------------------------
+// This test forces the publish-arm seam to `cp --` so the mirror warms even
+// on cross-device hosts. It exercises the *downstream accounting* that the
+// product's `ln` would produce on a shared-device host: mirror file count,
+// cache_hits/downloads, digest re-verification, and parcel B offline
+// toolchain operation. It does NOT exercise ADR-0013 cl. 3's symlink-refusal
+// or inode-identity (those are product `ln` properties, separately pinned).
+// The seam is honest: it simulates a shared-device topology, it does not
+// fake success.
+
+#[tokio::test]
+#[ignore = "guarded: needs HAMLET_PODMAN_TESTS=1 + podman on PATH (CONVENTIONS §5)"]
+async fn podman_bootstrap_forced_warm_mirror_makes_second_parcel_offline() {
+    // QA04-27: serialised with the other cold bootstrap.
+    let _serial = support::COLD_BOOTSTRAP_LOCK.lock().await;
+    if let Some(reason) = podman_guard()
+        .or_else(support::userns_precondition)
+        .or_else(|| support::work_area_precondition(&std::env::temp_dir()))
+    {
+        support::skip(
+            "podman_bootstrap_forced_warm_mirror_makes_second_parcel_offline",
+            &reason,
+        );
+        return;
+    }
+
+    let agent = support::scoped(AGENT_A_BASE); // slot 1001
+    let agent_b = support::scoped(AGENT_B_BASE); // slot 1002
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let tree = HamletTree::ensure(tmp.path().join(".hamlet")).expect("village tree");
+
+    // SPEC §5: provisioning seeds PROPRIETOR.md from the guild register, so
+    // both parcels need a brief before their provision call (sibling-suite
+    // pattern) — and the charter must exist for the provisioner to save into.
+    Charter::empty()
+        .save_atomic(&tree.charter())
+        .expect("seed charter");
+    for name in [&agent, &agent_b] {
+        fs::write(
+            tree.register_brief(&sanitize_name(name).unwrap()),
+            format!("# {name}\n\nGuarded-bootstrap brief.\n"),
+        )
+        .expect("brief");
+    }
+
+    let config = Config::default();
+    let inner_runtime =
+        Arc::new(PodmanRuntime::from_config(&config).with_pull_retry(3, Duration::from_secs(3)));
+    // Force the warm arm: rewrite publish argv from `ln` to `cp --`.
+    let runtime = support::PublishSeamRuntime::new(inner_runtime, support::PublishArm::ForceWarm);
+
+    let provisioner = Provisioner::new(
+        tree.clone(),
+        config,
+        Arc::clone(&runtime) as Arc<dyn hamlet_daemon::podman::Runtime>,
+    );
+    let blueprint = Blueprint::default_village_alpine().expect("default blueprint");
+
+    let cleanup = || {
+        let _ = StdCommand::new("podman")
+            .args(["rm", "-f", &agent])
+            .output();
+        let home = tree.parcel_home(UID_A);
+        if home.exists() {
+            let _ = StdCommand::new("podman")
+                .args(["unshare", "chown", "0:0", "--"])
+                .arg(&home)
+                .output();
+        }
+    };
+    cleanup();
+
+    let result = async {
+        // Provision parcel A with the forced warm mirror.
+        let a = provisioner
+            .provision_parcel_with_report(&sanitize_name(&agent).unwrap(), COMMISSION, &blueprint)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // The seam must have rewired at least one publish.
+        assert!(
+            runtime.rewrites() > 0,
+            "the publish-arm seam must have rewritten at least one argv"
+        );
+        // With ForceWarm, publish_failures must be empty (cp crosses devices).
+        assert!(
+            a.bootstrap.publish_failures.is_empty(),
+            "ForceWarm arm: publish must succeed (cp crosses devices; no EXDEV)"
+        );
+        // Mirror must hold all artifacts.
+        let dist = tree.market_pkgcache_dist();
+        let entries: Vec<_> = fs::read_dir(&dist)
+            .expect("mirror dir exists")
+            .map(|e| e.expect("entry"))
+            .collect();
+        assert_eq!(
+            entries.len(),
+            ARTIFACT_COUNT,
+            "mirror holds all pinned artifacts when warm"
+        );
+
+        // Provision parcel B: must download ZERO, all cache hits.
+        let b = provisioner
+            .provision_parcel_with_report(&sanitize_name(&agent_b).unwrap(), COMMISSION, &blueprint)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        assert_eq!(
+            b.bootstrap.downloads, 0,
+            "parcel B downloads NOTHING when mirror is warm"
+        );
+        assert_eq!(b.bootstrap.cache_hits, ARTIFACT_COUNT);
+        assert_eq!(b.bootstrap.cache_misses, 0);
+        assert_eq!(b.bootstrap.verified_artifacts.len(), ARTIFACT_COUNT);
+
+        // B's toolchain works and is B's own.
+        let out = login(&*runtime, &agent_b, "cargo --version").await?;
+        assert!(
+            out.stdout_lossy().contains(RUST_VERSION),
+            "parcel B installed Rust from the mirror: {}",
+            out.stdout_lossy()
+        );
+        let out = login(&*runtime, &agent_b, "node --version").await?;
+        assert!(out.stdout_lossy().contains(NODE_VERSION));
+        let owner = run(
+            &*runtime,
+            &agent_b,
+            &["stat", "-c", "%u", "/home/1002/.cargo/bin/cargo"],
+        )
+        .await?;
+        assert_eq!(owner.stdout_lossy().trim(), UID_B.to_string());
+
+        // Isolation still holds.
+        let cross = run(&*runtime, &agent_b, &["ls", "/home/1001"]).await?;
+        assert_ne!(cross.code, 0, "cross-UID home read blocked");
+        let cross = run(&*runtime, &agent, &["ls", "/home/1002"]).await?;
+        assert_ne!(cross.code, 0, "cross-UID home read blocked both ways");
+
+        // Teardown.
+        runtime
+            .stop(&agent, Duration::from_secs(10))
+            .await
+            .map_err(|e| e.to_string())?;
+        runtime
+            .stop(&agent_b, Duration::from_secs(10))
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok::<(), String>(())
+    }
+    .await;
+
+    cleanup();
+    result.expect("forced warm mirror: parcel B is offline-fast (ADR-0035)");
 }

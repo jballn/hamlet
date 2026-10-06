@@ -841,16 +841,57 @@ pub fn unshare_chown_argv(
     gid: u32,
     paths: &[PathBuf],
 ) -> Result<Vec<String>, PodmanError> {
+    unshare_chown_argv_inner(podman_bin, uid, gid, paths, false)
+}
+
+/// `podman unshare chown -RP <uid>:<gid> -- <paths…>` argv (ADR-0011 cl. 2,
+/// ADR-0034 cl. 1 + cl. 5): the same brace, extended to everything already
+/// inside the paths.
+///
+/// **`-R` always carries an explicit `-P`** (ADR-0034 cl. 5, QA04-29). The
+/// manor home is agent-writable by design, so the brace walks a tree the
+/// adversary can plant symlinks in. GNU `chown`'s traversal default is `-P`
+/// (never dereference) — safe, but *undocumented in this codebase and unpinned
+/// by any test*: a `-L`/`-H` "improvement", a BusyBox `chown`, or a different
+/// host's coreutils would silently turn this into a **privileged chown of an
+/// attacker-chosen tree** (measured live: `-RL` on the same fixture moves the
+/// symlink *target* to the Mayor's subuid, rc=0, no warning). Naming the
+/// policy in the argv makes the safe reading the *declared* one and the unsafe
+/// one a loud `invalid option` instead of a silent escalation.
+///
+/// # Errors
+///
+/// [`PodmanError`] on an empty path list or any invalid path.
+pub fn unshare_chown_recursive_argv(
+    podman_bin: &Path,
+    uid: u32,
+    gid: u32,
+    paths: &[PathBuf],
+) -> Result<Vec<String>, PodmanError> {
+    unshare_chown_argv_inner(podman_bin, uid, gid, paths, true)
+}
+
+fn unshare_chown_argv_inner(
+    podman_bin: &Path,
+    uid: u32,
+    gid: u32,
+    paths: &[PathBuf],
+    recursive: bool,
+) -> Result<Vec<String>, PodmanError> {
     if paths.is_empty() {
         return Err(PodmanError::invalid("unshare chown: no paths"));
     }
     let mut argv = vec![
         podman_bin.to_string_lossy().into_owned(),
         "unshare".to_owned(),
-        "chown".to_owned(),
-        format!("{uid}:{gid}"),
-        "--".to_owned(),
     ];
+    argv.push("chown".to_owned());
+    if recursive {
+        // Fixed operand, in this order: recurse, never dereference.
+        argv.push("-RP".to_owned());
+    }
+    argv.push(format!("{uid}:{gid}"));
+    argv.push("--".to_owned());
     for path in paths {
         validate_host_path(path)?;
         argv.push(path.to_string_lossy().into_owned());
@@ -893,9 +934,18 @@ pub fn unshare_exec_argv(podman_bin: &Path, cmd: &[String]) -> Result<Vec<String
     Ok(argv)
 }
 
-/// `getfacl -p -n -c -- <path>` payload for [`unshare_exec_argv`]
+/// `getfacl -p -n -- <path>` payload for [`unshare_exec_argv`]
 /// (ADR-0021 cl. 2): numeric ids (the in-userns slot UIDs), full path
-/// comment, no header noise. Pure.
+/// comment. Pure.
+///
+/// **No `-c`/`--omit-header`, deliberately** (QA04-12): that flag suppresses
+/// exactly the `# owner:` / `# group:` comment lines the audit's first two
+/// rules are derived from — "owner is a charter slot" and the group check —
+/// so with `-c` every real listing failed to parse as
+/// [`MissingOwner`](crate::freight::FreightError::MissingOwner). The parser
+/// ignores `# file:`/`# flags:`/blank lines, so the un-omitted header is
+/// harmless noise and the *owner* is mandatory state. Verified against GNU
+/// acl 2.4.0, the host tool ADR-0021 cl. 2 names as a prerequisite.
 ///
 /// # Errors
 ///
@@ -906,7 +956,27 @@ pub fn getfacl_cmd(path: &Path) -> Result<Vec<String>, PodmanError> {
         "getfacl".to_owned(),
         "-p".to_owned(),
         "-n".to_owned(),
+        "--".to_owned(),
+        path.to_string_lossy().into_owned(),
+    ])
+}
+
+/// `stat -c %F -- <path>` payload for [`unshare_exec_argv`] (ADR-0032
+/// cl. 1 / QA04-13): the userns-side *kind* probe the freight promotion-read
+/// uses when the daemon's host user may not `lstat` a 0700 subuid-owned
+/// sandbox. `-c %F` prints the human-readable file type; no `-L`, so the
+/// probe keeps `lstat` semantics and a symlinked target is still reported as
+/// `symbolic link`. Pure.
+///
+/// # Errors
+///
+/// [`PodmanError`] on an invalid host path.
+pub fn stat_cmd(path: &Path) -> Result<Vec<String>, PodmanError> {
+    validate_host_path(path)?;
+    Ok(vec![
+        "stat".to_owned(),
         "-c".to_owned(),
+        "%F".to_owned(),
         "--".to_owned(),
         path.to_string_lossy().into_owned(),
     ])
@@ -978,6 +1048,107 @@ pub fn cat_cmd(path: &Path) -> Result<Vec<String>, PodmanError> {
         "cat".to_owned(),
         "--".to_owned(),
         path.to_string_lossy().into_owned(),
+    ])
+}
+
+/// `mktemp -- <dir>/.<prefix>XXXXXX` payload for [`unshare_exec_argv`] —
+/// step one of [`unshare_write_atomic`].
+///
+/// `mktemp` creates its output with **`O_CREAT|O_EXCL`** and a name nobody
+/// can predict from outside the call, which is exactly the ADR-0007
+/// create-new property the daemon's own [`create_new`] temp walk buys in
+/// user space. That is why the write seam goes through it rather than
+/// guessing a name: the Mayor controls `manor/home/decrees/` and can
+/// pre-plant any *predictable* name (QA05-04), but cannot pre-plant six
+/// unpredictable ones. The resulting file is mode 0600 and owned by the
+/// userns root. Pure.
+///
+/// # Errors
+///
+/// [`PodmanError`] on an invalid host path or a non-sanitizable prefix.
+pub fn mktemp_staged_cmd(dir: &Path, prefix: &str) -> Result<Vec<String>, PodmanError> {
+    validate_host_path(dir)?;
+    let prefix = sanitize_name(prefix)
+        .map_err(|e| PodmanError::invalid(format!("mktemp prefix {prefix:?}: {e}")))?;
+    Ok(vec![
+        "mktemp".to_owned(),
+        "--".to_owned(),
+        format!("{}/.{prefix}XXXXXX", dir.to_string_lossy()),
+    ])
+}
+
+/// `cp -- <src> <dest>` payload for [`unshare_exec_argv`] — step two of
+/// [`unshare_write_atomic`]: copy the daemon-staged bytes onto the temp
+/// file `mktemp` just created exclusively. Pure.
+///
+/// # Errors
+///
+/// [`PodmanError`] on an invalid host path.
+pub fn cp_staged_cmd(src: &Path, dest: &Path) -> Result<Vec<String>, PodmanError> {
+    validate_host_path(src)?;
+    validate_host_path(dest)?;
+    Ok(vec![
+        "cp".to_owned(),
+        "--".to_owned(),
+        src.to_string_lossy().into_owned(),
+        dest.to_string_lossy().into_owned(),
+    ])
+}
+
+/// `chmod 0600 -- <path>` payload for [`unshare_exec_argv`] — step three of
+/// [`unshare_write_atomic`]. `0600` is correct only *after* the chown: the
+/// file's owner becomes the slot UID, which is exactly who may read it.
+/// Pure.
+///
+/// # Errors
+///
+/// [`PodmanError`] on an invalid host path.
+pub fn chmod_staged_cmd(mode: &str, path: &Path) -> Result<Vec<String>, PodmanError> {
+    if mode.len() != 4 || !mode.chars().all(|c| c.is_ascii_digit()) {
+        return Err(PodmanError::invalid(format!("chmod mode {mode:?}")));
+    }
+    validate_host_path(path)?;
+    Ok(vec![
+        "chmod".to_owned(),
+        mode.to_owned(),
+        "--".to_owned(),
+        path.to_string_lossy().into_owned(),
+    ])
+}
+
+/// `chown <uid>:<gid> -- <path>` payload for [`unshare_exec_argv`] — step
+/// four of [`unshare_write_atomic`]: hand the file to the subuid whose home
+/// it lives in (ADR-0011 cl. 2), so the daemon still owns no part of it
+/// afterwards. Pure.
+///
+/// # Errors
+///
+/// [`PodmanError`] on an invalid host path.
+pub fn chown_one_cmd(uid: u32, gid: u32, path: &Path) -> Result<Vec<String>, PodmanError> {
+    validate_host_path(path)?;
+    Ok(vec![
+        "chown".to_owned(),
+        format!("{uid}:{gid}"),
+        "--".to_owned(),
+        path.to_string_lossy().into_owned(),
+    ])
+}
+
+/// `mv -- <src> <dest>` payload for [`unshare_exec_argv`] — the final,
+/// atomic step of [`unshare_write_atomic`]: rename inside the same
+/// directory, so a reader (the Mayor) never observes a partial ack. Pure.
+///
+/// # Errors
+///
+/// [`PodmanError`] on an invalid host path.
+pub fn mv_staged_cmd(src: &Path, dest: &Path) -> Result<Vec<String>, PodmanError> {
+    validate_host_path(src)?;
+    validate_host_path(dest)?;
+    Ok(vec![
+        "mv".to_owned(),
+        "--".to_owned(),
+        src.to_string_lossy().into_owned(),
+        dest.to_string_lossy().into_owned(),
     ])
 }
 
@@ -1248,6 +1419,20 @@ pub trait Runtime: Send + Sync {
         paths: &'a [PathBuf],
     ) -> BoxFuture<'a, Result<(), PodmanError>>;
 
+    /// `podman unshare chown -R <uid>:<gid> -- <paths…>` (ADR-0034): the
+    /// same ownership brace applied to the whole subtree, for a directory
+    /// the daemon pre-creates *inside* a slot's private home. A
+    /// non-recursive chown hands the top directory to the slot while every
+    /// daemon-created child stays daemon-owned — invisible on the host (the
+    /// daemon can always write there) and fatal inside the container, where
+    /// that child is unwritable by the very slot that owns its parent.
+    fn unshare_chown_recursive<'a>(
+        &'a self,
+        uid: u32,
+        gid: u32,
+        paths: &'a [PathBuf],
+    ) -> BoxFuture<'a, Result<(), PodmanError>>;
+
     /// `podman unshare <cmd…>` (ADR-0011 cl. 4, ADR-0021 cl. 2): run a
     /// HOST binary as the daemon's userns root over the village tree —
     /// the freight ACL audit (`getfacl`), root grants (`setfacl`) and the
@@ -1259,6 +1444,47 @@ pub trait Runtime: Send + Sync {
         &'a self,
         cmd: &'a [String],
     ) -> BoxFuture<'a, Result<ExecOutput, PodmanError>>;
+
+    /// Atomically write `bytes` to `dest` (a path inside a subuid-owned
+    /// tree) from **inside the daemon's own userns** (ADR-0011 cl. 4,
+    /// QA05-02).
+    ///
+    /// Why this exists: `manor/home/` is mode 0700 owned by subuid 1000, so
+    /// under the spec'd dedicated service user the daemon's direct write of
+    /// `<decree_id>.ack` is refused by the kernel. Writing through
+    /// `podman unshare` is the seam ADR-0011 cl. 4 prescribes — the same one
+    /// the freight ACL audit and the promotion read already use.
+    ///
+    /// Properties the implementation must hold (ADR-0007 + CONVENTIONS §3
+    /// r2), because the Mayor owns the destination directory:
+    ///
+    /// * **create-new** — the staging temp name is minted by `mktemp`
+    ///   (`O_CREAT|O_EXCL`, unpredictable), never derived from `dest`;
+    /// * **never a shell** (ADR-0010 cl. 1) — five typed argv payloads, no
+    ///   interpolation, each validated by `validate_host_path`;
+    /// * **atomic** — the final step is a same-directory `mv`, so a reader
+    ///   sees either the old bytes or the whole new file;
+    /// * **handed over** — the result is `chown`ed to `owner` and left
+    ///   0600, so the daemon keeps no writable handle on a file the Mayor
+    ///   owns.
+    ///
+    /// The default implementation refuses: a runtime that cannot write into
+    /// the userns must say so rather than silently appearing to.
+    fn unshare_write_atomic<'a>(
+        &'a self,
+        dest: &'a Path,
+        bytes: &'a [u8],
+        owner: (u32, u32),
+    ) -> BoxFuture<'a, Result<(), PodmanError>> {
+        Box::pin(async move {
+            let _ = (bytes, owner);
+            Err(PodmanError::invalid(format!(
+                "this runtime has no unshare write seam; cannot write {} from inside the \
+                 daemon userns (ADR-0011 cl. 4)",
+                dest.display()
+            )))
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1541,6 +1767,19 @@ impl Runtime for PodmanRuntime {
         })
     }
 
+    fn unshare_chown_recursive<'a>(
+        &'a self,
+        uid: u32,
+        gid: u32,
+        paths: &'a [PathBuf],
+    ) -> BoxFuture<'a, Result<(), PodmanError>> {
+        Box::pin(async move {
+            let argv = unshare_chown_recursive_argv(&self.podman_bin, uid, gid, paths)?;
+            self.spawn_ok(argv).await?;
+            Ok(())
+        })
+    }
+
     fn unshare_exec<'a>(
         &'a self,
         cmd: &'a [String],
@@ -1554,7 +1793,145 @@ impl Runtime for PodmanRuntime {
             Ok(out)
         })
     }
+
+    fn unshare_write_atomic<'a>(
+        &'a self,
+        dest: &'a Path,
+        bytes: &'a [u8],
+        owner: (u32, u32),
+    ) -> BoxFuture<'a, Result<(), PodmanError>> {
+        Box::pin(async move {
+            let dir = dest.parent().ok_or_else(|| {
+                PodmanError::invalid(format!("{} has no parent directory", dest.display()))
+            })?;
+            // 1. Stage the bytes in a daemon-private file the Mayor cannot
+            //    reach: the daemon's own tmp dir, created O_EXCL, mode 0600.
+            let staged = stage_bytes(bytes)?;
+            let result = self.unshare_write_staged(dir, dest, &staged, owner).await;
+            // The staging file is the daemon's alone; it never survives the
+            // call, success or failure.
+            let _ = tokio::fs::remove_file(&staged).await;
+            result
+        })
+    }
 }
+
+impl PodmanRuntime {
+    /// The four `podman unshare` steps of [`Runtime::unshare_write_atomic`]
+    /// once `staged` holds the bytes: `mktemp` → `cp` → `chmod`/`chown` →
+    /// `mv`.
+    async fn unshare_write_staged(
+        &self,
+        dir: &Path,
+        dest: &Path,
+        staged: &Path,
+        owner: (u32, u32),
+    ) -> Result<(), PodmanError> {
+        // (a) Exclusive, unpredictable staging name inside the target dir.
+        let mktemp = mktemp_staged_cmd(dir, "hamlet-daemon-write")?;
+        let out = self.unshare_exec(&mktemp).await?;
+        if out.code != 0 {
+            return Err(map_nonzero(out.code, &mktemp, out.stderr_lossy()));
+        }
+        let created = out.stdout_lossy();
+        let created = created.trim_end_matches(['\n', '\r']).to_owned();
+        // Trust nothing the tool printed: it must be an absolute path
+        // *inside* the directory we asked about.
+        let created_path = Path::new(&created);
+        if !created_path.is_absolute()
+            || created_path.parent() != Some(dir)
+            || created.contains("..")
+            || created.len() > 512
+        {
+            return Err(PodmanError::invalid(format!(
+                "unshare mktemp returned an unusable path {created:?} (expected a fresh file in {})",
+                dir.display()
+            )));
+        }
+
+        // (b) .. (e) Any failure past this point must not leave the staging
+        // file behind in a directory the Mayor owns: the daemon created it,
+        // so the daemon removes it.
+        let copy = cp_staged_cmd(staged, created_path)?;
+        if let Err(e) = self.unshare_exec(&copy).await.and_then(check_exit(&copy)) {
+            let _ = tokio::fs::remove_file(created_path).await;
+            return Err(e);
+        }
+        let chmod = chmod_staged_cmd("0600", created_path)?;
+        if let Err(e) = self.unshare_exec(&chmod).await.and_then(check_exit(&chmod)) {
+            let _ = tokio::fs::remove_file(created_path).await;
+            return Err(e);
+        }
+        let chown = chown_one_cmd(owner.0, owner.1, created_path)?;
+        if let Err(e) = self.unshare_exec(&chown).await.and_then(check_exit(&chown)) {
+            let _ = tokio::fs::remove_file(created_path).await;
+            return Err(e);
+        }
+        let rename = mv_staged_cmd(created_path, dest)?;
+        self.unshare_exec(&rename)
+            .await
+            .and_then(check_exit(&rename))?;
+        Ok(())
+    }
+}
+
+/// `unshare_exec` helper: a non-zero tool exit is an error carrying argv +
+/// stderr (ADR-0010 cl. 5), never a silently ignored outcome.
+fn check_exit(argv: &[String]) -> impl FnOnce(ExecOutput) -> Result<ExecOutput, PodmanError> + '_ {
+    move |out: ExecOutput| {
+        if out.code != 0 {
+            return Err(map_nonzero(out.code, argv, out.stderr_lossy()));
+        }
+        Ok(out)
+    }
+}
+
+/// Stage `bytes` in a daemon-private temp file: `O_CREAT|O_EXCL`, mode 0600,
+/// fsynced before the read that the `cp` step will perform. Never in the
+/// village tree — the destination is in a directory the Mayor controls, and
+/// this file has no business being visible there.
+fn stage_bytes(bytes: &[u8]) -> Result<PathBuf, PodmanError> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let dir = std::env::temp_dir();
+    for attempt in 0..256u32 {
+        let candidate = dir.join(format!(
+            "hamlet-daemon-write-{}-{attempt}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&candidate)
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(PodmanError::spawn(
+                    e.to_string(),
+                    vec![candidate.display().to_string()],
+                ))
+            }
+        };
+        if let Err(e) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+            let _ = std::fs::remove_file(&candidate);
+            return Err(PodmanError::spawn(e.to_string(), vec![]));
+        }
+        return Ok(candidate);
+    }
+    Err(PodmanError::invalid(
+        "no free staging file name after 256 attempts",
+    ))
+}
+
+/// One recorded [`Runtime::unshare_write_atomic`] call: where, what, and who
+/// the file is handed to (QA05-02).
+pub type UnshareWrite = (PathBuf, Vec<u8>, (u32, u32));
 
 /// Real interactive exec session wrapping the tokio child.
 struct ChildExecHandle {
@@ -1632,6 +2009,9 @@ pub struct FakeRuntime {
     podman_bin: PathBuf,
     recorded: Mutex<Vec<Vec<String>>>,
     recorded_stdin: Mutex<Vec<(Vec<String>, Vec<u8>)>>,
+    /// Every [`Runtime::unshare_write_atomic`] call: destination, bytes and
+    /// the owner the file is handed to (QA05-02).
+    unshare_writes: Mutex<Vec<UnshareWrite>>,
     script: Mutex<FakeScript>,
 }
 
@@ -1649,6 +2029,7 @@ impl FakeRuntime {
             podman_bin: PathBuf::from("podman"),
             recorded: Mutex::new(Vec::new()),
             recorded_stdin: Mutex::new(Vec::new()),
+            unshare_writes: Mutex::new(Vec::new()),
             script: Mutex::new(FakeScript::default()),
         }
     }
@@ -1657,6 +2038,13 @@ impl FakeRuntime {
     #[must_use]
     pub fn argv_log(&self) -> Vec<Vec<String>> {
         self.lock(&self.recorded).clone()
+    }
+
+    /// Every [`Runtime::unshare_write_atomic`] call recorded so far:
+    /// `(destination, bytes, owner)`, in call order.
+    #[must_use]
+    pub fn unshare_writes(&self) -> Vec<UnshareWrite> {
+        self.lock(&self.unshare_writes).clone()
     }
 
     /// Every `exec` stdin payload recorded so far, paired with its (redacted)
@@ -1951,6 +2339,22 @@ impl Runtime for FakeRuntime {
         })
     }
 
+    fn unshare_chown_recursive<'a>(
+        &'a self,
+        uid: u32,
+        gid: u32,
+        paths: &'a [PathBuf],
+    ) -> BoxFuture<'a, Result<(), PodmanError>> {
+        Box::pin(async move {
+            let argv = unshare_chown_recursive_argv(&self.podman_bin, uid, gid, paths)?;
+            let recorded = self.record(argv);
+            if let Some(err) = self.take_failure(&recorded) {
+                return Err(err);
+            }
+            Ok(())
+        })
+    }
+
     fn unshare_exec<'a>(
         &'a self,
         cmd: &'a [String],
@@ -1971,6 +2375,53 @@ impl Runtime for FakeRuntime {
                 return Ok(output.clone());
             }
             Ok(script.exec_output.clone())
+        })
+    }
+
+    /// The fake write seam: record `(dest, bytes, owner)` and then perform
+    /// the write the real runtime's five steps would have performed, so a
+    /// test can assert both *which* payload reached the seam and the
+    /// resulting tree. No podman, no userns.
+    fn unshare_write_atomic<'a>(
+        &'a self,
+        dest: &'a Path,
+        bytes: &'a [u8],
+        owner: (u32, u32),
+    ) -> BoxFuture<'a, Result<(), PodmanError>> {
+        Box::pin(async move {
+            self.lock(&self.unshare_writes)
+                .push((dest.to_path_buf(), bytes.to_vec(), owner));
+            // The real seam writes as userns **root**, which is not subject
+            // to the DAC bits of a subuid-owned 0700 home (ADR-0011 cl. 4).
+            // The fake has no userns, so it emulates exactly that one
+            // property: if the ordinary write is refused, the parent
+            // directory is opened up for the duration and restored after.
+            match std::fs::write(dest, bytes) {
+                Ok(()) => Ok(()),
+                Err(refused) if refused.kind() == std::io::ErrorKind::PermissionDenied => {
+                    use std::os::unix::fs::PermissionsExt;
+                    let parent = dest.parent().ok_or_else(|| {
+                        PodmanError::invalid("fake unshare write: no parent directory")
+                    })?;
+                    let original = std::fs::metadata(parent)
+                        .map_err(|e| PodmanError::invalid(format!("fake unshare stat: {e}")))?
+                        .permissions()
+                        .mode()
+                        & 0o7777;
+                    std::fs::set_permissions(
+                        parent,
+                        std::fs::Permissions::from_mode(original | 0o700),
+                    )
+                    .map_err(|e| PodmanError::invalid(format!("fake unshare chmod: {e}")))?;
+                    let written = std::fs::write(dest, bytes);
+                    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(original))
+                        .map_err(|e| {
+                            PodmanError::invalid(format!("fake unshare chmod back: {e}"))
+                        })?;
+                    written.map_err(|e| PodmanError::invalid(format!("fake unshare write: {e}")))
+                }
+                Err(e) => Err(PodmanError::invalid(format!("fake unshare write: {e}"))),
+            }
         })
     }
 }
@@ -2426,9 +2877,110 @@ mod tests {
                 unshare_chown_argv(&bin(), 1001, 1001, &[PathBuf::from(evil)]).is_err(),
                 "{evil:?} must be rejected"
             );
+            assert!(
+                unshare_chown_recursive_argv(&bin(), 1001, 1001, &[PathBuf::from(evil)]).is_err(),
+                "the recursive brace validates identically: {evil:?} must be rejected"
+            );
         }
         // Valid absolute path passes.
         assert!(unshare_chown_argv(&bin(), 1001, 1001, &[PathBuf::from("/v/.hamlet/x")]).is_ok());
+        assert!(
+            unshare_chown_recursive_argv(&bin(), 1001, 1001, &[PathBuf::from("/v/.hamlet/x")])
+                .is_ok()
+        );
+    }
+
+    /// ADR-0034 golden: the recursive brace is the same argv with `-RP`
+    /// between `chown` and the ownership spec, and the `--` guard stays.
+    #[test]
+    fn unshare_chown_recursive_argv_golden() {
+        assert!(unshare_chown_recursive_argv(&bin(), 1000, 1000, &[]).is_err());
+        assert_eq!(
+            unshare_chown_recursive_argv(
+                &bin(),
+                1000,
+                1000,
+                &[PathBuf::from("/v/.hamlet/keep/census/manor/home")],
+            )
+            .unwrap(),
+            vec![
+                "podman",
+                "unshare",
+                "chown",
+                "-RP",
+                "1000:1000",
+                "--",
+                "/v/.hamlet/keep/census/manor/home",
+            ]
+        );
+    }
+
+    /// **QA04-29 / ADR-0034 cl. 5 — the recursive brace must not
+    /// dereference.** The manor home is agent-writable, so the tree the
+    /// `-R` walk descends contains symlinks the adversary chose. Whether
+    /// `-R` follows them is the difference between chowning the Mayor's own
+    /// subtree and chowning an arbitrary host path as the Mayor's subuid.
+    ///
+    /// The safety used to be an unpinned GNU default (`-P`), so this pins
+    /// **both directions**: the flag must be present, and no dereferencing
+    /// flag (`-L`, `-H`, or a `--dereference`-style long option) may appear
+    /// anywhere in the argv. A future "-L is more correct" edit fails here.
+    #[test]
+    fn chown_recursive_argv_pins_no_dereference() {
+        let argv = unshare_chown_recursive_argv(
+            &bin(),
+            1000,
+            1000,
+            &[PathBuf::from("/v/.hamlet/keep/census/manor/home")],
+        )
+        .unwrap();
+        assert_eq!(
+            argv.iter()
+                .filter(|a| a.starts_with('-') && a.as_str() != "--")
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["-RP".to_owned()],
+            "the recursive chown's whole option set is `-RP` (ADR-0034 cl. 5)"
+        );
+        for forbidden in [
+            "-L",
+            "-H",
+            "--dereference",
+            "--no-dereference",
+            "-RL",
+            "-RH",
+        ] {
+            assert!(
+                !argv.iter().any(|a| a == forbidden),
+                "`chown` must never be asked to dereference ({forbidden}): {argv:?}"
+            );
+        }
+        // The non-recursive brace touches the path itself only; it carries
+        // no traversal flag at all, so the two forms cannot be confused.
+        let flat = unshare_chown_argv(
+            &bin(),
+            1000,
+            1000,
+            &[PathBuf::from("/v/.hamlet/keep/census/manor/home")],
+        )
+        .unwrap();
+        assert_eq!(
+            flat.iter()
+                .filter(|a| a.starts_with('-') && a.as_str() != "--")
+                .count(),
+            0,
+            "the non-recursive brace has no traversal options: {flat:?}"
+        );
+    }
+
+    /// QA04-12: the audit cannot do its job without the `# owner:` line, and
+    /// `-c`/`--omit-header` is exactly what removes it. Pinned as an
+    /// invariant so a tidy-up never re-adds it.
+    #[test]
+    fn getfacl_payload_keeps_the_owner_header() {
+        let argv = getfacl_cmd(Path::new("/v/.hamlet/courier/freight/exchange")).unwrap();
+        assert!(!argv.iter().any(|a| a == "-c" || a == "--omit-header"));
+        assert!(argv.contains(&"-p".to_owned()) && argv.contains(&"-n".to_owned()));
     }
 
     /// ADR-0021 cl. 2 goldens: the typed `podman unshare` payload builders
@@ -2440,12 +2992,21 @@ mod tests {
             vec!["podman", "unshare", "getfacl", "--"]
         );
         assert_eq!(
+            stat_cmd(Path::new("/v/.hamlet/courier/freight/exchange/leak.md")).unwrap(),
+            vec![
+                "stat",
+                "-c",
+                "%F",
+                "--",
+                "/v/.hamlet/courier/freight/exchange/leak.md"
+            ]
+        );
+        assert_eq!(
             getfacl_cmd(Path::new("/v/.hamlet/courier/freight/exchange")).unwrap(),
             vec![
                 "getfacl",
                 "-p",
                 "-n",
-                "-c",
                 "--",
                 "/v/.hamlet/courier/freight/exchange"
             ]
@@ -2477,6 +3038,101 @@ mod tests {
                 "/v/.hamlet/courier/freight/exchange/payload.bin"
             ]
         );
+    }
+
+    /// ADR-0011 cl. 4 / QA05-02 goldens: the five typed payload builders the
+    /// unshare **write** seam composes. Pinned because the whole point of
+    /// the seam is that the Mayor owns the destination directory — every
+    /// name it derives must be `mktemp`'s exclusive, unpredictable one, and
+    /// every path slot must be behind `--`.
+    #[test]
+    fn unshare_write_payload_argv_goldens() {
+        let dir = Path::new("/v/.hamlet/keep/census/manor/home/decrees");
+        let staged = Path::new("/tmp/hamlet-daemon-write-1234-0-99");
+        let created =
+            Path::new("/v/.hamlet/keep/census/manor/home/decrees/.hamlet-daemon-writeAbC123");
+        assert_eq!(
+            mktemp_staged_cmd(dir, "hamlet-daemon-write").unwrap(),
+            vec![
+                "mktemp",
+                "--",
+                "/v/.hamlet/keep/census/manor/home/decrees/.hamlet-daemon-writeXXXXXX",
+            ]
+        );
+        assert_eq!(
+            cp_staged_cmd(staged, created).unwrap(),
+            vec![
+                "cp",
+                "--",
+                "/tmp/hamlet-daemon-write-1234-0-99",
+                "/v/.hamlet/keep/census/manor/home/decrees/.hamlet-daemon-writeAbC123",
+            ]
+        );
+        assert_eq!(
+            chmod_staged_cmd("0600", created).unwrap(),
+            vec![
+                "chmod",
+                "0600",
+                "--",
+                "/v/.hamlet/keep/census/manor/home/decrees/.hamlet-daemon-writeAbC123",
+            ]
+        );
+        assert_eq!(
+            chown_one_cmd(1000, 1000, created).unwrap(),
+            vec![
+                "chown",
+                "1000:1000",
+                "--",
+                "/v/.hamlet/keep/census/manor/home/decrees/.hamlet-daemon-writeAbC123",
+            ]
+        );
+        assert_eq!(
+            mv_staged_cmd(
+                created,
+                Path::new("/v/.hamlet/keep/census/manor/home/decrees/d-000000000007-a1b2.ack")
+            )
+            .unwrap(),
+            vec![
+                "mv",
+                "--",
+                "/v/.hamlet/keep/census/manor/home/decrees/.hamlet-daemon-writeAbC123",
+                "/v/.hamlet/keep/census/manor/home/decrees/d-000000000007-a1b2.ack",
+            ]
+        );
+    }
+
+    /// The write-seam builders are typed sources and hold the same
+    /// injection guarantees as every other argv builder (ADR-0010 cl. 1):
+    /// a hostile prefix cannot become a template, a relative path cannot
+    /// become an operand, and a sloppy mode cannot become a chmod.
+    #[test]
+    fn unshare_write_payload_injection_rejected() {
+        let dir = Path::new("/v/.hamlet/keep/census/manor/home/decrees");
+        for evil in ["../../etc", "", "-t", "/v/has\nnewline"] {
+            assert!(
+                mktemp_staged_cmd(Path::new(evil), "write").is_err(),
+                "{evil:?}"
+            );
+        }
+        // The prefix lands inside the template, so it must sanitize: no
+        // separator, no dot-leading traversal, no control chars.
+        for evil in ["../../escape", "/etc/passwd", "with space", "with\nnewline"] {
+            assert!(
+                mktemp_staged_cmd(dir, evil).is_err(),
+                "prefix {evil:?} must be rejected"
+            );
+        }
+        for evil in ["600", "0600x", "abc", ""] {
+            assert!(chmod_staged_cmd(evil, dir).is_err(), "mode {evil:?}");
+        }
+        for evil in ["relative", "", "--reference=/etc/shadow"] {
+            assert!(
+                chown_one_cmd(1000, 1000, Path::new(evil)).is_err(),
+                "{evil:?}"
+            );
+            assert!(mv_staged_cmd(dir, Path::new(evil)).is_err(), "{evil:?}");
+            assert!(cp_staged_cmd(Path::new(evil), dir).is_err(), "{evil:?}");
+        }
     }
 
     /// Injection matrix for the unshare payloads: hostile paths/mods/commands

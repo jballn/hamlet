@@ -9,6 +9,10 @@
 # This script is the committed equivalent: raw `rustc` probes compiled
 # against the built `hamlet_core` rlib. Every FAIL probe MUST fail to
 # compile; the CONTROL probe must compile cleanly. Any deviation fails CI.
+#
+# Privilege-free by construction (rustc + an rlib, no host, no podman), so
+# unlike the guarded container sections of e2e-02/04/05 it never needs the
+# service-user entry point — stated here rather than left as an implicit gap.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

@@ -71,6 +71,16 @@ ADRs are immutable. To change a decision:
 | [0023](0023-dispatch-runtime-checkpoints.md) | Dispatch outbox runtime: attempt checkpoints & idempotent recovery | Accepted (refines ADR-0020 cl. 4–5 runtime contract) |
 | [0024](0024-musl-runtime-libraries-in-the-apk-floor.md) | Musl runtime libraries belong in the daemon apk floor | Accepted (amends ADR-0012 cl. 2; fixes QA04-05) |
 | [0025](0025-derived-image-clears-parent-body.md) | The derived image CLEARS its parent's ENTRYPOINT/CMD | Accepted (amends ADR-0012 cl. 2; fixes QA04-06) |
+| [0026](0026-decree-protocol.md) | Decree protocol: vocabulary, encodings, acks, replay ids | Accepted (amends ADR-0019 cl. 5 decree row) |
+| [0027](0027-context-packet-schema.md) | Context packet: MAYOR.md + state grid + one event artifact | Accepted |
+| [0028](0028-mayor-session-lifecycle.md) | Mayor session lifecycle: fresh invocation per wake, merged wakes, bounded queue | Accepted (amends ADR-0027 cl. 2 additively) |
+| [0029](0029-decree-execution-and-wake-triggers.md) | Decree execution and mayor wake triggers: config-driven wakes, honest seams, escalation notices | Accepted |
+| [0030](0030-decree-boundary-hardening.md) | Decree boundary hardening: provenance checks, unshare writes, stable-file quarantine, wake identity | Accepted (fixes QA05-01/02/03/05/06; amends ADR-0029 cl. 1, ADR-0028 cl. 3) |
+| [0031](0031-acl-listing-keeps-owner-header.md) | The freight ACL listing keeps its `# owner:` header (`-c` is never re-added) | Accepted (amends ADR-0021 cl. 1; fixes QA04-12) |
+| [0032](0032-guarded-host-preconditions.md) | Guarded-suite host preconditions: skip with a remedy, never a vacuous green | Accepted (amends CONVENTIONS §5; resolves QA04-07/08/09) |
+| [0033](0033-promotion-read-kind-check-escalation.md) | Promotion-read's pre-read kind check escalates through the userns | Accepted (amends ADR-0021 cl. 6; fixes QA04-13) |
+| [0034](0034-manor-home-brace-is-recursive.md) | The manor home brace is recursive: a private home owns its whole subtree | Accepted (amends ADR-0011 cl. 2; fixes QA04-23; cl. 5 pins the brace's no-dereference traversal policy — QA04-29; cl. 6 records QA04-28 fix) |
+| [0035](0035-publish-arm-injection-seam.md) | Publish-arm fault-injection seam for the mirror-warm branch | Accepted (amends ADR-0013 cl. 3; fixes QA04-32) |
 
 Keep this index updated in the same commit that adds/changes an ADR.
 
@@ -86,6 +96,7 @@ reused. Where a later prompt cites one of these, read the ADR actually written:
 | Sprint 03 "ADR-0008" | session protocol + interrupt schema | 0008 (slot identity uniqueness) | **ADR-0015** |
 | Sprint 04 "ADR-0009" | mail format + watcher vocabulary | 0009 (blueprint schema) | **ADR-0019** |
 | Sprint 04 "ADR-0010" | dispatch protocol + retry policy | 0010 (podman invocation) | **ADR-0020** |
+| Sprint 05 "ADR-0011" | decree protocol + context packet | 0011 (host permission model) | **ADR-0026** (decrees) + **ADR-0027** (packet) |
 | Sprint 06 "ADR-0012" | commission state machine + git mediation | 0012 (derived images) | next free number (0016+) |
 | Sprint 07 "ADR-0013" | stasis formats + resource policy | 0013 (pkgcache trust) | next free number (0016+) |
 | Sprint 08 "ADR-0014" | CLI surface + local API contract | 0014 (parcel env policy) | next free number (0016+) |

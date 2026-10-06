@@ -1,7 +1,7 @@
 //! Freight POSIX ACL sandbox vocabulary (SPEC §4 "Freight ACLs", §8.3;
 //! ADR-0021).
 //!
-//! Pure logic for the daemon-side ACL audit: a parser for `getfacl -p -n -c`
+//! Pure logic for the daemon-side ACL audit: a parser for `getfacl -p -n`
 //! listings (the daemon obtains them through `podman unshare getfacl`, so the
 //! numeric ids are the in-userns slot UIDs) and the audit rules themselves.
 //!
@@ -126,7 +126,7 @@ pub struct AclEntry {
     pub perms: Perms,
 }
 
-/// A parsed `getfacl -p -n -c` listing of one filesystem object.
+/// A parsed `getfacl -p -n` listing of one filesystem object.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AclListing {
     /// `# owner:` — numeric UID (in-userns slot UID via `podman unshare`).
@@ -186,7 +186,8 @@ impl fmt::Display for FreightError {
 
 impl std::error::Error for FreightError {}
 
-/// Parse one `getfacl -p -n -c --` listing. Strict: CR is rejected, the
+/// Parse one `getfacl -p -n --` listing (comment header present: the `# owner:`
+/// line is state, not noise — ADR-0031). Strict: CR is rejected, the
 /// `# owner:`/`# group:` comments and a base `other::` entry are mandatory,
 /// trailing `# effective:` comments are stripped, anything else malformed is
 /// a typed error.

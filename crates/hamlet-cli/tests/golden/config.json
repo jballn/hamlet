@@ -1,5 +1,5 @@
 {
-  "config_version": 6,
+  "config_version": 10,
   "daemon_data_dir": ".hamlet-data/sled",
   "podman_bin": "podman",
   "base_image": "docker.io/library/alpine:3.20",
@@ -35,5 +35,13 @@
     "auth_env_key": "HAMLET_WEBHOOK_AUTH",
     "max_body_bytes": 65536,
     "routes": {}
+  },
+  "mayor": {
+    "ack_timeout_ms": 30000,
+    "wake_queue_depth": 16,
+    "turn_timeout_ms": 120000,
+    "crash_wake": "budget_exhausted",
+    "escalation_webhook_url": null,
+    "ack_retry_ms": 600000
   }
 }

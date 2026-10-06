@@ -17,7 +17,9 @@
 0755 dir keep/archives
 0755 dir keep/census
 0755 dir keep/census/manor
+0755 dir keep/census/manor/escalations
 0755 dir keep/census/manor/home
+0755 dir keep/census/manor/home/decrees
 0755 dir keep/vault
 0755 dir market
 0755 dir market/pkgcache

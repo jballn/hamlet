@@ -299,12 +299,12 @@ async fn metrics_for_session_uid_and_commission() {
 // Latency spikes
 // ---------------------------------------------------------------------------
 
-/// The threshold is config (`sessions.latency_spike_ms`, v4): a 120 ms tool
+/// The threshold is config (`sessions.latency_spike_ms`, v4): a 300 ms tool
 /// call is a spike at 50 ms and invisible at an hour.
 #[tokio::test]
 async fn latency_spikes_follow_the_configured_threshold() {
     let script_value = json!({
-        "tool_calls": [{ "name": "bash", "delay_ms": 120, "is_error": false }],
+        "tool_calls": [{ "name": "bash", "delay_ms": 300, "is_error": false }],
         "usage_sequence": [usage(1, 1, 0.0)],
     });
 
@@ -335,8 +335,12 @@ async fn latency_spikes_follow_the_configured_threshold() {
         .iter()
         .find(|spike| spike.operation == "tool-call bash")
         .unwrap();
-    // Spans are measured between frame *reads*, so a scripted 120 ms delay
-    // can read back a few ms short; the invariant is the threshold breach.
+    // Spans are measured between frame *reads*, so a scripted delay can read
+    // back short of its nominal value — and the shortfall grows with host
+    // load, not with the delay (QA05-11: under battery load the old 120 ms
+    // script came back as 97 ms against a >= 100 floor — a coin flip at the
+    // gate). The scripted delay is now wide enough that this floor still
+    // catches a collapsed span while no host shape can sink it.
     assert!(
         tool.duration_ms >= 100,
         "duration far below the scripted delay: {tool:?}"

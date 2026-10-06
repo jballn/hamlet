@@ -65,6 +65,12 @@
 - Container-touching tests are guarded: they run only when
   `HAMLET_PODMAN_TESTS=1` and `podman` is on PATH; otherwise they skip with a
   recorded reason. CI runs them in a podman-capable job.
+- **Host preconditions are part of the guard (ADR-0032).** A host on which an
+  invariant cannot hold at all (the test user is also the rootless podman
+  owner; the village tree would live on a RAM-backed `TMPDIR`) makes the
+  suite SKIP with its finding id and the host remedy — never RED, and never
+  by weakening an assertion. A guarded suite that skipped every test is
+  reported as skipped by `ci.sh`/the e2e harnesses, never as a pass.
 
 ## 6. Secrets
 

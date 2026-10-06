@@ -12,7 +12,7 @@
 //! |---|---|---|---|
 //! | `courier/mail/<r>/<f>.mail` (file) | Created | [`Reaction::MailSpool`] | daemon `mailroute` (Sprint 04) |
 //! | `keep/census/parcel<uid>/DEED.md` | Created/Modified | [`Reaction::DeedMutation`] | Sprint 06 |
-//! | `keep/census/manor/home/**` (file) | Created/Modified | [`Reaction::DecreeWrite`] | Sprint 05 |
+//! | `keep/census/manor/home/decrees/<id>.json` (file) | Created/Modified | [`Reaction::DecreeWrite`] | Sprint 05 |
 //! | `guild/ledger/commission<n>/INDENTURE.md` | Created/Modified | [`Reaction::DecreeWrite`] | Sprint 05 |
 //! | `courier/dispatch/outbox/<f>.json` | Created | [`Reaction::DispatchOutbox`] | daemon `dispatch` (Sprint 04) |
 //! | `courier/freight/<name>/` (dir) | Created | [`Reaction::FreightDir`] | daemon `freight` (Sprint 04) |
@@ -112,8 +112,10 @@ pub enum Reaction {
         /// Parcel owner UID.
         uid: u32,
     },
-    /// A Mayor decree emission (region match; Sprint 05 defines the
-    /// encodings and interprets `path`).
+    /// A Mayor decree emission `keep/census/manor/home/decrees/<id>.json`
+    /// (ADR-0026 cl. 6 narrowed this row: only the decree directory and
+    /// only well-formed `<decree_id>.json` names react, so the daemon's own
+    /// `<decree_id>.ack` and the Mayor's scratch files stay invisible).
     DecreeWrite {
         /// Village-relative path of the changed file.
         path: PathBuf,
@@ -179,12 +181,14 @@ pub fn classify(event: &FsEvent) -> Reaction {
                 None => Reaction::Ignored,
             }
         }
-        // keep/census/manor/home/** — Mayor decree emissions (Sprint 05
-        // interprets; the encoding ADR may extend this table).
-        ["keep", "census", "manor", "home", rest @ ..]
-            if !rest.is_empty()
-                && matches!(event.action, FsAction::Created | FsAction::Modified)
-                && !event.is_dir =>
+        // keep/census/manor/home/decrees/<decree_id>.json — Mayor decree
+        // emissions (ADR-0026 cl. 6). Narrowed from the provisional
+        // `manor/home/**` row of ADR-0019 cl. 5: acks and scratch files in
+        // the Mayor's home must never re-enter as a new decree.
+        ["keep", "census", "manor", "home", "decrees", file]
+            if matches!(event.action, FsAction::Created | FsAction::Modified)
+                && !event.is_dir
+                && crate::decree::is_decree_file_name(file) =>
         {
             Reaction::DecreeWrite {
                 path: event.path.clone(),
@@ -440,10 +444,10 @@ mod tests {
             Reaction::Ignored
         );
 
-        // decree regions (Sprint 05)
+        // decree regions (Sprint 05 / ADR-0026 cl. 6)
         let decree = ev(
             FsAction::Created,
-            "keep/census/manor/home/decrees/d-7.md",
+            "keep/census/manor/home/decrees/d-000000000007-c0225c3b8fabf543.json",
             false,
         );
         assert_eq!(
@@ -479,6 +483,21 @@ mod tests {
             classify(&ev(FsAction::Removed, "keep/census/manor/home/x.md", false)),
             Reaction::Ignored
         );
+        // daemon-written acks and the Mayor's scratch files never react
+        // (ADR-0026 cl. 6)
+        for not_a_decree in [
+            "keep/census/manor/home/decrees/d-000000000007-c0225c3b8fabf543.ack",
+            "keep/census/manor/home/decrees/notes.json",
+            "keep/census/manor/home/decrees/d-7.json",
+            "keep/census/manor/home/scratch.json",
+            "keep/census/manor/home/decrees/sub/deep.json",
+        ] {
+            assert_eq!(
+                classify(&ev(FsAction::Created, not_a_decree, false)),
+                Reaction::Ignored,
+                "{not_a_decree} must be ignored"
+            );
+        }
 
         // dispatch outbox additions
         assert_eq!(

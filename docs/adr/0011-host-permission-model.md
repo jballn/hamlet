@@ -23,7 +23,12 @@ subuid mapping, identical in every container of the same host user.
    flag on `run`, ever; cl. 4 prohibitions/hardening unchanged.
 2. Per-UID host ownership is set via `podman unshare chown <uid>:<gid> --
    <paths…>` (same subuid mapping containers see; no real root, no bare-
-   host chown). Applied to parcel `home/` and `courier/mail/<uid>/`.
+   host chown). Applied to parcel `home/` and `courier/mail/<uid>/`. The
+   recursive form (`-R`, manor home only — ADR-0034) **must not dereference
+   symlinks**: those trees are agent-writable, so a following chown would
+   hand the slot's subuid to an attacker-chosen path outside the village.
+   The policy is carried in the argv (`-RP`), not left to a tool default
+   (ADR-0034 cl. 5).
 3. Host mode table (ro mounts are the belt; these perms are braces):
    `parcel<uid>/home/` 0700 uid:uid · `courier/mail/<uid>/` 0700 uid:uid
    · `courier/mail/` 0755 daemon · `courier/freight/` 0710 daemon

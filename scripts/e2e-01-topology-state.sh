@@ -8,8 +8,12 @@
 #   crates/hamlet-core/tests/adversarial_sanitize.rs
 #   crates/hamlet-core/tests/adversarial_state.rs
 #   crates/hamlet-cli/tests/adversarial_init.rs
+# Container coverage lives in the guarded battery (e2e-02 T4 / e2e-04 T3 /
+# e2e-05 T3, all through scripts/guarded-entry.sh); T8 below only ACCOUNTS for
+# it, so a run that silently asserted nothing cannot hide in this log.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+. ./scripts/ci-guarded-job.sh
 
 FAILURES=0
 step()  { printf '\033[1m==> %s\033[0m\n' "$*"; }
@@ -18,6 +22,9 @@ fail()  { printf '\033[1;31m  FAIL: %s\033[0m\n' "$*"; FAILURES=$((FAILURES + 1)
 check() { # check <desc> <expected> <actual>
   if [ "$2" = "$3" ]; then pass "$1"; else fail "$1 (expected [$2], got [$3])"; fi
 }
+# Accounting-only line: T8 asserts nothing, so it must never touch FAILURES —
+# an unreachable container job is a coverage note, not a red in this harness.
+skip()  { printf '  \033[1;33mSKIP: %s\033[0m\n' "$*"; }
 
 step "building hamlet CLI"
 cargo build -p hamlet-cli --quiet
@@ -51,7 +58,7 @@ check "T1 charter.json mode 0644"      "644" "$(mode "$R/charter.json")"
 check "T1 config.json mode 0644"       "644" "$(mode "$R/config.json")"
 check "T1 .env mode EXACTLY 0600"      "600" "$(mode "$R/.env")"
 check "T1 empty charter golden" '{
-  "charter_version": 2
+  "charter_version": 3
 }' "$(cat "$R/charter.json")"
 
 # --- T2: re-init idempotency (byte + mode stability) ------------------------
@@ -115,6 +122,19 @@ if grep -RIn --exclude=.env -E 'test-key-do-not-use' "$WORK/v4/.hamlet" | grep -
   fail "T7 secret-looking value leaked outside .env"
 else
   pass "T7 no secret material outside .env"
+fi
+
+# --- T8: guarded-battery accounting -----------------------------------------
+# No assertion here; this is the coverage ledger. The podman-capable job runs
+# as the service user via scripts/guarded-entry.sh; if the direct route is
+# closed, the exact command that would run it is named rather than skipped
+# silently (ADR-0032 cl. 5 — a skip is a coverage hole, not a pass).
+step "T8: guarded-battery accounting (SPEC §4 uid policy lives there)"
+if why="$(ci_guarded_direct_viable 2>&1)"; then
+  pass "podman-capable job runnable here as $(id -un): ${why:-all preconditions met}"
+else
+  skip "guarded battery not runnable as $(id -un): ${why}"
+  skip "run it with: sudo -H -u ${HAMLET_SERVICE_USER:-hamlet} env TMPDIR=${HAMLET_WORK_AREA:-/var/hamlet/tmp} HAMLET_PODMAN_TESTS=1 ./scripts/guarded-service-user.sh"
 fi
 
 echo
