@@ -1472,3 +1472,107 @@ Step 06's precondition (HANDOFF shows `GATE 05/05: PASS`) is met; the merge
   reclaimed the stranded trees (~27 GiB free restored): **full battery PASS
   on `main`** (`TMPDIR=/var/hamlet/tmp HAMLET_PODMAN_TESTS=1
   ./scripts/ci-local.sh`, exit 0) — GATE 05/05 holds on the merged artifact.
+
+---
+
+## Step 05e — ci-agent: GATE 05/05 final verification (post-merge main, tagged artifact)
+
+Status: **PASS** — the full battery is green on the tagged artifact with zero
+skips. Precondition met: `GATE 05/04: PASS` (recorded in step 04b). No product
+code touched by this step; no CI config changed either (nothing needed fixing).
+
+### What ran
+
+Tree: `main` @ `a68143e` — the docs commit on top of squash-merge `51dbfa9`
+(tag `sprint/05-mayor-loop`). Working tree clean except the three known
+untracked non-change-set items (`assets/`, the session-export html,
+`roadmap/.runner-state.json`), left untouched.
+
+`TMPDIR=/var/hamlet/tmp HAMLET_PODMAN_TESTS=1 ./scripts/ci-local.sh`
+— log: `logs/ci-gate-postmerge.log`, exit 0 (`CI battery: PASS`).
+Host shape: podman 6.1.3 rootless, dock uid 1000, subuid range 65536 ids,
+btrfs work area (17.3 GiB free at the 5a audit) — the guarded battery ran
+**directly** through `guarded-entry.sh` (no delegation, no skips).
+
+### Gate battery
+
+| # | Check | Result | Notes |
+|---|---|---|---|
+| 1 | `cargo fmt --all --check` | **PASS** | clean |
+| 2 | `cargo clippy --workspace --all-targets -- -D warnings` | **PASS** | clean |
+| 3 | `cargo test --workspace` | **PASS** | 785 tests ok across all targets; core lib 160/160 (decree + packet goldens = ADR-0026/0027); `guard_acceptance` 15/15 — SKIP-not-panic holds without e2e-06's env (step-05b red stays closed) |
+| 4 | `scripts/check-deps.sh` | **PASS** | allowlist intact |
+| 5a | village-tree disk policy | **PASS** | survey at 17.3 GiB free; 14 pre-existing stranded trees enumerated, floor met |
+| 5 | guarded podman battery | **PASS — all seven suites ran**: podman 1, bootstrap 5 (QA04-32), provision 1, escape 2, freight 1, supervise 1, manor 3 — 14 tests, zero skips; QA05-02 probe executed LIVE (direct write EACCES as expected on this host shape; bytes arrive through the unshare seam) |
+| 6 | `scripts/e2e-01-safename-compile-fail.sh` | **PASS** | type-enforced boundary |
+| 7 | `scripts/e2e-01-topology-state.sh` | **PASS** | T1–T8 |
+| 8 | `scripts/e2e-02-isolation.sh` | **PASS** | T1–T4 incl. the `-RP` ratchets and the guarded escape suite on real podman |
+| 9 | `scripts/e2e-03-adversarial.sh` | **PASS** | T1–T4 |
+| 10 | `scripts/e2e-04-comms.sh` | **PASS** | T1–T3, guarded freight green |
+| 11 | `scripts/e2e-05-mayor-adversarial.sh` | **PASS** | T1 = 17/17 attack tests + all T2 ratchets + **T3 manor provision smoke on real podman** (UID-1000-only decree authorship; QA05-02 probe LIVE) |
+| 12 | `scripts/e2e-06-guard-mutations.sh` | **PASS** | mutation grading ran on the clean tree — the step-05d refusal is gone. The one `test result: FAILED (14 passed; 1 failed)` line in the log is a **killed mutation** (the acceptance suite went RED against an injected change, as designed) and was reverted: `git status` clean afterwards |
+| 13 | `scripts/e2e-07-ci-abort.sh` | **PASS** | T1–T3 abort regressions |
+
+### CI05-01 freshness (stale-binary discipline)
+
+Verified for this run: step 3 rebuilt every test target from the committed
+tree **before** step 5 ran (the `escape_guarded` binary used by the battery was
+built at 15:45, inside this battery; the e2e-phase rebuilds all post-date
+step 5). Row 5 is therefore a real read of this tree, not a stale-binary
+vacuous PASS. The entry-point build gate itself remains owed (carry-forward).
+
+### ADR / provisioning verification (sprint-prompt items)
+
+- **ADR-0011 (host-permission model) matches implementation — YES.**
+  cl. 1: `--user <uid>` on every run argv, no `--userns` flag
+  (`podman.rs:586–588`; run-argv golden pinned); cl. 2: per-UID ownership via
+  `podman unshare chown <uid>:<gid> -- <paths…>` with the recursive form
+  pinned to `-RP`, never a dereference flag (`podman.rs:891`;
+  `hostperm.rs:389`; e2e-02 T2 ratchets green this run); cl. 3: the host mode
+  table as constants (`hostperm.rs:29–58`) — the freight row is amended by
+  **ADR-0021 cl. 4** to `0o1770` (amendment recorded there; code matches the
+  amended value); cl. 4: daemon writes into subuid-owned trees through
+  `Runtime::unshare_write_atomic` (`podman.rs:1473/1797`) — exercised LIVE by
+  the QA05-02 probe in `manor_guarded` this run.
+- **Per the renumber note, "ADR-0011" also = ADR-0026/0027** (decree protocol,
+  context packet): core goldens 160/160 green in row 3 — decree vocabulary +
+  replay algebra and the packet schema/caps all verified.
+- **`defaults/MAYOR.md` ships and is referenced by provisioning — YES.**
+  Committed in `51dbfa9` (mode 644, 5.6 K); embedded via `include_str!` as
+  `MAYOR_MD_TEMPLATE` (`mayor.rs:102`) and seeded into the manor home by
+  `seed_mayor_md` inside `ManorProvisioner::provision`
+  (`mayor.rs:378`, `416–427`) with adopt-once semantics; the golden pins its
+  header, and the T3 manor smoke provisions it in a real container this run.
+
+### Observations (CI-side; no product defects)
+
+- **Orphaned guarded artifact removed.** Container `hamlet-boot-a-r1939730`
+  had been Up 21 h with no owning process (leaked by an earlier aborted run —
+  its rollback did not finish). Removed (`SIGKILL` after the SIGTERM timeout);
+  its tree (`.tmpCf3Uom`) was reclaimed in the sweep below. This is the QA05-09
+  rule made concrete: hand-run guarded work bypasses `guarded-entry.sh`'s lock
+  and can leak; the battery's own rollbacks cleaned up everything this run
+  created.
+- **Disk hygiene after the gate.** A fully green battery still strands trees:
+  49 total under `/var/hamlet/tmp` after the run (~14 pre-existing + ~35 from
+  this run, ~9 GB net) — same accumulation step 06 measured. Ran
+  `scripts/village-reclaim.sh --reclaim`: free space **8.3 G → 39 G**;
+  two 32 K residuals remain (one `hamlet`-owned, `.tmpyEhz0K`, owner-only:
+  `sudo -H -u hamlet podman unshare rm -rf <tree>` — negligible).
+- **Carry-forward (CI):** the 5a policy audits *before* each gate and reclaims
+  only on abort; post-run reclaim is still operator action. If the work area
+  keeps shrinking, add an automatic `--reclaim` step after the battery in
+  `ci.sh` — a CI-config change this role may make, proposed rather than made
+  here so the gated tree stays untouched.
+- **CI05-01** (entry-point build gate) remains the standing carry-forward,
+  unchanged; its hazard did not materialize this run (freshness verified above).
+
+### Verdict
+
+**`GATE 05/05: PASS`** — all fourteen rows green on the tagged artifact
+(`main` @ `a68143e`, tag `sprint/05-mayor-loop`), zero skips, exit 0; the
+guarded container battery ran for real (14 tests incl. the manor provision
+smoke and the QA05-02 unshare-write probe LIVE); ADR-0011 (incl. the
+ADR-0021 freight amendment) matches the implementation and `defaults/MAYOR.md`
+ships and is provisioned. Sprint 05 is verified end-to-end on the merged
+artifact; nothing outstanding blocks the tag.
