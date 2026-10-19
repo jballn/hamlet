@@ -23,7 +23,8 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use hamlet_core::charter::{Charter, CommissionStatus};
+use hamlet_core::charter::Charter;
+use hamlet_core::commission::CommissionRecord;
 use hamlet_core::config::{Config, WebhookRoute};
 use hamlet_core::dispatch::{
     file_name, InboxResponse, Method, OutboxRequest, Outcome, RetryPolicy, UrlAllowlist,
@@ -71,7 +72,7 @@ fn mail_fixture(tweak: impl FnOnce(&mut Config)) -> MailFixture {
     let mut charter = Charter::empty();
     charter
         .commissions
-        .insert(COMMISSION, CommissionStatus::Open);
+        .insert(COMMISSION, CommissionRecord::draft(name("commission")));
     charter.reserve_mayor(name("mayor")).unwrap();
     assert_eq!(
         charter
@@ -553,7 +554,7 @@ fn kill_restart_zero_duplicates_across_two_restarts() {
     let mut charter = Charter::empty();
     charter
         .commissions
-        .insert(COMMISSION, CommissionStatus::Open);
+        .insert(COMMISSION, CommissionRecord::draft(name("commission")));
     charter.reserve_mayor(name("mayor")).unwrap();
     assert_eq!(
         charter
@@ -788,7 +789,7 @@ async fn downtime_files_recovered_after_restart() {
     let mut charter = Charter::empty();
     charter
         .commissions
-        .insert(COMMISSION, CommissionStatus::Open);
+        .insert(COMMISSION, CommissionRecord::draft(name("commission")));
     charter.reserve_mayor(name("mayor")).unwrap();
     assert_eq!(
         charter
@@ -1047,7 +1048,7 @@ async fn freight_symlink_escape_and_promotion_read_strict_acl() {
     let mut charter = Charter::empty();
     charter
         .commissions
-        .insert(COMMISSION, CommissionStatus::Open);
+        .insert(COMMISSION, CommissionRecord::draft(name("commission")));
     charter.reserve_mayor(name("mayor")).unwrap();
     assert_eq!(
         charter
@@ -1213,7 +1214,7 @@ fn dispatch_fixture(tweak: impl FnOnce(&mut Config)) -> DispatchFixture {
     let mut charter = Charter::empty();
     charter
         .commissions
-        .insert(COMMISSION, CommissionStatus::Open);
+        .insert(COMMISSION, CommissionRecord::draft(name("commission")));
     charter.reserve_mayor(name("mayor")).unwrap();
     assert_eq!(
         charter
@@ -1645,7 +1646,7 @@ fn web_fixture(tweak: impl FnOnce(&mut Config)) -> WebFixture {
     let mut charter = Charter::empty();
     charter
         .commissions
-        .insert(COMMISSION, CommissionStatus::Open);
+        .insert(COMMISSION, CommissionRecord::draft(name("commission")));
     charter.reserve_mayor(name("mayor")).unwrap();
     assert_eq!(
         charter

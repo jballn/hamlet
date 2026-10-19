@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 hamlet-core = { workspace = true }
+hamlet-daemon = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

@@ -1,0 +1,9 @@
+hamlet commission new: commission2 (beta)
+  id:            2
+  slug:          beta
+  state:         draft
+  ledger:        guild/ledger/commission2
+  git:           guild/ledger/commission2/git (bare, HEAD -> refs/heads/main)
+  brief:         guild/ledger/commission2/COMMISSION.md
+  seed:          2 file(s) imported on main
+  mayor wake:    commission_created

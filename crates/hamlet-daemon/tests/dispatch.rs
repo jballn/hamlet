@@ -17,7 +17,8 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use hamlet_core::charter::{Charter, CommissionStatus};
+use hamlet_core::charter::Charter;
+use hamlet_core::commission::CommissionRecord;
 use hamlet_core::config::Config;
 use hamlet_core::dispatch::{
     file_name, InboxResponse, Method, OutboxRequest, Outcome, DISPATCH_VERSION,
@@ -118,7 +119,7 @@ fn fixture(tweak: impl FnOnce(&mut Config)) -> Fixture {
     let mut charter = Charter::empty();
     charter
         .commissions
-        .insert(COMMISSION, CommissionStatus::Open);
+        .insert(COMMISSION, CommissionRecord::draft(name("commission")));
     charter.reserve_mayor(name("mayor")).unwrap();
     assert_eq!(
         charter

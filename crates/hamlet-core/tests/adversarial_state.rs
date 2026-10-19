@@ -17,7 +17,8 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
-use hamlet_core::charter::{Charter, CharterError, CommissionStatus, ParcelLease};
+use hamlet_core::charter::{Charter, CharterError, ParcelLease};
+use hamlet_core::commission::CommissionRecord;
 use hamlet_core::sanitize::{sanitize_name, SafeName};
 use hamlet_core::slots::{self, SlotError, SlotRecord, SlotStatus, AGENT_SLOT_CAPACITY, MAYOR_UID};
 use hamlet_core::tree::HamletTree;
@@ -462,7 +463,9 @@ fn hibernated_and_crashed_slots_are_never_reused() {
 fn double_allocation_is_idempotent_not_duplicated() {
     let mut charter = Charter::empty();
     let first = charter.allocate_slot(name("ada"), Some(7)).unwrap();
-    charter.commissions.insert(7, CommissionStatus::Open);
+    charter
+        .commissions
+        .insert(7, CommissionRecord::draft(name("commission")));
     let before = charter.slots.clone();
 
     let again = charter.allocate_slot(name("ada"), Some(999)).unwrap();
@@ -605,7 +608,8 @@ fn full_cycle_restart_from_disk_only_is_identical() {
     c1.reserve_mayor(name("manor")).unwrap();
     let ada = c1.allocate_slot(name("ada"), Some(1)).unwrap();
     let grace = c1.allocate_slot(name("grace"), None).unwrap();
-    c1.commissions.insert(1, CommissionStatus::Open);
+    c1.commissions
+        .insert(1, CommissionRecord::draft(name("commission")));
     c1.parcels.insert(
         ada,
         ParcelLease {
@@ -673,7 +677,8 @@ fn identical_operations_produce_identical_bytes() {
                 .unwrap();
         }
         for i in 0..3 {
-            c.commissions.insert(i, CommissionStatus::Open);
+            c.commissions
+                .insert(i, CommissionRecord::draft(name("commission")));
         }
         slots::hibernate(&mut c.slots, 1010).unwrap();
         c.render()

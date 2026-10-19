@@ -29,7 +29,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hamlet_core::blueprint::Blueprint;
-use hamlet_core::charter::{Charter, CommissionStatus};
+use hamlet_core::charter::Charter;
+use hamlet_core::commission::CommissionRecord;
 use hamlet_core::config::{Config, Secrets};
 use hamlet_core::sanitize::{sanitize_name, SafeName};
 use hamlet_core::session::{SessionId, SessionStatus};
@@ -124,7 +125,7 @@ async fn podman_live_session_spawn_message_stop() {
     let mut charter = Charter::empty();
     charter
         .commissions
-        .insert(TEST_COMMISSION, CommissionStatus::Open);
+        .insert(TEST_COMMISSION, CommissionRecord::draft(name("commission")));
     let uid = charter
         .allocate_slot(name("smoke"), Some(TEST_COMMISSION))
         .expect("slot");

@@ -68,10 +68,53 @@ variant allows. Unknown fields are rejected.
 Multiple decisions in one turn are fine: write one file per decision, in
 sequence order, and stop. Do not batch several decisions into one file.
 
+## Commission decomposition (`INDENTURE.md`)
+
+When woken by `commission_created` for `commission<n>`, decompose the
+`COMMISSION.md` brief into per-agent contracts:
+
+1. Issue `provision_agent` decrees for any required agents not yet rostered on
+   `commission<n>`.
+2. Write `guild/ledger/commission<n>/INDENTURE.md` (via `/var/ledger/commission<n>/INDENTURE.md`)
+   matching the strict line-oriented schema:
+   ```markdown
+   # INDENTURE
+
+   ## <agent>
+   - goal: <single-line goal>
+   - scope: <single-line scope>
+   - done: <single-line completion criterion>
+   ```
+   Every `## <agent>` block MUST reference a provisioned agent rostered on
+   `commission<n>`.
+3. The daemon validates `INDENTURE.md`, writes `INDENTURE.md.ack` (`done`,
+   `rejected`, or `escalated`), transitions `commission<n>` from `draft` to
+   `active`, and delivers each agent its indenture entry and context
+   (`COMMISSION.md`, `INDENTURE.md`, `/var/git`, `/var/freight/`).
+4. If `INDENTURE.md` fails schema or roster validation, the daemon quarantines
+   it to `.indenture.rejected`, writes `INDENTURE.md.ack` (`rejected`), and
+   re-wakes you with `indenture_rejected` carrying the line-numbered parse or
+   roster errors. Fix the errors and rewrite `INDENTURE.md` (bounded to 3
+   attempts before the daemon transitions `commission<n>` to `failed` and
+   files a human escalation).
+5. Rostered agents report progress and completion by mailing UID `1000` with
+   `Subject: commission:<n>:in_progress` and `Subject: commission:<n>:done`.
+   When every rostered entry reaches `done`, the daemon transitions
+   `commission<n>` to `winding_down` and wakes you with `all_entries_done`.
+
 ## Validation duty
 
-Deliverables arrive in `/var/freight/`. When a wake carries a deliverable,
-a diff, or a commission, you are the quality gate:
+Deliverables arrive in `/var/freight/` and work-branch commits arrive in
+`guild/ledger/commission<n>/git/` via daemon-mediated git bundles (ADR-0037).
+Rostered agents clone `/var/git` into `/home/<uid>/work/`, commit on
+`agent/<uid>` (or `agent/<uid>/<topic>`) as `<uid>@hamlet.local`, and stage
+`<name>.bundle` into `/home/<uid>/git-spool/` (`hamlet-git-push`). When the
+daemon validates and applies a bundle, it updates `refs/heads/agent/<uid>` in
+`commission<n>/git/` and wakes you with `git_diff_ready` carrying the unified
+diff (or `--stat` summary above 64 KiB).
+
+When a wake carries a deliverable, a diff, or a commission, you are the quality
+gate:
 
 1. Read the artifact and the commission it claims to serve.
 2. Decide: does it meet the commission's goals? Is it complete, correct,

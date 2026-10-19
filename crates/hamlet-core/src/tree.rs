@@ -234,6 +234,13 @@ impl HamletTree {
         self.join(&[GUILD, BLUEPRINTS, &format!("{name}.toml")])
     }
 
+    /// `guild/blueprints/<name>.v<version>.toml` — one immutable environment
+    /// snapshot version (SPEC §9.4).
+    #[must_use]
+    pub fn guild_blueprint_version(&self, name: &SafeName, version: u32) -> PathBuf {
+        self.join(&[GUILD, BLUEPRINTS, &format!("{name}.v{version}.toml")])
+    }
+
     /// `guild/register/<name>.md` — the immutable agent brief for `name`
     /// (SPEC §5). Provisioning seeds `parcel<uid>/PROPRIETOR.md` from it;
     /// runtime mutations are recorded in the parcel, never here.
@@ -270,6 +277,13 @@ impl HamletTree {
     #[must_use]
     pub fn commission_indenture(&self, n: u64) -> PathBuf {
         self.commission(n).join("INDENTURE.md")
+    }
+
+    /// `guild/ledger/commission<n>/INDENTURE.md.ack` — daemon validation ack
+    /// for `INDENTURE.md` (SPEC §9.2; ADR-0026 cl. 5).
+    #[must_use]
+    pub fn commission_indenture_ack(&self, n: u64) -> PathBuf {
+        self.commission(n).join("INDENTURE.md.ack")
     }
 
     // --- tavern ----------------------------------------------------------
@@ -489,6 +503,22 @@ impl HamletTree {
         self.join(&[KEEP, VAULT])
     }
 
+    /// `keep/vault/<commission_slug>/` — vault directory for one commission's promoted deliverables.
+    #[must_use]
+    pub fn keep_vault_commission(&self, commission_slug: &SafeName) -> PathBuf {
+        self.join(&[KEEP, VAULT, commission_slug.as_str()])
+    }
+
+    /// `keep/vault/<commission_slug>/<artifact>` — one promoted artifact under its commission.
+    #[must_use]
+    pub fn vault_commission_artifact(
+        &self,
+        commission_slug: &SafeName,
+        artifact: &SafeName,
+    ) -> PathBuf {
+        self.join(&[KEEP, VAULT, commission_slug.as_str(), artifact.as_str()])
+    }
+
     /// `keep/vault/<artifact>` — one promoted artifact (file or dir).
     /// Lazy: promotion is daemon-performed only (SPEC §11.3).
     #[must_use]
@@ -500,6 +530,12 @@ impl HamletTree {
     #[must_use]
     pub fn keep_archives(&self) -> PathBuf {
         self.join(&[KEEP, ARCHIVES])
+    }
+
+    /// `keep/archives/commission<n>/` — commission-specific archives.
+    #[must_use]
+    pub fn keep_archives_commission(&self, commission: u64) -> PathBuf {
+        self.join(&[KEEP, ARCHIVES, &format!("commission{commission}")])
     }
 
     /// `keep/census/` — active working subtask directories.
@@ -537,6 +573,29 @@ impl HamletTree {
     #[must_use]
     pub fn parcel_proprietor(&self, uid: u32) -> PathBuf {
         self.parcel(uid).join("PROPRIETOR.md")
+    }
+
+    /// `…/parcel<uid>/home/git-spool/` — the push-mediation spool (ADR-0037):
+    /// agents stage `.bundle` files here (agent-visible as `/home/<uid>/git-spool/`);
+    /// the daemon is the only validator/applier.
+    #[must_use]
+    pub fn parcel_git_spool(&self, uid: u32) -> PathBuf {
+        self.parcel_home(uid).join("git-spool")
+    }
+
+    /// `keep/census/archives/git/<commission>/<uid>/` — daemon-owned archive of
+    /// accepted git bundles for a commission and agent slot (ADR-0037 cl. 6).
+    /// Lazy: created on first accepted bundle, never by `ensure`.
+    #[must_use]
+    pub fn census_git_archive(&self, commission: u64, uid: u32) -> PathBuf {
+        self.join(&[
+            KEEP,
+            CENSUS,
+            ARCHIVES,
+            "git",
+            &commission.to_string(),
+            &uid.to_string(),
+        ])
     }
 
     /// `keep/census/manor/` — the Mayor's lease environment.
@@ -810,6 +869,18 @@ mod tests {
             PathBuf::from("/v/.hamlet/keep/vault/report.md")
         );
         assert_eq!(
+            tree.keep_vault_commission(&name("alpha")),
+            PathBuf::from("/v/.hamlet/keep/vault/alpha")
+        );
+        assert_eq!(
+            tree.vault_commission_artifact(&name("alpha"), &name("report.md")),
+            PathBuf::from("/v/.hamlet/keep/vault/alpha/report.md")
+        );
+        assert_eq!(
+            tree.keep_archives_commission(1),
+            PathBuf::from("/v/.hamlet/keep/archives/commission1")
+        );
+        assert_eq!(
             tree.parcel(1042),
             PathBuf::from("/v/.hamlet/keep/census/parcel1042")
         );
@@ -828,6 +899,14 @@ mod tests {
         assert_eq!(
             tree.parcel_proprietor(1042),
             PathBuf::from("/v/.hamlet/keep/census/parcel1042/PROPRIETOR.md")
+        );
+        assert_eq!(
+            tree.parcel_git_spool(1042),
+            PathBuf::from("/v/.hamlet/keep/census/parcel1042/home/git-spool")
+        );
+        assert_eq!(
+            tree.census_git_archive(7, 1042),
+            PathBuf::from("/v/.hamlet/keep/census/archives/git/7/1042")
         );
         assert_eq!(
             tree.manor_mayor_md(),

@@ -1088,9 +1088,10 @@ async fn the_charter_projection_carries_no_secret_material() {
     // credential: the projection must carry it verbatim (it is identity) but
     // never anything from the secret surface.
     let mut charter = Charter::load(&v.tree.charter()).unwrap();
-    charter
-        .commissions
-        .insert(1, hamlet_core::charter::CommissionStatus::Open);
+    charter.commissions.insert(
+        1,
+        hamlet_core::commission::CommissionRecord::draft(name("commission")),
+    );
     charter.allocate_slot(name("scribe"), Some(1)).unwrap();
     charter.save_atomic(&v.tree.charter()).unwrap();
 
@@ -1439,9 +1440,10 @@ async fn crash_mid_provision_leaves_no_duplicate_slot_or_parcel() {
     fs::copy(&blueprint_src, &bp).unwrap();
     // An open commission 1 for the decree to point at.
     let mut charter = Charter::load(&v.tree.charter()).unwrap();
-    charter
-        .commissions
-        .insert(1, hamlet_core::charter::CommissionStatus::Open);
+    charter.commissions.insert(
+        1,
+        hamlet_core::commission::CommissionRecord::draft(name("commission")),
+    );
     charter.save_atomic(&v.tree.charter()).unwrap();
 
     let crashed = Arc::new(AtomicBool::new(true));

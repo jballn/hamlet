@@ -38,7 +38,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use hamlet_core::charter::{Charter, CharterError, CommissionStatus};
+use hamlet_core::charter::{Charter, CharterError};
 use hamlet_core::freight::{
     audit as audit_listing, parse_getfacl, AclGrant, AuditPolicy, Qualifier, Violation,
     ViolationKind,
@@ -470,13 +470,52 @@ impl FreightGuard {
         for (uid, slot) in &charter.slots {
             owners.insert(*uid);
             let open = match slot.commission {
-                Some(commission) => {
-                    charter.commissions.get(&commission) == Some(&CommissionStatus::Open)
-                }
+                Some(commission) => charter.commissions.get(&commission).is_some_and(|record| {
+                    record.state().is_live()
+                        && (record.roster.is_empty() || record.roster.contains(uid))
+                }),
                 None => false,
             };
             if *uid == MAYOR_UID || open {
                 grantees.insert(*uid);
+            }
+        }
+        Ok(AuditPolicy { owners, grantees })
+    }
+
+    /// Commission-scoped freight ACL policy (SPEC §4, ADR-0036 cl. 2):
+    /// `owners` = every charter slot; `grantees` = Mayor (`1000`) plus UIDs
+    /// rostered on `commission` while `commission` is live (`Draft`/`Active`).
+    ///
+    /// # Errors
+    ///
+    /// [`FreightError::Charter`] when `charter.json` fails to load or
+    /// `commission` is not registered.
+    pub fn policy_for_commission(&self, commission: u64) -> Result<AuditPolicy, FreightError> {
+        let charter = self.charter()?;
+        let record = charter.commissions.get(&commission).ok_or_else(|| {
+            FreightError::Charter(CharterError::Commission {
+                message: format!("commission {commission} does not exist"),
+            })
+        })?;
+        let owners: BTreeSet<u32> = charter.slots.keys().copied().collect();
+        let mut grantees = BTreeSet::new();
+        if charter.slots.contains_key(&MAYOR_UID) {
+            grantees.insert(MAYOR_UID);
+        }
+        if record.state().is_live() {
+            if record.roster.is_empty() {
+                for (&uid, slot) in &charter.slots {
+                    if uid != MAYOR_UID && slot.commission == Some(commission) {
+                        grantees.insert(uid);
+                    }
+                }
+            } else {
+                for &uid in &record.roster {
+                    if charter.slots.contains_key(&uid) {
+                        grantees.insert(uid);
+                    }
+                }
             }
         }
         Ok(AuditPolicy { owners, grantees })

@@ -15,7 +15,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use hamlet_core::charter::{Charter, CommissionStatus};
+use hamlet_core::charter::Charter;
+use hamlet_core::commission::CommissionRecord;
 use hamlet_core::config::Config;
 use hamlet_core::freight::ViolationKind;
 use hamlet_core::sanitize::{sanitize_name, SafeName};
@@ -63,8 +64,10 @@ fn fixture() -> Fixture {
     let mut charter = Charter::empty();
     charter
         .commissions
-        .insert(COMMISSION, CommissionStatus::Open);
-    charter.commissions.insert(CLOSED, CommissionStatus::Closed);
+        .insert(COMMISSION, CommissionRecord::draft(name("commission")));
+    charter
+        .commissions
+        .insert(CLOSED, CommissionRecord::migrated(CLOSED, true));
     charter.reserve_mayor(name("mayor")).unwrap();
     assert_eq!(
         charter

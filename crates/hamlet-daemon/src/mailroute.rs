@@ -282,6 +282,11 @@ pub struct MailRouter {
     /// `None` means no Mayor is wired, and UID-1000 mail keeps the normal
     /// queue path so it is never lost.
     mayor_mail: Mutex<Option<Arc<dyn MayorMail>>>,
+    /// Optional guild ledger hook (`SPEC §9.3`): when installed, indenture
+    /// status notice mails (`Subject: commission:<n>:done` / `in_progress`)
+    /// addressed to [`MAYOR_UID`] advance the sender's charter entry and fire
+    /// `AllEntriesDone` once all entries on `commission<n>` complete.
+    ledger: Mutex<Option<Arc<crate::ledger::Ledger>>>,
 }
 
 impl MailRouter {
@@ -295,15 +300,41 @@ impl MailRouter {
             tmp_serial: AtomicU64::new(0),
             hints: Mutex::new(None),
             mayor_mail: Mutex::new(None),
+            ledger: Mutex::new(None),
         }
     }
 
     /// Install the Mayor-mail hook (SPEC §7). The Mayor plane calls this at
     /// wiring time; without it, mail to UID 1000 falls back to the delivery
     /// queue (never dropped, just not a wake).
-    pub fn with_mayor_mail(mut self, hook: Arc<dyn MayorMail>) -> Self {
-        self.mayor_mail = Mutex::new(Some(hook));
+    #[must_use]
+    pub fn with_mayor_mail(self, hook: Arc<dyn MayorMail>) -> Self {
+        *self.mayor_mail.lock().unwrap_or_else(|e| e.into_inner()) = Some(hook);
         self
+    }
+
+    /// Attach a [`crate::ledger::Ledger`] so agent indenture completion
+    /// notices (`Subject: commission:<n>:done`) addressed to [`MAYOR_UID`]
+    /// advance the sender's charter entry (`SPEC §9.3`).
+    #[must_use]
+    pub fn with_ledger(self, ledger: Arc<crate::ledger::Ledger>) -> Self {
+        self.set_ledger(ledger);
+        self
+    }
+
+    /// Attach a [`crate::ledger::Ledger`] on a shared [`MailRouter`] reference.
+    pub fn set_ledger(&self, ledger: Arc<crate::ledger::Ledger>) {
+        *self.ledger.lock().unwrap_or_else(|e| e.into_inner()) = Some(ledger);
+    }
+
+    /// True when the background watcher/handler loop (`spawn_mail_plane`) is
+    /// attached to this router.
+    #[must_use]
+    pub fn has_handler(&self) -> bool {
+        self.hints
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
     }
 
     /// The village tree this router reads/writes.
@@ -448,6 +479,46 @@ impl MailRouter {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         if uid == MAYOR_UID {
+            if let MailSender::Uid(sender_uid) = mail.header.from {
+                let ledger_hook = self
+                    .ledger
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                if let Some(ledger) = ledger_hook {
+                    if let Ok(Some(commission)) = ledger.handle_deliverable_notice(
+                        sender_uid,
+                        &mail.header.subject,
+                        &mail.body,
+                    ) {
+                        self.ack(recipient, file)?;
+                        self.trace(
+                            agent,
+                            "mail-deliverable-submitted",
+                            format!(
+                                "{} → commission {commission} uid {sender_uid}",
+                                file.as_str()
+                            ),
+                        );
+                        return Ok(RouteOutcome::WokenMayor { uid });
+                    }
+                    if let Ok(Some((commission, status, all_done))) =
+                        ledger.handle_entry_notice(sender_uid, &mail.header.subject)
+                    {
+                        self.ack(recipient, file)?;
+                        self.trace(
+                            agent,
+                            "mail-indenture-notice",
+                            format!(
+                                "{} → commission {commission} uid {sender_uid} status {} (all_done={all_done})",
+                                file.as_str(),
+                                status.as_str()
+                            ),
+                        );
+                        return Ok(RouteOutcome::WokenMayor { uid });
+                    }
+                }
+            }
             if let Some(hook) = mayor_hook {
                 let spool = self
                     .tree

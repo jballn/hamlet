@@ -1,0 +1,14 @@
+commission: commission1 (alpha)
+  id:         1
+  slug:       alpha
+  state:      draft
+  roster:     none
+  ledger:     guild/ledger/commission1
+  git:        guild/ledger/commission1/git (HEAD -> refs/heads/main, main: unborn)
+  brief:      guild/ledger/commission1/COMMISSION.md (present)
+  indenture:  guild/ledger/commission1/INDENTURE.md (absent)
+
+--- COMMISSION.md ---
+# Commission 1 — Alpha
+
+Build the northern watchtower.

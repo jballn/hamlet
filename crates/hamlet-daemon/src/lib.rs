@@ -26,6 +26,7 @@
 //! | [`census`] | parcel provisioning (02); hibernation, awakening | §10 | 02/07 |
 //! | [`decrees`] | decree interpretation: validate → replay-check → execute → ack | §7 | 05 |
 //! | [`telemetry`] | sled metrics sink (never orchestration state) | §11.2 | 01 |
+//! | [`promote`] | DEED alteration validation → blueprint evolution | §5, §9.4 | 06 |
 
 pub mod bootstrap;
 pub mod census;
@@ -39,7 +40,9 @@ pub mod mailroute;
 pub mod mayor;
 pub mod metrics;
 pub mod podman;
+pub mod promote;
 pub mod supervise;
 pub mod telemetry;
+pub mod vault;
 pub mod watch;
 pub mod web;

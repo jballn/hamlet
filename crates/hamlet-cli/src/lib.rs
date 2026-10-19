@@ -6,4 +6,6 @@
 //! `main.rs` is intentionally hand-rolled until then (clap is dev-allowlist
 //! only).
 
+pub mod commission;
 pub mod init;
+pub mod vault;

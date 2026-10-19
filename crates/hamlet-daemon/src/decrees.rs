@@ -506,7 +506,13 @@ impl CensusAgentProvisioner {
             .map_err(|e| {
                 DecreeRefusal::execution_failed(format!("seeded PROPRIETOR unreadable: {e}"))
             })?;
-        let brief = format!("{register}\n--- PROPRIETOR SEEDS (parcel{uid}) ---\n{proprietor}");
+        let addendum = crate::ledger::agent_commission_brief_addendum(
+            request.commission,
+            uid,
+            &request.identity,
+        );
+        let brief =
+            format!("{register}\n--- PROPRIETOR SEEDS (parcel{uid}) ---\n{proprietor}{addendum}");
         let parcel = self
             .supervisor
             .parcel_ref(uid)
@@ -788,6 +794,10 @@ pub struct DecreeExecutor {
     /// (`manor/home/`) from inside the daemon's own userns (ADR-0011 cl. 4,
     /// QA05-02). Absent in unit tests that never touch a 0700 manor home.
     runtime: Mutex<Option<Arc<dyn crate::podman::Runtime>>>,
+    /// Optional guild ledger governor (`SPEC §9.2`): when installed, every
+    /// decree pass reconciles any `guild/ledger/commission<n>/INDENTURE.md`
+    /// after `provision_agent` decrees have run.
+    ledger: Mutex<Option<Arc<crate::ledger::Ledger>>>,
     charter_lock: Mutex<()>,
     /// Serializes whole passes (`scan`); charter writes have their own
     /// short lock.
@@ -825,6 +835,7 @@ impl DecreeExecutor {
             promotion: Mutex::new(Arc::new(DeferredPromotion::new())),
             telemetry: None,
             runtime: Mutex::new(None),
+            ledger: Mutex::new(None),
             charter_lock: Mutex::new(()),
             exec_lock: tokio::sync::Mutex::new(()),
             torn: Mutex::new(BTreeMap::new()),
@@ -875,6 +886,20 @@ impl DecreeExecutor {
     pub fn with_runtime(mut self, runtime: Arc<dyn crate::podman::Runtime>) -> Self {
         self.runtime = Mutex::new(Some(runtime));
         self
+    }
+
+    /// Attach a [`crate::ledger::Ledger`] so `INDENTURE.md` files written
+    /// during a Mayor decomposition turn are validated and delivered right
+    /// after `provision_agent` decrees execute (`SPEC §9.2`).
+    #[must_use]
+    pub fn with_ledger(self, ledger: Arc<crate::ledger::Ledger>) -> Self {
+        self.set_ledger(ledger);
+        self
+    }
+
+    /// Attach a [`crate::ledger::Ledger`] on a shared [`DecreeExecutor`] reference.
+    pub fn set_ledger(&self, ledger: Arc<crate::ledger::Ledger>) {
+        *self.ledger.lock().unwrap_or_else(|e| e.into_inner()) = Some(ledger);
     }
 
     /// The village tree.
@@ -965,6 +990,18 @@ impl DecreeExecutor {
         {
             let mut torn = self.lock_torn();
             torn.retain(|name, _| names.contains(name));
+        }
+        if first_error.is_none() && report.parse_deferred() == 0 {
+            let ledger = self
+                .ledger
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some(ledger) = ledger {
+                if let Err(e) = ledger.reconcile_indentures() {
+                    self.trace("indenture-reconcile-error", e.to_string());
+                }
+            }
         }
         match first_error {
             Some(e) => Err(e),
@@ -1337,9 +1374,28 @@ impl DecreeExecutor {
                 commission, uid, ..
             } => {
                 self.require_agent_slot(&charter, *uid)?;
-                if !charter.commissions.contains_key(commission) {
+                let Some(record) = charter.commissions.get(commission) else {
                     return Err(DecreeRefusal::invalid_target(format!(
                         "commission {commission} is not in the charter ledger"
+                    )));
+                };
+                if !record.state().is_live() {
+                    return Err(DecreeRefusal::invalid_target(format!(
+                        "commission {commission} is not live (state: {})",
+                        record.state().kind_name()
+                    )));
+                }
+                let rostered = if record.roster.is_empty() {
+                    charter
+                        .slots
+                        .get(uid)
+                        .is_some_and(|slot| slot.commission == Some(*commission))
+                } else {
+                    record.roster.contains(uid)
+                };
+                if !rostered {
+                    return Err(DecreeRefusal::invalid_target(format!(
+                        "uid {uid} is not rostered to commission {commission}"
                     )));
                 }
                 Ok(())
@@ -1507,6 +1563,22 @@ impl DecreeExecutor {
                         .clone();
                     provisioner.provision(request).await?
                 };
+                if let Err(e) = self.update_charter(|charter| {
+                    if charter
+                        .commissions
+                        .get(commission)
+                        .is_some_and(|r| r.state().is_live())
+                        && charter.slots.contains_key(&outcome.uid)
+                    {
+                        let _ = charter.assign_uid(*commission, outcome.uid);
+                    }
+                    Ok(())
+                }) {
+                    self.trace(
+                        "decree-roster-write-failed",
+                        format!("commission {commission} uid {}: {e}", outcome.uid),
+                    );
+                }
                 self.trace(
                     "decree-provisioned",
                     format!(

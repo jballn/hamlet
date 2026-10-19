@@ -172,6 +172,71 @@ impl ToolSpec {
     pub fn version_spec(&self) -> Option<&str> {
         self.version_spec.as_deref()
     }
+
+    /// Construct a validated tool entry — the promotion upsert's only build
+    /// path (ADR-0038 cl. 2); same vocabulary as [`from_toml`]'s validation.
+    ///
+    /// # Errors
+    ///
+    /// [`BlueprintError::InvalidToolName`] / [`BlueprintError::InvalidVersionSpec`].
+    pub(crate) fn new(
+        kind: ToolKind,
+        name: String,
+        version_spec: Option<String>,
+    ) -> Result<Self, BlueprintError> {
+        if name.len() > MAX_TOOL_NAME_LEN || !tool_name_re().is_match(&name) {
+            return Err(BlueprintError::InvalidToolName {
+                path: "tools.name".into(),
+                value: name,
+            });
+        }
+        let version_spec = match version_spec {
+            None => None,
+            Some(spec) => {
+                if spec.len() > MAX_VERSION_SPEC_LEN || !version_spec_re().is_match(&spec) {
+                    return Err(BlueprintError::InvalidVersionSpec {
+                        path: "tools.version_spec".into(),
+                        value: spec,
+                    });
+                }
+                Some(spec)
+            }
+        };
+        Ok(Self {
+            kind,
+            name,
+            version_spec,
+        })
+    }
+
+    /// A copy with a replaced version spec (promotion upsert, ADR-0038 cl. 2);
+    /// immutability holds — the original value is untouched.
+    ///
+    /// # Errors
+    ///
+    /// [`BlueprintError::InvalidVersionSpec`] when the new spec fails validation.
+    pub(crate) fn with_version_spec(
+        &self,
+        version_spec: Option<String>,
+    ) -> Result<Self, BlueprintError> {
+        let version_spec = match version_spec {
+            None => None,
+            Some(spec) => {
+                if spec.len() > MAX_VERSION_SPEC_LEN || !version_spec_re().is_match(&spec) {
+                    return Err(BlueprintError::InvalidVersionSpec {
+                        path: "tools.version_spec".into(),
+                        value: spec,
+                    });
+                }
+                Some(spec)
+            }
+        };
+        Ok(Self {
+            kind: self.kind,
+            name: self.name.clone(),
+            version_spec,
+        })
+    }
 }
 
 /// `[meta]` block: identity + base image of the environment.
@@ -200,6 +265,18 @@ impl BlueprintMeta {
     pub fn base_image(&self) -> &str {
         &self.base_image
     }
+
+    /// The same meta with `version + 1` — the promotion bump (ADR-0038 cl. 2);
+    /// `None` at `u32::MAX` (callers raise [`BlueprintError::VersionOverflow`]).
+    #[must_use]
+    pub(crate) fn bumped_version(&self) -> Option<Self> {
+        let version = self.version.checked_add(1)?;
+        Some(Self {
+            name: self.name.clone(),
+            version,
+            base_image: self.base_image.clone(),
+        })
+    }
 }
 
 /// Typed validation failure with the exact offending field path.
@@ -222,6 +299,9 @@ pub enum BlueprintError {
     InvalidVersionSpec { path: String, value: String },
     /// Two `[[tools]]` entries share the same (kind, name).
     DuplicateTool { path: String, name: String },
+    /// Promotion cannot bump `meta.version` — already at `u32::MAX`
+    /// (ADR-0038 cl. 2).
+    VersionOverflow { path: String },
     /// `[env]` key is not a valid environment identifier.
     InvalidEnvKey { path: String, value: String },
     /// `[env]` key looks like a secret carrier — secrets belong in `.env`
@@ -247,6 +327,7 @@ impl BlueprintError {
             | Self::InvalidToolName { path, .. }
             | Self::InvalidVersionSpec { path, .. }
             | Self::DuplicateTool { path, .. }
+            | Self::VersionOverflow { path }
             | Self::InvalidEnvKey { path, .. }
             | Self::ForbiddenEnvKey { path, .. }
             | Self::InvalidEnvValue { path }
@@ -275,6 +356,12 @@ impl fmt::Display for BlueprintError {
                 write!(f, "{path}: invalid version spec {value:?}")
             }
             Self::DuplicateTool { path, name } => write!(f, "{path}: duplicate tool {name:?}"),
+            Self::VersionOverflow { path } => {
+                write!(
+                    f,
+                    "{path}: version overflow; the blueprint is at its maximum content version"
+                )
+            }
             Self::InvalidEnvKey { path, value } => {
                 write!(f, "{path}: invalid environment identifier {value:?}")
             }
@@ -406,6 +493,69 @@ impl Blueprint {
     #[must_use]
     pub fn skills(&self) -> &[SafeName] {
         &self.skills
+    }
+
+    /// Internal assembly (ADR-0038 cl. 2): the promotion upsert builds a
+    /// fresh immutable value; every part arrives already validated by its
+    /// own constructor, so this never re-checks.
+    pub(crate) fn assemble(
+        meta: BlueprintMeta,
+        tools: Vec<ToolSpec>,
+        env: BTreeMap<String, String>,
+        skills: Vec<SafeName>,
+    ) -> Self {
+        Self {
+            meta,
+            tools,
+            env,
+            skills,
+        }
+    }
+
+    /// Render this blueprint to canonical TOML text with an optional
+    /// header/provenance comment block.
+    #[must_use]
+    pub fn render_toml(&self, provenance: Option<&str>) -> String {
+        let mut out = String::new();
+        if let Some(comment) = provenance {
+            for line in comment.lines() {
+                if !line.starts_with('#') {
+                    out.push_str("# ");
+                }
+                out.push_str(line);
+                out.push('\n');
+            }
+            out.push('\n');
+        }
+        out.push_str("[meta]\n");
+        out.push_str(&format!("name = \"{}\"\n", self.meta.name()));
+        out.push_str(&format!("version = {}\n", self.meta.version()));
+        out.push_str(&format!("base_image = \"{}\"\n", self.meta.base_image()));
+
+        for tool in &self.tools {
+            out.push_str("\n[[tools]]\n");
+            out.push_str(&format!("kind = \"{}\"\n", tool.kind().as_str()));
+            out.push_str(&format!("name = \"{}\"\n", tool.name()));
+            if let Some(spec) = tool.version_spec() {
+                out.push_str(&format!("version_spec = \"{spec}\"\n"));
+            }
+        }
+
+        if !self.env.is_empty() {
+            out.push_str("\n[env]\n");
+            for (k, v) in &self.env {
+                out.push_str(&format!("{k} = \"{v}\"\n"));
+            }
+        }
+
+        out.push_str("\n[skills]\nrefs = [");
+        if !self.skills.is_empty() {
+            let refs: Vec<String> = self.skills.iter().map(|s| format!("\"{s}\"")).collect();
+            out.push_str(&refs.join(", "));
+        }
+        out.push_str("]\n");
+
+        out
     }
 }
 
@@ -771,5 +921,14 @@ refs = ["code-review", "pdf-tools"]
         let v2 = parse(&MINIMAL.replace("version = 1", "version = 2")).unwrap();
         assert_ne!(v1, v2, "a promoted blueprint is a distinct value");
         assert_eq!(v1.meta().version(), 1, "the old value is untouched");
+    }
+
+    #[test]
+    fn render_toml_round_trips_identically() {
+        let bp = Blueprint::default_village_alpine().unwrap();
+        let rendered = bp.render_toml(Some("Provenance: test header\nCommission 1"));
+        let parsed = Blueprint::from_toml(&rendered).unwrap();
+        assert_eq!(parsed, bp);
+        assert!(rendered.starts_with("# Provenance: test header\n# Commission 1\n\n[meta]\n"));
     }
 }

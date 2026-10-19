@@ -16,6 +16,7 @@
 //! | `guild/ledger/commission<n>/INDENTURE.md` | Created/Modified | [`Reaction::DecreeWrite`] | Sprint 05 |
 //! | `courier/dispatch/outbox/<f>.json` | Created | [`Reaction::DispatchOutbox`] | daemon `dispatch` (Sprint 04) |
 //! | `courier/freight/<name>/` (dir) | Created | [`Reaction::FreightDir`] | daemon `freight` (Sprint 04) |
+//! | `keep/census/parcel<uid>/home/git-spool/<name>.bundle` (file) | Created | [`Reaction::GitBundle`] | Sprint 06 (ADR-0037 push mediation) |
 //! | anything else / hidden components | any | [`Reaction::Ignored`] | — |
 //!
 //! Hidden (dot-prefixed) components anywhere in the path make an event
@@ -133,6 +134,14 @@ pub enum Reaction {
         /// Directory name under `courier/freight/`.
         name: SafeName,
     },
+    /// A bundle candidate appeared in an agent's git spool — push
+    /// mediation (ADR-0037): the daemon validates, applies, or refuses it.
+    GitBundle {
+        /// Spool owner UID.
+        uid: u32,
+        /// The `.bundle` file name (validated by `gitmed::is_bundle_name`).
+        name: String,
+    },
 }
 
 /// Classify one debounced event against the ADR-0019 cl. 5 table. Pure.
@@ -170,6 +179,20 @@ pub fn classify(event: &FsEvent) -> Reaction {
             match sanitize_name(name) {
                 Ok(name) => Reaction::FreightDir { name },
                 Err(_) => Reaction::Ignored,
+            }
+        }
+        // keep/census/parcel<uid>/home/git-spool/<name>.bundle — push
+        // mediation (ADR-0037): only Created files with a bundle-candidate
+        // name react; everything else in the spool is invisible.
+        ["keep", "census", parcel, "home", "git-spool", name]
+            if event.action == FsAction::Created && !event.is_dir =>
+        {
+            match parcel_uid(parcel) {
+                Some(uid) if crate::gitmed::is_bundle_name(name) => Reaction::GitBundle {
+                    uid,
+                    name: name.to_string(),
+                },
+                _ => Reaction::Ignored,
             }
         }
         // keep/census/parcel<uid>/DEED.md
@@ -431,6 +454,36 @@ mod tests {
             classify(&ev(
                 FsAction::Removed,
                 "keep/census/parcel1042/DEED.md",
+                false
+            )),
+            Reaction::Ignored
+        );
+
+        // git spool bundles (Sprint 06 / ADR-0037)
+        assert_eq!(
+            classify(&ev(
+                FsAction::Created,
+                "keep/census/parcel1042/home/git-spool/push.bundle",
+                false
+            )),
+            Reaction::GitBundle {
+                uid: 1042,
+                name: "push.bundle".into(),
+            }
+        );
+        // non-bundle files and removals in the spool are invisible
+        assert_eq!(
+            classify(&ev(
+                FsAction::Created,
+                "keep/census/parcel1042/home/git-spool/notes.txt",
+                false
+            )),
+            Reaction::Ignored
+        );
+        assert_eq!(
+            classify(&ev(
+                FsAction::Removed,
+                "keep/census/parcel1042/home/git-spool/push.bundle",
                 false
             )),
             Reaction::Ignored

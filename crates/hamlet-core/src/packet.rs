@@ -27,7 +27,8 @@ use std::fmt;
 
 use serde::Serialize;
 
-use crate::charter::{Charter, CommissionStatus, DecreeStatus};
+use crate::charter::{Charter, DecreeStatus};
+use crate::commission::CommissionRecord;
 use crate::decree::{DecreeId, TreeRelPath};
 use crate::freight::ViolationKind;
 use crate::mail::MailSender;
@@ -63,12 +64,20 @@ pub enum WakeReason {
     DecreeAckTimeout,
     /// A new `commission<n>/` appeared (SPEC §9.1).
     CommissionCreated,
+    /// An `INDENTURE.md` posted by the Mayor failed schema or roster
+    /// validation (SPEC §9.2; ADR-0036 cl. 2).
+    IndentureRejected,
+    /// Every rostered agent on `commission<n>` reported its indenture entry
+    /// done (`Active -> WindingDown`, SPEC §9.3).
+    AllEntriesDone,
     /// A commission work branch advanced and a diff is ready to evaluate
     /// (SPEC §7 validation loop).
     GitDiffReady,
     /// An agent session crashed in a way the restart policy cannot absorb
     /// (or every crash, under `mayor.crash_wake: every` — ADR-0029 cl. 2).
     SessionCrashed,
+    /// A deliverable was submitted for commission promotion review (SPEC §7, §9.4).
+    DeliverableSubmitted,
 }
 
 impl WakeReason {
@@ -81,8 +90,11 @@ impl WakeReason {
             Self::FreightViolation => "freight_violation",
             Self::DecreeAckTimeout => "decree_ack_timeout",
             Self::CommissionCreated => "commission_created",
+            Self::IndentureRejected => "indenture_rejected",
+            Self::AllEntriesDone => "all_entries_done",
             Self::GitDiffReady => "git_diff_ready",
             Self::SessionCrashed => "session_crashed",
+            Self::DeliverableSubmitted => "deliverable_submitted",
         }
     }
 }
@@ -137,6 +149,19 @@ pub enum EventKind {
         /// Ledger index (`commission<n>`, n ≥ 1).
         commission: u64,
     },
+    /// An `INDENTURE.md` posted by the Mayor failed validation (SPEC §9.2).
+    IndentureRejected {
+        /// Ledger index (`commission<n>`, n ≥ 1).
+        commission: u64,
+        /// 1-based validation failure attempt counter.
+        attempt: u32,
+    },
+    /// Every rostered agent on `commission<n>` reported its indenture entry
+    /// done (`Active -> WindingDown`, SPEC §9.3).
+    AllEntriesDone {
+        /// Ledger index (`commission<n>`, n ≥ 1).
+        commission: u64,
+    },
     /// A work branch advanced; the body carries the unified diff.
     GitDiffReady {
         /// Ledger index.
@@ -161,6 +186,15 @@ pub enum EventKind {
         /// not revive the agent (the `TITLE.md` lineage stamp of a dead
         /// parcel).
         permanent: bool,
+    },
+    /// A finished product was submitted to `/var/freight/` for promotion review (SPEC §7, §9.4).
+    DeliverableSubmitted {
+        /// Ledger index (`commission<n>`).
+        commission: u64,
+        /// Submitting agent UID.
+        uid: u32,
+        /// Freight path reference when known.
+        path: Option<String>,
     },
     /// Several events that share one wake reason, merged into the single
     /// evaluation they deserve (ADR-0028 cl. 2). The packet still carries
@@ -195,8 +229,11 @@ impl EventKind {
             Self::FreightViolation { .. } => WakeReason::FreightViolation,
             Self::DecreeAckTimeout { .. } => WakeReason::DecreeAckTimeout,
             Self::CommissionCreated { .. } => WakeReason::CommissionCreated,
+            Self::IndentureRejected { .. } => WakeReason::IndentureRejected,
+            Self::AllEntriesDone { .. } => WakeReason::AllEntriesDone,
             Self::GitDiffReady { .. } => WakeReason::GitDiffReady,
             Self::SessionCrashed { .. } => WakeReason::SessionCrashed,
+            Self::DeliverableSubmitted { .. } => WakeReason::DeliverableSubmitted,
             Self::MergedBatch { reason, .. } => *reason,
         }
     }
@@ -248,8 +285,15 @@ impl EventKind {
                 lines.push(format!("decree_id: {decree_id}"));
                 lines.push(format!("waited_ms: {waited_ms}"));
             }
-            Self::CommissionCreated { commission } => {
+            Self::CommissionCreated { commission } | Self::AllEntriesDone { commission } => {
                 lines.push(format!("commission: {commission}"));
+            }
+            Self::IndentureRejected {
+                commission,
+                attempt,
+            } => {
+                lines.push(format!("commission: {commission}"));
+                lines.push(format!("attempt: {attempt}"));
             }
             Self::GitDiffReady {
                 commission,
@@ -273,6 +317,17 @@ impl EventKind {
                     "permanent: {permanent}",
                     permanent = if *permanent { "yes" } else { "no" }
                 ));
+            }
+            Self::DeliverableSubmitted {
+                commission,
+                uid,
+                path,
+            } => {
+                lines.push(format!("commission: {commission}"));
+                lines.push(format!("uid: {uid}"));
+                if let Some(p) = path {
+                    lines.push(format!("path: {p}"));
+                }
             }
             Self::MergedBatch { reason, members } => {
                 lines.push(format!("merged: {}", members.len()));
@@ -417,8 +472,8 @@ pub struct StateGrid {
     pub next_decree_seq: u64,
     /// Decrees still queued (`Queued`); terminal ones are history.
     pub open_decrees: BTreeMap<u64, DecreeStatus>,
-    /// Commission index → status.
-    pub commissions: BTreeMap<u64, CommissionStatus>,
+    /// Commission ledger id → lifecycle record (ADR-0036 cl. 2).
+    pub commissions: BTreeMap<u64, CommissionRecord>,
     /// UID → parcel lease row.
     pub parcels: BTreeMap<u32, ParcelRow>,
     /// UID → supervised session row.
@@ -694,8 +749,12 @@ mod tests {
         charter.reserve_mayor(name("manor")).unwrap();
         let ada = charter.allocate_slot(name("ada"), Some(1)).unwrap();
         let grace = charter.allocate_slot(name("grace"), None).unwrap();
-        charter.commissions.insert(1, CommissionStatus::Open);
-        charter.commissions.insert(2, CommissionStatus::Closed);
+        charter
+            .commissions
+            .insert(1, CommissionRecord::draft(name("ledger")));
+        charter
+            .commissions
+            .insert(2, CommissionRecord::migrated(2, true));
         charter.agents.insert(name("ada"), AgentRef { slot: ada });
         charter.parcels.insert(
             ada,
@@ -749,10 +808,22 @@ mod tests {
         let grid = StateGrid::from_charter(&sample_charter());
         let expected = "\
 {
-  \"charter_version\": 3,
+  \"charter_version\": 4,
   \"commissions\": {
-    \"1\": \"open\",
-    \"2\": \"closed\"
+    \"1\": {
+      \"deliverable_in_review\": false,
+      \"indenture_entries\": {},
+      \"roster\": [],
+      \"slug\": \"ledger\",
+      \"state\": \"draft\"
+    },
+    \"2\": {
+      \"deliverable_in_review\": false,
+      \"indenture_entries\": {},
+      \"roster\": [],
+      \"slug\": \"commission-2\",
+      \"state\": \"closed\"
+    }
   },
   \"next_decree_seq\": 3,
   \"open_decrees\": {
@@ -802,7 +873,7 @@ mod tests {
             StateGrid::from_charter(&Charter::empty()).render(),
             "\
 {
-  \"charter_version\": 3,
+  \"charter_version\": 4,
   \"commissions\": {},
   \"next_decree_seq\": 1,
   \"open_decrees\": {},
@@ -835,10 +906,22 @@ You are the executive. Emit decrees as files.
 
 --- CHARTER STATE GRID ---
 {
-  \"charter_version\": 3,
+  \"charter_version\": 4,
   \"commissions\": {
-    \"1\": \"open\",
-    \"2\": \"closed\"
+    \"1\": {
+      \"deliverable_in_review\": false,
+      \"indenture_entries\": {},
+      \"roster\": [],
+      \"slug\": \"ledger\",
+      \"state\": \"draft\"
+    },
+    \"2\": {
+      \"deliverable_in_review\": false,
+      \"indenture_entries\": {},
+      \"roster\": [],
+      \"slug\": \"commission-2\",
+      \"state\": \"closed\"
+    }
   },
   \"next_decree_seq\": 3,
   \"open_decrees\": {
@@ -966,6 +1049,19 @@ emission: one turn, one decision — write decree files only, never podman or ho
                 vec!["kind: commission_created", "commission: 4"],
             ),
             (
+                EventKind::IndentureRejected {
+                    commission: 4,
+                    attempt: 2,
+                },
+                WakeReason::IndentureRejected,
+                vec!["kind: indenture_rejected", "commission: 4", "attempt: 2"],
+            ),
+            (
+                EventKind::AllEntriesDone { commission: 4 },
+                WakeReason::AllEntriesDone,
+                vec!["kind: all_entries_done", "commission: 4"],
+            ),
+            (
                 EventKind::GitDiffReady {
                     commission: 3,
                     base: name("main"),
@@ -993,6 +1089,20 @@ emission: one turn, one decision — write decree files only, never podman or ho
                     "session: 1042.3",
                     "restarts: 5",
                     "permanent: yes",
+                ],
+            ),
+            (
+                EventKind::DeliverableSubmitted {
+                    commission: 5,
+                    uid: 1001,
+                    path: Some("courier/freight/worker1001/final.tar.gz".to_owned()),
+                },
+                WakeReason::DeliverableSubmitted,
+                vec![
+                    "kind: deliverable_submitted",
+                    "commission: 5",
+                    "uid: 1001",
+                    "path: courier/freight/worker1001/final.tar.gz",
                 ],
             ),
         ];

@@ -1,0 +1,3 @@
+ID  SLUG   STATE  ROSTER  BRIEF  INDENTURE  GIT
+1   alpha  draft  -       yes    no         bare
+2   beta   draft  -       yes    no         bare

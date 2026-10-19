@@ -15,7 +15,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use hamlet_core::charter::{Charter, CommissionStatus};
+use hamlet_core::charter::Charter;
+use hamlet_core::commission::CommissionRecord;
 use hamlet_core::config::{Config, WebhookRoute};
 use hamlet_core::dispatch::{InboxResponse, Outcome};
 use hamlet_core::mail::is_incoming;
@@ -79,7 +80,7 @@ fn fixture(tweak: impl FnOnce(&mut Config)) -> Fixture {
     let mut charter = Charter::empty();
     charter
         .commissions
-        .insert(COMMISSION, CommissionStatus::Open);
+        .insert(COMMISSION, CommissionRecord::draft(name("commission")));
     charter.reserve_mayor(name("mayor")).unwrap();
     assert_eq!(
         charter

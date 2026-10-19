@@ -1,0 +1,14 @@
+commission: commission2 (beta)
+  id:         2
+  slug:       beta
+  state:      draft
+  roster:     none
+  ledger:     guild/ledger/commission2
+  git:        guild/ledger/commission2/git (HEAD -> refs/heads/main, main: seeded)
+  brief:      guild/ledger/commission2/COMMISSION.md (present)
+  indenture:  guild/ledger/commission2/INDENTURE.md (absent)
+
+--- COMMISSION.md ---
+# Commission 2 — Beta
+
+Extend the seeded repository.

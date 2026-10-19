@@ -17,7 +17,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use hamlet_core::blueprint::Blueprint;
-use hamlet_core::charter::{Charter, CommissionStatus, ParcelLease};
+use hamlet_core::charter::{Charter, ParcelLease};
+use hamlet_core::commission::CommissionState;
 use hamlet_core::config::Config;
 use hamlet_core::pins::ToolchainPins;
 use hamlet_core::sanitize::{sanitize_name, SafeName};
@@ -180,7 +181,7 @@ async fn provision_happy_path_records_lease_and_hardens_host() {
     assert_eq!(charter.slots[&uid].identity, name("scribe"));
     assert_eq!(charter.slots[&uid].commission, Some(7));
     assert_eq!(charter.parcels[&uid], lease);
-    assert_eq!(charter.commissions[&7], CommissionStatus::Open);
+    assert_eq!(charter.commissions[&7].state(), CommissionState::Draft);
     assert_eq!(charter.agents[&name("scribe")].slot, uid);
 
     // --- podman call sequence (all through the pure builders) --------------

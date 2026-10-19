@@ -55,7 +55,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use hamlet_core::blueprint::Blueprint;
-use hamlet_core::charter::{AgentRef, Charter, CharterError, CommissionStatus, ParcelLease};
+use hamlet_core::charter::{AgentRef, Charter, CharterError, ParcelLease};
 use hamlet_core::config::Config;
 use hamlet_core::sanitize::{sanitize_name, SafeName};
 use hamlet_core::slots::SlotError;
@@ -582,13 +582,23 @@ impl Provisioner {
         // in-container as the slot uid — never from the host side.
         let target = BootstrapTarget::new(identity.clone(), uid)?;
         let bootstrap = bootstrapper.bootstrap_home(&target, blueprint).await?;
+        crate::ledger::seed_agent_git_home(self.runtime.as_ref(), identity, uid).await?;
 
         // --- step 6: record the lease (atomic; last, so disk never sees a
         // lease whose container failed or whose home failed to bootstrap) ---
+        // Legacy auto-registration (ADR-0036 cl. 2): idempotent Draft record.
         charter
+            .ensure_commission(commission)
+            .map_err(ProvisionError::Charter)?;
+        if charter
             .commissions
-            .entry(commission)
-            .or_insert(CommissionStatus::Open);
+            .get(&commission)
+            .is_some_and(|r| r.state().is_live())
+        {
+            charter
+                .assign_uid(commission, uid)
+                .map_err(ProvisionError::Charter)?;
+        }
         charter
             .agents
             .entry(identity.clone())

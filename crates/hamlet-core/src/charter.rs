@@ -9,7 +9,8 @@
 //!
 //! **Normative content groups** (SPEC §11.1; later sprints extend
 //! additively): [`slots`](crate::slots) (uid → identity record), `agents`
-//! (registry refs), `commissions` (id → state placeholder), `parcels` (uid
+//! (registry refs), `commissions` (id → [`CommissionRecord`](crate::commission::CommissionRecord),
+//! charter v4, ADR-0036), `parcels` (uid
 //! lease records), `sessions` (uid → supervised session record, charter v2,
 //! ADR-0015), `decrees` (decree sequence → queue status) + `decree_receipts`
 //! (decree sequence → admitted content digest, charter v3, ADR-0026),
@@ -37,6 +38,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::commission::{CommissionEvent, CommissionRecord, IndentureEntryStatus};
 use crate::sanitize::SafeName;
 use crate::session::{SessionId, SessionRecord};
 use crate::slots::{self, SlotError, SlotTable, FIRST_AGENT_UID, LAST_AGENT_UID, MAYOR_UID};
@@ -51,8 +53,12 @@ use crate::slots::{self, SlotError, SlotTable, FIRST_AGENT_UID, LAST_AGENT_UID, 
 /// `decree_receipts` group — the content digest each admitted decree id was
 /// recorded with, so replaying an id with different content is *refused*
 /// rather than silently dropped. `decrees` (id → status) is untouched, so
-/// v2 files still load.
-pub const CHARTER_VERSION: u32 = 3;
+/// v2 files still load. v3 → v4 (Sprint 06, ADR-0036 cl. 2): the
+/// `commissions` value type retypes from the 2-state placeholder string to
+/// [`CommissionRecord`](crate::commission::CommissionRecord); the legacy
+/// string carries exactly two bits and maps bijectively at parse time
+/// (`open` → draft, `closed` → closed), so v3 files still load.
+pub const CHARTER_VERSION: u32 = 4;
 
 /// Master state map — the typed form of `.hamlet/charter.json`.
 ///
@@ -78,10 +84,12 @@ pub struct Charter {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub agents: BTreeMap<SafeName, AgentRef>,
 
-    /// Commission states: ledger id → lifecycle placeholder. Sprint 06 owns
-    /// the full state machine (SPEC §9); v1 records open/closed only.
+    /// Commission states: ledger id → lifecycle record (SPEC §9; ADR-0036).
+    /// The state machine, roster, indenture entries, and review flag live in
+    /// the record; the repo path derives from the ledger id via
+    /// `tree::commission_git(n)` and is deliberately not stored.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub commissions: BTreeMap<u64, CommissionStatus>,
+    pub commissions: BTreeMap<u64, CommissionRecord>,
 
     /// Parcel lease records (`keep/census/parcel<uid>/`): uid → lease.
     /// `stasis` marks a patron whose home is parked under
@@ -121,17 +129,6 @@ pub struct Charter {
 pub struct AgentRef {
     /// The permanent UID slot this registered agent identity runs under.
     pub slot: u32,
-}
-
-/// Commission lifecycle placeholder (sprint 06 replaces with the full
-/// SPEC §9 state machine, additively).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CommissionStatus {
-    /// Commission is open (created through converging).
-    Open,
-    /// Commission closed (DEED/vault promotions complete, INDENTURE.md written).
-    Closed,
 }
 
 /// Parcel lease record (SPEC §10 census tenant).
@@ -202,6 +199,13 @@ pub enum CharterError {
         /// What is inconsistent.
         message: String,
     },
+    /// A commission lifecycle operation refused by the state machine
+    /// (ADR-0036) — typed at [`crate::commission::CommissionError`], carried
+    /// here as a message to keep one error channel for charter ops.
+    Commission {
+        /// What was refused and why.
+        message: String,
+    },
 }
 
 impl fmt::Display for CharterError {
@@ -222,6 +226,9 @@ impl fmt::Display for CharterError {
                 "charter_version {found} is not supported by this build (max {supported}); refusing to guess"
             ),
             Self::Invariant { message } => write!(f, "charter invariant violated: {message}"),
+            Self::Commission { message } => {
+                write!(f, "commission operation refused: {message}")
+            }
         }
     }
 }
@@ -231,6 +238,14 @@ impl std::error::Error for CharterError {
         match self {
             Self::Io { source, .. } => Some(source),
             _ => None,
+        }
+    }
+}
+
+impl From<crate::commission::CommissionError> for CharterError {
+    fn from(error: crate::commission::CommissionError) -> Self {
+        Self::Commission {
+            message: error.to_string(),
         }
     }
 }
@@ -520,6 +535,153 @@ impl Charter {
         slots::allocate(&mut self.slots, identity, commission)
     }
 
+    // --- commission lifecycle (SPEC §9; ADR-0036) -------------------------
+
+    /// The next commission ledger id: 1-based, `max(existing) + 1`.
+    #[must_use]
+    pub fn next_commission_id(&self) -> u64 {
+        self.commissions.keys().max().map_or(1, |m| m + 1)
+    }
+
+    /// Create a new commission in `Draft` (SPEC §9.1). The slug must be
+    /// unique across commissions; the ledger id is allocated by this
+    /// aggregate.
+    ///
+    /// # Errors
+    ///
+    /// [`CharterError::Commission`] when the slug is already taken.
+    pub fn create_commission(&mut self, slug: SafeName) -> Result<u64> {
+        let taken = self
+            .commissions
+            .iter()
+            .find(|(_, record)| record.slug == slug);
+        if let Some((n, _)) = taken {
+            return Err(CharterError::Commission {
+                message: format!("slug '{}' already used by commission {n}", slug.as_str()),
+            });
+        }
+        let n = self.next_commission_id();
+        self.commissions.insert(n, CommissionRecord::draft(slug));
+        Ok(n)
+    }
+
+    /// Legacy auto-registration (ADR-0036 cl. 2): idempotently ensure a
+    /// `Draft` record exists for ledger id `n`, slugged `commission-{n}`.
+    /// A present record — in any state — is left untouched.
+    ///
+    /// # Errors
+    ///
+    /// [`CharterError::Commission`] for non-1-based ids.
+    pub fn ensure_commission(&mut self, n: u64) -> Result<()> {
+        if n < 1 {
+            return Err(CharterError::Commission {
+                message: "commission ids are 1-based".into(),
+            });
+        }
+        self.commissions
+            .entry(n)
+            .or_insert_with(|| CommissionRecord::migrated(n, false));
+        Ok(())
+    }
+
+    /// Roster a slot uid to commission `n` (draft/active only), mirroring
+    /// the binding into the slot table.
+    ///
+    /// # Errors
+    ///
+    /// [`CharterError::Commission`] — unknown commission, missing slot,
+    /// slot already bound elsewhere, or roster frozen.
+    pub fn assign_uid(&mut self, n: u64, uid: u32) -> Result<()> {
+        let Some(slot) = self.slots.get(&uid) else {
+            return Err(CharterError::Commission {
+                message: format!("uid {uid} has no slot record"),
+            });
+        };
+        if let Some(other) = slot.commission {
+            if other != n {
+                return Err(CharterError::Commission {
+                    message: format!("slot {uid} already serves commission {other}"),
+                });
+            }
+        }
+        let record = self
+            .commissions
+            .get_mut(&n)
+            .ok_or_else(|| CharterError::Commission {
+                message: format!("commission {n} does not exist"),
+            })?;
+        record.assign_uid(uid).map_err(commission_refusal)?;
+        if let Some(slot) = self.slots.get_mut(&uid) {
+            slot.commission = Some(n);
+        }
+        Ok(())
+    }
+
+    /// Unroster a slot uid from commission `n` (draft/active only), clearing
+    /// the slot's commission binding.
+    ///
+    /// # Errors
+    ///
+    /// [`CharterError::Commission`] — unknown commission, uid not rostered,
+    /// or roster frozen.
+    pub fn release_uid(&mut self, n: u64, uid: u32) -> Result<()> {
+        let record = self
+            .commissions
+            .get_mut(&n)
+            .ok_or_else(|| CharterError::Commission {
+                message: format!("commission {n} does not exist"),
+            })?;
+        if !record.roster.contains(&uid) {
+            return Err(CharterError::Commission {
+                message: format!("uid {uid} is not rostered to commission {n}"),
+            });
+        }
+        record.release_uid(uid).map_err(commission_refusal)?;
+        if let Some(slot) = self.slots.get_mut(&uid) {
+            slot.commission = None;
+        }
+        Ok(())
+    }
+
+    /// Apply an addressable commission event (the typed transition table,
+    /// ADR-0036 cl. 1). The only path a commission's state changes after
+    /// creation.
+    ///
+    /// # Errors
+    ///
+    /// [`CharterError::Commission`] — unknown commission or refused
+    /// `(state, event)` pair / precondition.
+    pub fn apply_commission_event(&mut self, n: u64, event: &CommissionEvent) -> Result<()> {
+        let record = self
+            .commissions
+            .get_mut(&n)
+            .ok_or_else(|| CharterError::Commission {
+                message: format!("commission {n} does not exist"),
+            })?;
+        record.apply_event(event).map_err(commission_refusal)
+    }
+
+    /// Move one indenture entry forward (active only; ADR-0036 cl. 1).
+    ///
+    /// # Errors
+    ///
+    /// [`CharterError::Commission`] — unknown commission, unknown entry,
+    /// backwards move, or wrong state.
+    pub fn mark_indenture_entry(
+        &mut self,
+        n: u64,
+        uid: u32,
+        status: IndentureEntryStatus,
+    ) -> Result<()> {
+        let record = self
+            .commissions
+            .get_mut(&n)
+            .ok_or_else(|| CharterError::Commission {
+                message: format!("commission {n} does not exist"),
+            })?;
+        record.mark_entry(uid, status).map_err(commission_refusal)
+    }
+
     /// Validate cross-group invariants (ADR-0004). Run on every load; also
     /// available for daemon-side sanity checks after mutation batches.
     ///
@@ -554,6 +716,29 @@ impl Charter {
                     return Err(invariant(format!(
                         "slot {uid} references unknown commission {commission}"
                     )));
+                }
+            }
+        }
+        // Roster implies binding (ADR-0036 cl. 2): every rostered uid must
+        // hold a slot record bound to this commission.
+        for (&n, record) in &self.commissions {
+            if n < 1 {
+                return Err(invariant(format!("commission id {n} is not 1-based")));
+            }
+            for uid in &record.roster {
+                match self.slots.get(uid) {
+                    Some(slot) if slot.commission == Some(n) => {}
+                    Some(slot) => {
+                        return Err(invariant(format!(
+                            "commission {n} rosters uid {uid} but its slot serves commission {:?}",
+                            slot.commission
+                        )));
+                    }
+                    None => {
+                        return Err(invariant(format!(
+                            "commission {n} rosters missing slot {uid}"
+                        )));
+                    }
                 }
             }
         }
@@ -647,6 +832,14 @@ fn invariant(message: String) -> CharterError {
     CharterError::Invariant { message }
 }
 
+/// Carry a typed commission refusal (ADR-0036) through the charter error
+/// channel; the machine's own vocabulary is preserved in the message.
+fn commission_refusal(error: crate::commission::CommissionError) -> CharterError {
+    CharterError::Commission {
+        message: error.to_string(),
+    }
+}
+
 /// Version gate: reject zero and anything from the future before migration.
 fn gate_version(found: u32) -> Result<()> {
     if found == 0 || found > CHARTER_VERSION {
@@ -675,6 +868,9 @@ fn migrate(charter: Charter) -> Result<Charter> {
     if current.charter_version == 2 {
         current = step_2_to_3(current)?;
     }
+    if current.charter_version == 3 {
+        current = step_3_to_4(current)?;
+    }
     if current.charter_version != CHARTER_VERSION {
         return Err(invariant(format!(
             "no migration step from charter_version {} to {CHARTER_VERSION}",
@@ -701,7 +897,79 @@ fn step_2_to_3(mut charter: Charter) -> Result<Charter> {
     Ok(charter)
 }
 
-/// Unknown-fields-strict wire mirror of [`Charter`] (v3 schema). Public
+/// v3 → v4 (Sprint 06, ADR-0036 cl. 2): the `commissions` value retype.
+/// The wire layer already mapped legacy status strings to records at parse
+/// time (bijective: `open` → draft, `closed` → closed); the step only
+/// stamps the version — never renames, retypes, or drops state a second time.
+fn step_3_to_4(mut charter: Charter) -> Result<Charter> {
+    charter.charter_version = 4;
+    Ok(charter)
+}
+
+/// The two legacy v3 commission statuses, parse-time validated (ADR-0036
+/// cl. 2): any other string is corruption at every version.
+#[derive(Deserialize)]
+enum LegacyCommissionStatus {
+    #[serde(rename = "open")]
+    Open,
+    #[serde(rename = "closed")]
+    Closed,
+}
+
+/// Wire form for one commission value (ADR-0036 cl. 2): the current record
+/// object, or the legacy v3 status string. Implemented via a direct visitor
+/// rather than `#[serde(untagged)]` so `serde_json`'s map-key coercion for
+/// `indenture_entries: BTreeMap<u32, IndentureEntryStatus>` is preserved.
+enum CommissionWire {
+    /// Legacy v3 status (bijective migration source).
+    Legacy(LegacyCommissionStatus),
+    /// Current record object (charter v4+).
+    Record(CommissionRecord),
+}
+
+impl<'de> Deserialize<'de> for CommissionWire {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct CommissionWireVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for CommissionWireVisitor {
+            type Value = CommissionWire;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(
+                    "a commission record object or legacy status string (\"open\" | \"closed\")",
+                )
+            }
+
+            fn visit_str<E>(self, v: &str) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                match v {
+                    "open" => Ok(CommissionWire::Legacy(LegacyCommissionStatus::Open)),
+                    "closed" => Ok(CommissionWire::Legacy(LegacyCommissionStatus::Closed)),
+                    other => Err(E::unknown_variant(other, &["open", "closed"])),
+                }
+            }
+
+            fn visit_map<M>(self, map: M) -> std::result::Result<Self::Value, M::Error>
+            where
+                M: serde::de::MapAccess<'de>,
+            {
+                let record = CommissionRecord::deserialize(
+                    serde::de::value::MapAccessDeserializer::new(map),
+                )?;
+                Ok(CommissionWire::Record(record))
+            }
+        }
+
+        deserializer.deserialize_any(CommissionWireVisitor)
+    }
+}
+
+/// Unknown-fields-strict wire mirror of [`Charter`] (v4 schema). Public
 /// parsing is lenient *only* for documents declaring an older version —
 /// additive migration (CONVENTIONS §3 r3) means a v1 file simply lacks the
 /// newer groups; it must never mean new fields are silently dropped from a
@@ -715,7 +983,7 @@ struct StrictCharter {
     #[serde(default)]
     agents: BTreeMap<SafeName, AgentRef>,
     #[serde(default)]
-    commissions: BTreeMap<u64, CommissionStatus>,
+    commissions: BTreeMap<u64, CommissionWire>,
     #[serde(default)]
     parcels: BTreeMap<u32, ParcelLease>,
     #[serde(default)]
@@ -730,11 +998,28 @@ struct StrictCharter {
 
 impl From<StrictCharter> for Charter {
     fn from(wire: StrictCharter) -> Self {
+        // Legacy v3 status strings map bijectively to records (ADR-0036
+        // cl. 2): `open` → draft (decomposition is a recorded fact),
+        // `closed` → closed, with the deterministic migrated slug.
+        let commissions: BTreeMap<u64, CommissionRecord> = wire
+            .commissions
+            .into_iter()
+            .map(|(n, wire_value)| {
+                let record = match wire_value {
+                    CommissionWire::Legacy(status) => CommissionRecord::migrated(
+                        n,
+                        matches!(status, LegacyCommissionStatus::Closed),
+                    ),
+                    CommissionWire::Record(record) => record,
+                };
+                (n, record)
+            })
+            .collect();
         Self {
             charter_version: wire.charter_version,
             slots: wire.slots,
             agents: wire.agents,
-            commissions: wire.commissions,
+            commissions,
             parcels: wire.parcels,
             sessions: wire.sessions,
             decrees: wire.decrees,
@@ -823,7 +1108,9 @@ mod tests {
         charter.reserve_mayor(name("manor")).unwrap();
         let ada = charter.allocate_slot(name("ada"), Some(1)).unwrap();
         charter.allocate_slot(name("grace"), None).unwrap();
-        charter.commissions.insert(1, CommissionStatus::Open);
+        charter
+            .commissions
+            .insert(1, CommissionRecord::draft(name("ledger")));
         charter.agents.insert(name("ada"), AgentRef { slot: ada });
         charter.parcels.insert(
             ada,
@@ -854,7 +1141,7 @@ mod tests {
     fn empty_charter_render_golden() {
         assert_eq!(
             Charter::empty().render(),
-            "{\n  \"charter_version\": 3\n}\n"
+            "{\n  \"charter_version\": 4\n}\n"
         );
     }
 
@@ -871,7 +1158,7 @@ mod tests {
     /// v1-rendered charter loads as v3 with the empty `sessions` and
     /// `decree_receipts` groups defaulted in; all other state untouched.
     #[test]
-    fn v1_charter_migrates_to_v3_additively() {
+    fn v1_charter_migrates_additively() {
         let v1 = br#"{
   "agents": { "ada": { "slot": 1001 } },
   "charter_version": 1,
@@ -881,7 +1168,7 @@ mod tests {
   }
 }"#;
         let mut charter = Charter::from_bytes(v1).unwrap();
-        assert_eq!(charter.charter_version, 3);
+        assert_eq!(charter.charter_version, CHARTER_VERSION);
         assert!(charter.sessions.is_empty());
         assert!(charter.decree_receipts.is_empty());
         assert_eq!(charter.slots.len(), 2);
@@ -896,7 +1183,7 @@ mod tests {
             },
         );
         let rendered = charter.render();
-        assert!(rendered.contains("\"charter_version\": 3"));
+        assert!(rendered.contains("\"charter_version\": 4"));
         assert_eq!(Charter::from_bytes(rendered.as_bytes()).unwrap(), charter);
     }
 
@@ -906,7 +1193,7 @@ mod tests {
     /// without a receipt is the v2 placeholder shape, which the receipt
     /// invariant refuses) — that refusal is the documented migration edge.
     #[test]
-    fn v2_charter_without_decrees_migrates_to_v3() {
+    fn v2_charter_without_decrees_migrates_additively() {
         let v2 = br#"{
   "charter_version": 2,
   "slots": {
@@ -914,7 +1201,7 @@ mod tests {
   }
 }"#;
         let charter = Charter::from_bytes(v2).unwrap();
-        assert_eq!(charter.charter_version, 3);
+        assert_eq!(charter.charter_version, CHARTER_VERSION);
         assert!(charter.decrees.is_empty());
         assert!(charter.decree_receipts.is_empty());
         // A v2 document that already recorded a decree status is refused
@@ -1115,9 +1402,15 @@ mod tests {
       \"slot\": 1001
     }
   },
-  \"charter_version\": 3,
+  \"charter_version\": 4,
   \"commissions\": {
-    \"1\": \"open\"
+    \"1\": {
+      \"deliverable_in_review\": false,
+      \"indenture_entries\": {},
+      \"roster\": [],
+      \"slug\": \"ledger\",
+      \"state\": \"draft\"
+    }
   },
   \"decree_receipts\": {
     \"1\": \"c0225c3b8fabf543\"
@@ -1206,21 +1499,21 @@ mod tests {
 
     #[test]
     fn future_version_is_rejected_before_migration() {
-        let err = Charter::from_bytes(br#"{"charter_version": 4}"#).unwrap_err();
+        let err = Charter::from_bytes(br#"{"charter_version": 5}"#).unwrap_err();
         assert!(
             matches!(
                 err,
                 CharterError::UnsupportedVersion {
-                    found: 4,
+                    found: 5,
                     supported: CHARTER_VERSION
                 }
             ),
             "{err}"
         );
         let err =
-            Charter::from_bytes(br#"{"charter_version": 4, "brand_new_group": 42}"#).unwrap_err();
+            Charter::from_bytes(br#"{"charter_version": 5, "brand_new_group": 42}"#).unwrap_err();
         assert!(
-            matches!(err, CharterError::UnsupportedVersion { found: 4, .. }),
+            matches!(err, CharterError::UnsupportedVersion { found: 5, .. }),
             "{err}"
         );
         let err = Charter::from_bytes(br#"{"charter_version": 0}"#).unwrap_err();
@@ -1405,5 +1698,28 @@ mod tests {
         // The failed allocation left no partial state behind.
         assert_eq!(charter.slots.len(), AGENT_SLOT_CAPACITY);
         assert!(charter.validate().is_ok());
+    }
+
+    #[test]
+    fn active_commission_with_indenture_entries_roundtrips_json() {
+        let mut charter = Charter::empty();
+        let uid = charter.allocate_slot(name("scribe"), None).unwrap();
+        let cid = charter.create_commission(name("watchtower")).unwrap();
+        charter.assign_uid(cid, uid).unwrap();
+        charter
+            .apply_commission_event(
+                cid,
+                &CommissionEvent::IndenturePosted {
+                    entries: BTreeSet::from([uid]),
+                },
+            )
+            .unwrap();
+        let rendered = charter.render();
+        let reparsed = Charter::from_bytes(rendered.as_bytes()).unwrap();
+        assert_eq!(reparsed, charter);
+        assert_eq!(
+            reparsed.commissions[&cid].state(),
+            crate::commission::CommissionState::Active
+        );
     }
 }

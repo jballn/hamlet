@@ -25,7 +25,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hamlet_core::blueprint::Blueprint;
-use hamlet_core::charter::{Charter, CommissionStatus, DecreeStatus, ParcelLease};
+use hamlet_core::charter::{Charter, DecreeStatus, ParcelLease};
+use hamlet_core::commission::CommissionRecord;
 use hamlet_core::config::Config;
 use hamlet_core::decree::{
     Decree, DecreeAck, DecreeError, DecreeId, EscalationNotice, RejectReason, TreeRelPath,
@@ -557,7 +558,7 @@ fn charter_with_slot(tree: &HamletTree, identity: &SafeName, commission: u64) ->
         .unwrap();
     charter
         .commissions
-        .insert(commission, CommissionStatus::Open);
+        .insert(commission, CommissionRecord::draft(name("commission")));
     charter.save_atomic(&tree.charter()).unwrap();
     uid
 }

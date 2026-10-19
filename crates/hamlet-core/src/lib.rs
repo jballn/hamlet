@@ -41,6 +41,7 @@ pub mod config;
 pub mod decree;
 pub mod dispatch;
 pub mod freight;
+pub mod gitmed;
 pub mod mail;
 pub mod mount;
 pub mod packet;

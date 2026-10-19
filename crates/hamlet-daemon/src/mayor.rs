@@ -725,6 +725,49 @@ impl WakeEvent {
         })
     }
 
+    /// An `INDENTURE.md` posted by the Mayor failed schema or roster
+    /// validation (SPEC §9.2; ADR-0036 cl. 2).
+    ///
+    /// # Errors
+    ///
+    /// [`PacketError`] — cap refusal.
+    pub fn from_indenture_rejected(
+        commission: u64,
+        attempt: u32,
+        errors: impl Into<String>,
+    ) -> Result<Self, MayorError> {
+        Ok(Self {
+            artifact: EventArtifact::new(
+                EventKind::IndentureRejected {
+                    commission,
+                    attempt,
+                },
+                errors,
+            )?,
+            source: WakeSource::new("indenture-rejected", format!("{commission}#{attempt}")),
+        })
+    }
+
+    /// Every rostered agent on `commission<n>` reported its indenture entry
+    /// done (`Active -> WindingDown`, SPEC §9.3).
+    ///
+    /// # Errors
+    ///
+    /// [`MayorError`] — io failure or cap refusal.
+    pub fn from_all_entries_done(tree: &HamletTree, commission: u64) -> Result<Self, MayorError> {
+        let indenture_path = tree.commission_indenture(commission);
+        let body = if indenture_path.is_file() {
+            fs::read_to_string(&indenture_path)
+                .map_err(io_err(format!("read {}", indenture_path.display())))?
+        } else {
+            format!("commission{commission}: all indenture entries reported done\n")
+        };
+        Ok(Self {
+            artifact: EventArtifact::new(EventKind::AllEntriesDone { commission }, body)?,
+            source: WakeSource::new("all-entries-done", commission),
+        })
+    }
+
     /// A work-branch diff ready for the validation loop (SPEC §7).
     ///
     /// # Errors
@@ -746,6 +789,30 @@ impl WakeEvent {
                 diff,
             )?,
             source: WakeSource::new("git", format!("{commission}/{base}/{head}")),
+        })
+    }
+
+    /// A deliverable submitted for commission promotion review (SPEC §7, §9.4).
+    ///
+    /// # Errors
+    ///
+    /// [`MayorError`] — cap refusal.
+    pub fn from_deliverable_submitted(
+        commission: u64,
+        uid: u32,
+        path: Option<&str>,
+        body: impl Into<String>,
+    ) -> Result<Self, MayorError> {
+        Ok(Self {
+            artifact: EventArtifact::new(
+                EventKind::DeliverableSubmitted {
+                    commission,
+                    uid,
+                    path: path.map(str::to_owned),
+                },
+                body,
+            )?,
+            source: WakeSource::new("deliverable-submitted", format!("{commission}/{uid}")),
         })
     }
 

@@ -16,7 +16,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use hamlet_core::charter::{Charter, CommissionStatus};
+use hamlet_core::charter::Charter;
+use hamlet_core::commission::CommissionRecord;
 use hamlet_core::config::{Config, Secrets};
 use hamlet_core::sanitize::{sanitize_name, SafeName};
 use hamlet_core::session::{
@@ -61,7 +62,7 @@ fn fixture(tweak: impl FnOnce(&mut Config)) -> Fixture {
     let mut charter = Charter::empty();
     charter
         .commissions
-        .insert(COMMISSION, CommissionStatus::Open);
+        .insert(COMMISSION, CommissionRecord::draft(name("commission")));
     let uid = charter
         .allocate_slot(name("scribe"), Some(COMMISSION))
         .unwrap();

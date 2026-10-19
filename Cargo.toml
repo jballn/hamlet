@@ -20,6 +20,7 @@ publish = false
 [workspace.dependencies]
 # --- internal (path deps; exempt from the allowlist) ---
 hamlet-core = { path = "crates/hamlet-core" }
+hamlet-daemon = { path = "crates/hamlet-daemon" }
 
 # --- locked stack, SPEC §3 (versions [DEV] within these majors) ---
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs"] }

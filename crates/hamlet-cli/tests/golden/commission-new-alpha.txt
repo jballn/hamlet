@@ -1,0 +1,9 @@
+hamlet commission new: commission1 (alpha)
+  id:            1
+  slug:          alpha
+  state:         draft
+  ledger:        guild/ledger/commission1
+  git:           guild/ledger/commission1/git (bare, HEAD -> refs/heads/main)
+  brief:         guild/ledger/commission1/COMMISSION.md
+  seed:          none (empty bare repository)
+  mayor wake:    commission_created
