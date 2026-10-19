@@ -2362,3 +2362,29 @@ ADR-0012 (derived parcel images & pinned toolchains) and associated Sprint 06 de
 
 `GATE 06/08: PASS`
 
+---
+
+## Step 09 — commit-agent: Commission lifecycle merge & tag
+
+Status: **done**. Precondition `GATE 06/08: PASS` verified.
+
+### Commits (`sprint/06-commission-lifecycle`, in order)
+
+| SHA | Scope | Why |
+| --- | ----- | --- |
+| `beecb4c` | `feat(core)` | Commission state machine, git mediation schema, promotion parsers (ADR-0012, ADR-0036, ADR-0037, ADR-0038; SPEC §9) |
+| `3c4465a` | `feat(daemon,cli)` | Commission creation + bare git repos (SPEC §9.1) |
+| `c443cea` | `feat(daemon)` | INDENTURE decomposition + entry tracking (SPEC §9.2–§9.3) |
+| `0b683f5` | `feat(daemon)` | Git bundle push mediation (SPEC §9, §14; ADR-0037) |
+| `a5143e3` | `feat(daemon)` | DEED dynamic-alterations → blueprint evolution (SPEC §9.4; ADR-0038) |
+| `0be17c0` | `feat(daemon,cli)` | Deliverable vault promotion loop + commission close (SPEC §7, §9, §11.2, §12.1; ADR-0038) |
+| `76b3b87` | `test(daemon,scripts)` | Adversarial commission lifecycle suite (22 tests) + 4-tier e2e commission script (SPEC §7, §9) |
+| `00ddad5` | `fix(core,daemon,cli)` | QA06-01..05 boundary remediation — append-only DEED, freight confinement, symlink refusal, attribution, verified checksum (SPEC §7, §9; ADR-0007, ADR-0036, ADR-0038) |
+| `107edfa` | `docs(roadmap)` | Record sprint 06 QA findings, remediation, and GATE 06/08 PASS |
+
+### Merge & tag
+
+- **Squash-merged** `sprint/06-commission-lifecycle` → `main`: **`2694023`** (9 branch commits squashed; 63 files changed, +18704, -126).
+- **Tagged** `sprint/06-commission-lifecycle` → `2694023`.
+- **Battery on merged main**: `./scripts/ci-local.sh` PASS (fmt, clippy, check-deps, all workspace tests, village disk policy, and all 9 e2e scripts green); guarded podman battery verified clean (`TMPDIR=/var/hamlet/tmp HAMLET_PODMAN_TESTS=1 ./scripts/ci-local.sh` 15/15 PASS, zero skips, zero failures).
+
