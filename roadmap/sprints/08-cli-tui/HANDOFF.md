@@ -359,11 +359,31 @@ Per the ADR renumbering index (`docs/adr/README.md`), Sprint 08 "ADR-0014" corre
 
 `GATE 08/05: PASS`
 
-### Next Steps (Step 06)
+---
 
-- Hand over to **Commit Agent** for Step 06 (`06-commit-agent.md`): `git diff main...HEAD` audit, squash-merge `sprint/08-cli-tui` → `main`, create tag `sprint/08-cli-tui`, run verification battery on merged main, and record merge commit SHA and tag.
+## Step 06 — commit-agent: CLI & TUI merge & tag
 
+Status: **done**. Precondition `GATE 08/05: PASS` verified.
 
+### Commits (`sprint/08-cli-tui`, in order)
 
+| SHA | Scope | Why |
+| --- | ----- | --- |
+| `7357462` | `feat(core)` | Stasis schemas + resource policy types (ADR-0013 / ADR-0039, ADR-0040) |
+| `f5ab946` | `feat(daemon)` | TITLE chain-of-title + census view (SPEC §10) |
+| `a0b4fac` | `feat(daemon)` | Hibernation routine + patron stasis (SPEC §10) |
+| `094c371` | `feat(daemon,cli)` | Quick awakening + dual-state convergence (SPEC §10) |
+| `4be6ebd` | `test(daemon,scripts)` | Adversarial stasis suite + e2e harness + findings (SPEC §10, §14) |
+| `bed3faa` | `feat(core,daemon)` | Local API contract + CLI/TUI specs (ADR-0014 / ADR-0041, ADR-0042) |
+| `3e1a0cc` | `feat(cli)` | Full normative CLI surface over local API (SPEC §12.1) |
+| `1ee1453` | `feat(tui)` | MUD-style village over local API (SPEC §12.2) |
+| `f281675` | `test(cli,tui,scripts)` | Interface suite + scripted demo e2e + findings (GATE 08/04: FAIL) |
+| `a3d227b` | `fix(daemon,cli)` | Remediate QA08-01 traversal & QA08-02/03 secrets seam (GATE 08/05: PASS) |
+
+### Merge & tag
+
+- **Squash-merged** `sprint/08-cli-tui` → `main`: **`e3e9726`** (80 files changed, +22900, -1682).
+- **Tagged** `sprint/08-cli-tui` → `e3e9726`.
+- **Battery on merged main**: `./scripts/ci-local.sh` PASS (fmt, clippy, check-deps, all workspace tests, village disk policy, and all 11 e2e scripts green).
 
 
