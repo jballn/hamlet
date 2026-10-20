@@ -84,6 +84,11 @@ ADRs are immutable. To change a decision:
 | [0036](0036-commission-state-machine.md) | Commission state machine: Draft→Active→WindingDown→Closed (+Failed), charter v4 records, INDENTURE grammar | Accepted (amends ADR-0027 cl. 2 state grid; retypes the charter v3 commission placeholder) |
 | [0037](0037-git-push-mediation.md) | Git push mediation: bundle spool, validation ladder, conflict policy, `GitDiffReady` wake | Accepted (resolves SPEC §14 git mediation) |
 | [0038](0038-deed-alterations-promotion.md) | DEED `### Dynamic Alterations` grammar and promotion request schema | Accepted (blueprint write-back upsert + vault promotion naming) |
+| [0039](0039-stasis-formats-and-census.md) | Stasis formats and census: patron schema, PROPRIETOR grammar, home manifest, TITLE lineage | Accepted |
+| [0040](0040-resource-bounds-and-hibernation-policy.md) | Resource bounds & pressure-triggered hibernation policy | Accepted |
+| [0041](0041-daemon-local-api.md) | Daemon local API contract: localhost HTTP+WS, 0600 token auth, zero-orchestration projections & commands | Accepted |
+| [0042](0042-cli-command-tree-and-tui-architecture.md) | CLI command tree and TUI architecture: clap surface, exit code policy, ratatui landmark MUD | Accepted (§4 room contents superseded by ADR-0043) |
+| [0043](0043-tui-rooms-landmark-projection.md) | TUI rooms on the SPEC §2 tree; landmark + escalation projections, WS command publication | Accepted (supersedes ADR-0042 §4 room contents; amends ADR-0041 cl. 4–5) |
 
 Keep this index updated in the same commit that adds/changes an ADR.
 
@@ -101,6 +106,6 @@ reused. Where a later prompt cites one of these, read the ADR actually written:
 | Sprint 04 "ADR-0010" | dispatch protocol + retry policy | 0010 (podman invocation) | **ADR-0020** |
 | Sprint 05 "ADR-0011" | decree protocol + context packet | 0011 (host permission model) | **ADR-0026** (decrees) + **ADR-0027** (packet) |
 | Sprint 06 "ADR-0012" | commission state machine + git mediation | 0012 (derived images) | **ADR-0036** (state machine) + **ADR-0037** (git mediation) + **ADR-0038** (DEED promotion) |
-| Sprint 07 "ADR-0013" | stasis formats + resource policy | 0013 (pkgcache trust) | next free number (0016+) |
-| Sprint 08 "ADR-0014" | CLI surface + local API contract | 0014 (parcel env policy) | next free number (0016+) |
-| Sprint 09 "ADR-0015" | WS protocol + asset architecture | 0015 (session protocol) | next free number (0016+) |
+| Sprint 07 "ADR-0013" | stasis formats + resource policy | 0013 (pkgcache trust) | **ADR-0039** (stasis formats) + **ADR-0040** (resource policy) |
+| Sprint 08 "ADR-0014" | CLI surface + local API contract | 0014 (parcel env policy) | **ADR-0041** (local API) + **ADR-0042** (CLI/TUI) |
+| Sprint 09 "ADR-0015" | WS protocol + asset architecture | 0015 (session protocol) | next free number (0044+) |

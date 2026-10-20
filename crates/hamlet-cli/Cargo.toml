@@ -16,10 +16,12 @@ path = "src/main.rs"
 [dependencies]
 hamlet-core = { workspace = true }
 hamlet-daemon = { workspace = true }
+hamlet-tui = { workspace = true }
+clap = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
-
-# Stub stage note: clap arrives in sprint 08 — it is currently
-# dev-allowlist only, so sprint 08 needs an ADR + check-deps.sh update
-# before adding it here (see HANDOFF, Sprint 00 prompt 02).

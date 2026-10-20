@@ -563,7 +563,7 @@ fn duplicate_identity_across_slots_must_violate_invariant() {
   "charter_version": 1,
   "slots": {
     "1001": { "identity": "ada", "status": "active" },
-    "1002": { "identity": "ada", "status": "hibernated" }
+    "1002": { "identity": "ada", "status": "active" }
   }
 }"#;
     let loaded = Charter::from_bytes(lying);
@@ -751,7 +751,7 @@ fn duplicate_identity_including_mayor_is_rejected() {
     // Three-way duplicate: rejected, and the message names identity + uid.
     let lying = br#"{"charter_version": 1, "slots": {
       "1001": { "identity": "ada", "status": "active" },
-      "1002": { "identity": "ada", "status": "hibernated" },
+      "1002": { "identity": "ada", "status": "active" },
       "1003": { "identity": "ada", "status": "crashed" } } }"#;
     match Charter::from_bytes(lying).unwrap_err() {
         CharterError::Invariant { message } => {

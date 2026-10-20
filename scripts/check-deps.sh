@@ -11,13 +11,14 @@
 # ADR-approved additions (CONVENTIONS §2):
 #   toml (ADR-0009 — blueprint schema)
 #   tower-http (ADR-0022 — hyper-level webhook body cap, feature `limit`)
+#   clap, ratatui, crossterm (ADR-0042 — CLI command tree and TUI architecture)
 # Dev-dependency allowlist (Sprint 00 baseline, recorded in HANDOFF.md):
-#   tempfile, anyhow, thiserror, clap, ratatui, crossterm
+#   tempfile, anyhow, thiserror
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-RUNTIME_ALLOW="tokio axum tokio-tungstenite serde serde_json sled dotenvy regex reqwest notify toml tower-http"
-DEV_ALLOW="tempfile anyhow thiserror clap ratatui crossterm"
+RUNTIME_ALLOW="tokio axum tokio-tungstenite serde serde_json sled dotenvy regex reqwest notify toml tower-http clap ratatui crossterm"
+DEV_ALLOW="tempfile anyhow thiserror"
 
 shopt -s nullglob
 manifests=(crates/*/Cargo.toml)

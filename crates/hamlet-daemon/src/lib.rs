@@ -27,6 +27,7 @@
 //! | [`decrees`] | decree interpretation: validate → replay-check → execute → ack | §7 | 05 |
 //! | [`telemetry`] | sled metrics sink (never orchestration state) | §11.2 | 01 |
 //! | [`promote`] | DEED alteration validation → blueprint evolution | §5, §9.4 | 06 |
+//! | [`local_api`] | daemon-local HTTP+WS API router & auth | §12.1–§12.2 | 08 |
 
 pub mod bootstrap;
 pub mod census;
@@ -36,6 +37,7 @@ pub mod dispatch;
 pub mod freight;
 pub mod hostperm;
 pub mod ledger;
+pub mod local_api;
 pub mod mailroute;
 pub mod mayor;
 pub mod metrics;

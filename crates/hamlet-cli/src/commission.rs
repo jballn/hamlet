@@ -1,616 +1,263 @@
-//! `hamlet commission {new|list|show}` — thin CLI surface over
-//! [`hamlet_daemon::ledger::Ledger`] (SPEC §9.1, §12.1; ADR-0001, ADR-0036).
-//!
-//! No orchestration state lives in `hamlet-cli`: every command resolves
-//! `<working_dir>/.hamlet`, delegates to [`Ledger`], and renders deterministic
-//! output derived strictly from `charter.json` and the `.hamlet/` tree.
+//! `hamlet commission` client commands over local API (SPEC §12.1; ADR-0041, ADR-0042).
 
-use std::fmt;
 use std::fs;
 use std::io::{self, Read};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use hamlet_core::tree::HamletTree;
-use hamlet_daemon::ledger::{
-    render_commission_list, CommissionCloseReport, CommissionDetail, CommissionSummary,
-    CreatedCommission, Ledger, LedgerError,
-};
+use hamlet_core::api::*;
+use hamlet_core::sanitize::sanitize_name;
 
-/// Errors returned by `hamlet commission` subcommands.
-#[derive(Debug)]
-pub enum CommissionCliError {
-    /// Bad CLI invocation (missing required flag, unknown subcommand, extra
-    /// positional arguments) — maps to exit code `2`.
-    Usage(String),
-    /// Runtime / validation / ledger failure — maps to exit code `1`.
-    Ledger(LedgerError),
-    /// Brief file / stdin read failure — maps to exit code `1`.
-    BriefIo {
-        /// Source description (`stdin` or file path).
-        source_desc: String,
-        /// Underlying OS error.
-        source: io::Error,
-    },
-}
+use crate::client::{ClientError, HamletClient};
 
-impl fmt::Display for CommissionCliError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Usage(msg) => write!(f, "{msg}"),
-            Self::Ledger(e) => write!(f, "{e}"),
-            Self::BriefIo {
-                source_desc,
-                source,
-            } => write!(f, "read brief from {source_desc}: {source}"),
-        }
+/// Execute `hamlet commission list`.
+pub async fn list(dir_flag: Option<&Path>, json: bool) -> Result<String, ClientError> {
+    let client = HamletClient::discover(dir_flag)?;
+    let items: Vec<CommissionSummaryView> = client.get(ENDPOINT_COMMISSIONS).await?;
+
+    if json {
+        return serde_json::to_string_pretty(&items)
+            .map_err(|e| ClientError::Operational(format!("JSON serialization error: {e}")));
     }
-}
 
-impl std::error::Error for CommissionCliError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Ledger(e) => Some(e),
-            Self::BriefIo { source, .. } => Some(source),
-            Self::Usage(_) => None,
-        }
-    }
-}
-
-impl From<LedgerError> for CommissionCliError {
-    fn from(e: LedgerError) -> Self {
-        Self::Ledger(e)
-    }
-}
-
-/// Source for the `COMMISSION.md` brief passed to `--brief`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BriefSource {
-    /// Read brief from `stdin` (`--brief -`).
-    Stdin,
-    /// Read brief from a filesystem path (`--brief <file>`).
-    File(PathBuf),
-}
-
-/// Parsed arguments for `hamlet commission new`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NewArgs {
-    /// Raw commission slug (sanitized by [`Ledger::create_commission`]).
-    pub slug: String,
-    /// Source of the `COMMISSION.md` brief.
-    pub brief: BriefSource,
-    /// Optional `--seed <dir>` directory to import as initial commit on `main`.
-    pub seed: Option<PathBuf>,
-    /// Optional `--dir <working_dir>` override (defaults to `cwd`).
-    pub working_dir: Option<PathBuf>,
-}
-
-/// Parsed arguments for `hamlet commission list`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ListArgs {
-    /// Optional `--dir <working_dir>` override (defaults to `cwd`).
-    pub working_dir: Option<PathBuf>,
-}
-
-/// Parsed arguments for `hamlet commission show`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ShowArgs {
-    /// Raw commission slug to inspect.
-    pub slug: String,
-    /// Optional `--dir <working_dir>` override (defaults to `cwd`).
-    pub working_dir: Option<PathBuf>,
-}
-
-/// Parsed arguments for `hamlet commission close`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CloseArgs {
-    /// Raw commission slug to close.
-    pub slug: String,
-    /// Optional `--dir <working_dir>` override (defaults to `cwd`).
-    pub working_dir: Option<PathBuf>,
-}
-
-/// Parsed `hamlet commission` subcommand.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CommissionCommand {
-    /// `hamlet commission new <slug> --brief <file|-> [--seed <dir>]`
-    New(NewArgs),
-    /// `hamlet commission list`
-    List(ListArgs),
-    /// `hamlet commission show <slug>`
-    Show(ShowArgs),
-    /// `hamlet commission close <slug>`
-    Close(CloseArgs),
-}
-
-/// Parse argv slice following `hamlet commission`.
-///
-/// # Errors
-///
-/// Returns [`CommissionCliError::Usage`] when the subcommand or flags are
-/// invalid.
-pub fn parse_args(args: &[&str]) -> Result<CommissionCommand, CommissionCliError> {
-    let Some((&sub, rest)) = args.split_first() else {
-        return Err(CommissionCliError::Usage(
-            "missing commission subcommand (expected: new | list | show | close)".to_owned(),
+    let headers = ["ID", "SLUG", "STATE", "ROSTER", "BRIEF", "INDENTURE", "GIT"];
+    if items.is_empty() {
+        return Ok(format!(
+            "{}  {}  {}  {}  {}  {}  {}\n(no commissions)\n",
+            headers[0], headers[1], headers[2], headers[3], headers[4], headers[5], headers[6]
         ));
-    };
-    match sub {
-        "new" => parse_new_args(rest).map(CommissionCommand::New),
-        "list" => parse_list_args(rest).map(CommissionCommand::List),
-        "show" => parse_show_args(rest).map(CommissionCommand::Show),
-        "close" => parse_close_args(rest).map(CommissionCommand::Close),
-        other => Err(CommissionCliError::Usage(format!(
-            "unknown commission subcommand '{other}' (expected: new | list | show | close)"
-        ))),
-    }
-}
-
-fn parse_new_args(args: &[&str]) -> Result<NewArgs, CommissionCliError> {
-    let mut slug: Option<String> = None;
-    let mut brief: Option<BriefSource> = None;
-    let mut seed: Option<PathBuf> = None;
-    let mut working_dir: Option<PathBuf> = None;
-    let mut positional_only = false;
-
-    let mut i = 0;
-    while i < args.len() {
-        let arg = args[i];
-        if !positional_only {
-            if arg == "--" {
-                positional_only = true;
-                i += 1;
-                continue;
-            }
-            if arg == "-h" || arg == "--help" {
-                return Err(CommissionCliError::Usage(
-                    "usage: hamlet commission new <slug> --brief <file|-> [--seed <dir>]"
-                        .to_owned(),
-                ));
-            }
-            if arg == "--brief" {
-                i += 1;
-                let Some(&val) = args.get(i) else {
-                    return Err(CommissionCliError::Usage(
-                        "--brief requires an argument (<file|->)".to_owned(),
-                    ));
-                };
-                if brief.is_some() {
-                    return Err(CommissionCliError::Usage(
-                        "--brief specified more than once".to_owned(),
-                    ));
-                }
-                brief = Some(parse_brief_source(val));
-                i += 1;
-                continue;
-            }
-            if let Some(val) = arg.strip_prefix("--brief=") {
-                if val.is_empty() {
-                    return Err(CommissionCliError::Usage(
-                        "--brief requires an argument (<file|->)".to_owned(),
-                    ));
-                }
-                if brief.is_some() {
-                    return Err(CommissionCliError::Usage(
-                        "--brief specified more than once".to_owned(),
-                    ));
-                }
-                brief = Some(parse_brief_source(val));
-                i += 1;
-                continue;
-            }
-            if arg == "--seed" {
-                i += 1;
-                let Some(&val) = args.get(i) else {
-                    return Err(CommissionCliError::Usage(
-                        "--seed requires a directory path".to_owned(),
-                    ));
-                };
-                if seed.is_some() {
-                    return Err(CommissionCliError::Usage(
-                        "--seed specified more than once".to_owned(),
-                    ));
-                }
-                seed = Some(PathBuf::from(val));
-                i += 1;
-                continue;
-            }
-            if let Some(val) = arg.strip_prefix("--seed=") {
-                if val.is_empty() {
-                    return Err(CommissionCliError::Usage(
-                        "--seed requires a directory path".to_owned(),
-                    ));
-                }
-                if seed.is_some() {
-                    return Err(CommissionCliError::Usage(
-                        "--seed specified more than once".to_owned(),
-                    ));
-                }
-                seed = Some(PathBuf::from(val));
-                i += 1;
-                continue;
-            }
-            if arg == "--dir" {
-                i += 1;
-                let Some(&val) = args.get(i) else {
-                    return Err(CommissionCliError::Usage(
-                        "--dir requires a directory path".to_owned(),
-                    ));
-                };
-                if working_dir.is_some() {
-                    return Err(CommissionCliError::Usage(
-                        "--dir specified more than once".to_owned(),
-                    ));
-                }
-                working_dir = Some(PathBuf::from(val));
-                i += 1;
-                continue;
-            }
-            if let Some(val) = arg.strip_prefix("--dir=") {
-                if val.is_empty() {
-                    return Err(CommissionCliError::Usage(
-                        "--dir requires a directory path".to_owned(),
-                    ));
-                }
-                if working_dir.is_some() {
-                    return Err(CommissionCliError::Usage(
-                        "--dir specified more than once".to_owned(),
-                    ));
-                }
-                working_dir = Some(PathBuf::from(val));
-                i += 1;
-                continue;
-            }
-        }
-
-        if slug.is_none() {
-            slug = Some(arg.to_owned());
-            i += 1;
-        } else {
-            return Err(CommissionCliError::Usage(format!(
-                "unexpected argument '{arg}' (usage: hamlet commission new <slug> --brief <file|-> [--seed <dir>])"
-            )));
-        }
     }
 
-    let Some(slug) = slug else {
-        return Err(CommissionCliError::Usage(
-            "missing <slug> (usage: hamlet commission new <slug> --brief <file|-> [--seed <dir>])"
-                .to_owned(),
-        ));
-    };
-    let Some(brief) = brief else {
-        return Err(CommissionCliError::Usage(
-            "missing required --brief <file|-> flag".to_owned(),
-        ));
-    };
+    // Determine column widths
+    let mut w_id = headers[0].len();
+    let mut w_slug = headers[1].len();
+    let mut w_state = headers[2].len();
+    let mut w_roster = headers[3].len();
+    let mut w_brief = headers[4].len();
+    let mut w_indenture = headers[5].len();
+    let mut w_git = headers[6].len();
 
-    Ok(NewArgs {
-        slug,
-        brief,
-        seed,
-        working_dir,
-    })
-}
-
-fn parse_list_args(args: &[&str]) -> Result<ListArgs, CommissionCliError> {
-    let mut working_dir: Option<PathBuf> = None;
-    let mut i = 0;
-    while i < args.len() {
-        let arg = args[i];
-        if arg == "--dir" {
-            i += 1;
-            let Some(&val) = args.get(i) else {
-                return Err(CommissionCliError::Usage(
-                    "--dir requires a directory path".to_owned(),
-                ));
+    let rows: Vec<[String; 7]> = items
+        .iter()
+        .map(|item| {
+            let id = item.commission_id.to_string();
+            let slug = item.slug.to_string();
+            let state = item.state.clone();
+            let roster = if item.roster.is_empty() {
+                "-".to_string()
+            } else {
+                item.roster
+                    .iter()
+                    .map(|u| u.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
             };
-            if working_dir.is_some() {
-                return Err(CommissionCliError::Usage(
-                    "--dir specified more than once".to_owned(),
-                ));
-            }
-            working_dir = Some(PathBuf::from(val));
-            i += 1;
-            continue;
+            let brief = if item.brief { "yes" } else { "no" }.to_string();
+            let indenture = if item.indenture { "yes" } else { "no" }.to_string();
+            let git = item.git.clone();
+
+            w_id = w_id.max(id.len());
+            w_slug = w_slug.max(slug.len());
+            w_state = w_state.max(state.len());
+            w_roster = w_roster.max(roster.len());
+            w_brief = w_brief.max(brief.len());
+            w_indenture = w_indenture.max(indenture.len());
+            w_git = w_git.max(git.len());
+
+            [id, slug, state, roster, brief, indenture, git]
+        })
+        .collect();
+
+    let mut out = format!(
+        "{:<w_id$}  {:<w_slug$}  {:<w_state$}  {:<w_roster$}  {:<w_brief$}  {:<w_indenture$}  {}\n",
+        headers[0], headers[1], headers[2], headers[3], headers[4], headers[5], headers[6]
+    );
+
+    for r in rows {
+        out.push_str(&format!(
+            "{:<w_id$}  {:<w_slug$}  {:<w_state$}  {:<w_roster$}  {:<w_brief$}  {:<w_indenture$}  {}\n",
+            r[0], r[1], r[2], r[3], r[4], r[5], r[6]
+        ));
+    }
+
+    Ok(out)
+}
+
+/// Execute `hamlet commission new`.
+pub async fn new(
+    dir_flag: Option<&Path>,
+    slug: &str,
+    brief_arg: &str,
+    seed_arg: Option<&Path>,
+    json: bool,
+) -> Result<String, ClientError> {
+    let safe_slug = sanitize_name(slug)
+        .map_err(|e| ClientError::Operational(format!("invalid commission slug '{slug}': {e}")))?;
+
+    let brief_text = read_brief_body(brief_arg)?;
+    let seed_str = seed_arg.map(|p| p.display().to_string());
+
+    let client = HamletClient::discover(dir_flag)?;
+    let req = CommissionNewRequest {
+        slug: safe_slug,
+        brief: brief_text,
+        seed_dir: seed_str,
+    };
+
+    let resp: CommissionNewResponse = client.post(ENDPOINT_COMMISSION_NEW, &req).await?;
+
+    if json {
+        return serde_json::to_string_pretty(&resp)
+            .map_err(|e| ClientError::Operational(format!("JSON serialization error: {e}")));
+    }
+
+    Ok(resp.message)
+}
+
+/// Execute `hamlet commission show`.
+pub async fn show(dir_flag: Option<&Path>, slug: &str, json: bool) -> Result<String, ClientError> {
+    let safe_slug = sanitize_name(slug)
+        .map_err(|e| ClientError::Operational(format!("invalid commission slug '{slug}': {e}")))?;
+
+    let client = HamletClient::discover(dir_flag)?;
+    let path = format!("{ENDPOINT_COMMISSIONS}/{}", safe_slug.as_str());
+    let detail: CommissionDetailView = client.get(&path).await?;
+
+    if json {
+        return serde_json::to_string_pretty(&detail)
+            .map_err(|e| ClientError::Operational(format!("JSON serialization error: {e}")));
+    }
+
+    let roster_str = if detail.summary.roster.is_empty() {
+        "none".to_string()
+    } else {
+        detail
+            .summary
+            .roster
+            .iter()
+            .map(|u| u.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    let git_head_str = match (&detail.git_head, &detail.main_oid) {
+        (Some(head), Some(_)) => format!("HEAD -> {head}, main: seeded"),
+        (Some(head), None) => format!("HEAD -> {head}, main: unborn"),
+        (None, _) => "missing".to_string(),
+    };
+
+    let brief_status = if detail.brief.is_some() {
+        "present"
+    } else {
+        "absent"
+    };
+
+    let indenture_status = if detail.indenture_tasks.is_empty() {
+        "absent"
+    } else {
+        "present"
+    };
+
+    let mut out = format!(
+        "commission: commission{} ({})\n\
+         \x20 id:         {}\n\
+         \x20 slug:       {}\n\
+         \x20 state:      {}\n\
+         \x20 roster:     {}\n\
+         \x20 ledger:     guild/ledger/commission{}\n\
+         \x20 git:        guild/ledger/commission{}/git ({})\n\
+         \x20 brief:      guild/ledger/commission{}/COMMISSION.md ({})\n\
+         \x20 indenture:  guild/ledger/commission{}/INDENTURE.md ({})\n",
+        detail.summary.commission_id,
+        detail.summary.slug,
+        detail.summary.commission_id,
+        detail.summary.slug,
+        detail.summary.state,
+        roster_str,
+        detail.summary.commission_id,
+        detail.summary.commission_id,
+        git_head_str,
+        detail.summary.commission_id,
+        brief_status,
+        detail.summary.commission_id,
+        indenture_status
+    );
+
+    if !detail.indenture_tasks.is_empty() {
+        let entries_str = detail
+            .indenture_tasks
+            .iter()
+            .map(|e| match &e.identity {
+                Some(ident) => format!("{} ({ident}): {}", e.uid, e.status),
+                None => format!("{}: {}", e.uid, e.status),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!("  entries:    {entries_str}\n"));
+    }
+
+    if let Some(ref brief) = detail.brief {
+        out.push_str("\n--- COMMISSION.md ---\n");
+        out.push_str(brief);
+        if !brief.ends_with('\n') {
+            out.push('\n');
         }
-        if let Some(val) = arg.strip_prefix("--dir=") {
-            if val.is_empty() {
-                return Err(CommissionCliError::Usage(
-                    "--dir requires a directory path".to_owned(),
-                ));
-            }
-            if working_dir.is_some() {
-                return Err(CommissionCliError::Usage(
-                    "--dir specified more than once".to_owned(),
-                ));
-            }
-            working_dir = Some(PathBuf::from(val));
-            i += 1;
-            continue;
-        }
-        return Err(CommissionCliError::Usage(format!(
-            "unexpected argument '{arg}' (usage: hamlet commission list)"
+    }
+
+    Ok(out)
+}
+
+/// Execute `hamlet commission close`.
+pub async fn close(dir_flag: Option<&Path>, slug: &str, json: bool) -> Result<String, ClientError> {
+    let safe_slug = sanitize_name(slug)
+        .map_err(|e| ClientError::Operational(format!("invalid commission slug '{slug}': {e}")))?;
+
+    let client = HamletClient::discover(dir_flag)?;
+    let path = format!("/api/v1/commissions/{}/close", safe_slug.as_str());
+    let resp: CommissionCloseResponse = client.post_empty(&path).await?;
+
+    if json {
+        return serde_json::to_string_pretty(&resp)
+            .map_err(|e| ClientError::Operational(format!("JSON serialization error: {e}")));
+    }
+
+    Ok(format!(
+        "hamlet commission close: commission{} ({})\n\
+         \x20 state: {}\n\
+         \x20 parcels stopped: {}\n\
+         \x20 escalation filed: {}\n",
+        resp.commission_id, resp.slug, resp.state, resp.parcels_stopped, resp.escalation_filed
+    ))
+}
+
+fn read_brief_body(brief_arg: &str) -> Result<String, ClientError> {
+    if brief_arg == "-" {
+        let mut buf = String::new();
+        io::stdin().read_to_string(&mut buf).map_err(|e| {
+            ClientError::Operational(format!("failed to read brief from stdin: {e}"))
+        })?;
+        return Ok(buf);
+    }
+
+    let path = Path::new(brief_arg);
+    let meta = fs::symlink_metadata(path).map_err(|e| {
+        ClientError::Operational(format!("failed to read brief file {}: {e}", path.display()))
+    })?;
+
+    if meta.file_type().is_symlink() {
+        return Err(ClientError::Operational(format!(
+            "symlink brief path {} refused (ADR-0007)",
+            path.display()
         )));
     }
-    Ok(ListArgs { working_dir })
-}
 
-fn parse_show_args(args: &[&str]) -> Result<ShowArgs, CommissionCliError> {
-    let mut slug: Option<String> = None;
-    let mut working_dir: Option<PathBuf> = None;
-    let mut positional_only = false;
-    let mut i = 0;
-    while i < args.len() {
-        let arg = args[i];
-        if !positional_only {
-            if arg == "--" {
-                positional_only = true;
-                i += 1;
-                continue;
-            }
-            if arg == "-h" || arg == "--help" {
-                return Err(CommissionCliError::Usage(
-                    "usage: hamlet commission show <slug>".to_owned(),
-                ));
-            }
-            if arg == "--dir" {
-                i += 1;
-                let Some(&val) = args.get(i) else {
-                    return Err(CommissionCliError::Usage(
-                        "--dir requires a directory path".to_owned(),
-                    ));
-                };
-                if working_dir.is_some() {
-                    return Err(CommissionCliError::Usage(
-                        "--dir specified more than once".to_owned(),
-                    ));
-                }
-                working_dir = Some(PathBuf::from(val));
-                i += 1;
-                continue;
-            }
-            if let Some(val) = arg.strip_prefix("--dir=") {
-                if val.is_empty() {
-                    return Err(CommissionCliError::Usage(
-                        "--dir requires a directory path".to_owned(),
-                    ));
-                }
-                if working_dir.is_some() {
-                    return Err(CommissionCliError::Usage(
-                        "--dir specified more than once".to_owned(),
-                    ));
-                }
-                working_dir = Some(PathBuf::from(val));
-                i += 1;
-                continue;
-            }
-        }
-        if slug.is_none() {
-            slug = Some(arg.to_owned());
-            i += 1;
-        } else {
-            return Err(CommissionCliError::Usage(format!(
-                "unexpected argument '{arg}' (usage: hamlet commission show <slug>)"
-            )));
-        }
+    if !meta.is_file() {
+        return Err(ClientError::Operational(format!(
+            "brief path {} is not a regular file",
+            path.display()
+        )));
     }
-    let Some(slug) = slug else {
-        return Err(CommissionCliError::Usage(
-            "missing <slug> (usage: hamlet commission show <slug>)".to_owned(),
-        ));
-    };
-    Ok(ShowArgs { slug, working_dir })
-}
 
-fn parse_close_args(args: &[&str]) -> Result<CloseArgs, CommissionCliError> {
-    let mut slug: Option<String> = None;
-    let mut working_dir: Option<PathBuf> = None;
-    let mut positional_only = false;
-
-    let mut i = 0;
-    while i < args.len() {
-        let arg = args[i];
-        if !positional_only {
-            if arg == "--" {
-                positional_only = true;
-                i += 1;
-                continue;
-            }
-            if arg == "-h" || arg == "--help" {
-                return Err(CommissionCliError::Usage(
-                    "usage: hamlet commission close <slug>".to_owned(),
-                ));
-            }
-            if arg == "--dir" {
-                i += 1;
-                let Some(&val) = args.get(i) else {
-                    return Err(CommissionCliError::Usage(
-                        "--dir requires a directory path".to_owned(),
-                    ));
-                };
-                if working_dir.is_some() {
-                    return Err(CommissionCliError::Usage(
-                        "--dir specified more than once".to_owned(),
-                    ));
-                }
-                working_dir = Some(PathBuf::from(val));
-                i += 1;
-                continue;
-            }
-            if let Some(val) = arg.strip_prefix("--dir=") {
-                if val.is_empty() {
-                    return Err(CommissionCliError::Usage(
-                        "--dir requires a directory path".to_owned(),
-                    ));
-                }
-                if working_dir.is_some() {
-                    return Err(CommissionCliError::Usage(
-                        "--dir specified more than once".to_owned(),
-                    ));
-                }
-                working_dir = Some(PathBuf::from(val));
-                i += 1;
-                continue;
-            }
-        }
-        if slug.is_none() {
-            slug = Some(arg.to_owned());
-            i += 1;
-        } else {
-            return Err(CommissionCliError::Usage(format!(
-                "unexpected argument '{arg}' (usage: hamlet commission close <slug>)"
-            )));
-        }
-    }
-    let Some(slug) = slug else {
-        return Err(CommissionCliError::Usage(
-            "missing <slug> (usage: hamlet commission close <slug>)".to_owned(),
-        ));
-    };
-    Ok(CloseArgs { slug, working_dir })
-}
-
-fn parse_brief_source(raw: &str) -> BriefSource {
-    if raw == "-" {
-        BriefSource::Stdin
-    } else {
-        BriefSource::File(PathBuf::from(raw))
-    }
-}
-
-/// Read the brief body from a file or `stdin`, refusing symlink brief paths
-/// under ADR-0007.
-///
-/// # Errors
-///
-/// Returns [`CommissionCliError`] on symlink refusal or I/O failure.
-pub fn load_brief(source: &BriefSource) -> Result<String, CommissionCliError> {
-    match source {
-        BriefSource::Stdin => {
-            let mut buf = String::new();
-            io::stdin()
-                .read_to_string(&mut buf)
-                .map_err(|source| CommissionCliError::BriefIo {
-                    source_desc: "stdin".to_owned(),
-                    source,
-                })?;
-            Ok(buf)
-        }
-        BriefSource::File(path) => {
-            let meta =
-                fs::symlink_metadata(path).map_err(|source| CommissionCliError::BriefIo {
-                    source_desc: path.display().to_string(),
-                    source,
-                })?;
-            if meta.file_type().is_symlink() {
-                return Err(CommissionCliError::Ledger(LedgerError::SymlinkRefused {
-                    path: path.clone(),
-                }));
-            }
-            if !meta.is_file() {
-                return Err(CommissionCliError::BriefIo {
-                    source_desc: path.display().to_string(),
-                    source: io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"),
-                });
-            }
-            fs::read_to_string(path).map_err(|source| CommissionCliError::BriefIo {
-                source_desc: path.display().to_string(),
-                source,
-            })
-        }
-    }
-}
-
-/// Execute `hamlet commission new` against `working_dir` (which contains
-/// `.hamlet/`).
-///
-/// # Errors
-///
-/// Returns [`CommissionCliError`] on invalid brief/slug/seed or ledger error.
-pub fn run_new(
-    working_dir: &Path,
-    slug: &str,
-    brief_text: &str,
-    seed: Option<&Path>,
-) -> Result<CreatedCommission, CommissionCliError> {
-    let tree = HamletTree::new(working_dir.join(".hamlet"));
-    let ledger = Ledger::new(tree);
-    Ok(ledger.create_commission(slug, brief_text, seed)?)
-}
-
-/// Execute `hamlet commission list` against `working_dir` (which contains
-/// `.hamlet/`).
-///
-/// # Errors
-///
-/// Returns [`CommissionCliError`] if the village is not initialized or
-/// `charter.json` cannot be loaded.
-pub fn run_list(working_dir: &Path) -> Result<Vec<CommissionSummary>, CommissionCliError> {
-    let tree = HamletTree::new(working_dir.join(".hamlet"));
-    let ledger = Ledger::new(tree);
-    Ok(ledger.list_commissions()?)
-}
-
-/// Execute `hamlet commission show <slug>` against `working_dir` (which
-/// contains `.hamlet/`).
-///
-/// # Errors
-///
-/// Returns [`CommissionCliError`] if `<slug>` is invalid, unknown, or the
-/// village is not initialized.
-pub fn run_show(working_dir: &Path, slug: &str) -> Result<CommissionDetail, CommissionCliError> {
-    let tree = HamletTree::new(working_dir.join(".hamlet"));
-    let ledger = Ledger::new(tree);
-    Ok(ledger.show_commission(slug)?)
-}
-
-/// Execute `hamlet commission close <slug>` against `working_dir` (which
-/// contains `.hamlet/`).
-///
-/// # Errors
-///
-/// Returns [`CommissionCliError`] if `<slug>` is invalid, unknown, or the
-/// village is not initialized.
-pub fn run_close(
-    working_dir: &Path,
-    slug: &str,
-) -> Result<CommissionCloseReport, CommissionCliError> {
-    let tree = HamletTree::new(working_dir.join(".hamlet"));
-    let ledger = Ledger::new(tree);
-    Ok(ledger.close_commission(slug)?)
-}
-
-/// Execute a parsed [`CommissionCommand`] using `default_working_dir` when
-/// `--dir` was not provided, returning the rendered stdout string.
-///
-/// # Errors
-///
-/// Returns [`CommissionCliError`] on usage, I/O, or ledger failure.
-pub fn execute(
-    cmd: &CommissionCommand,
-    default_working_dir: &Path,
-) -> Result<String, CommissionCliError> {
-    match cmd {
-        CommissionCommand::New(args) => {
-            let dir = args.working_dir.as_deref().unwrap_or(default_working_dir);
-            let brief_text = load_brief(&args.brief)?;
-            let created = run_new(dir, &args.slug, &brief_text, args.seed.as_deref())?;
-            Ok(created.summary())
-        }
-        CommissionCommand::List(args) => {
-            let dir = args.working_dir.as_deref().unwrap_or(default_working_dir);
-            let items = run_list(dir)?;
-            Ok(render_commission_list(&items))
-        }
-        CommissionCommand::Show(args) => {
-            let dir = args.working_dir.as_deref().unwrap_or(default_working_dir);
-            let detail = run_show(dir, &args.slug)?;
-            Ok(detail.render())
-        }
-        CommissionCommand::Close(args) => {
-            let dir = args.working_dir.as_deref().unwrap_or(default_working_dir);
-            let report = run_close(dir, &args.slug)?;
-            Ok(report.summary())
-        }
-    }
+    fs::read_to_string(path).map_err(|e| {
+        ClientError::Operational(format!("failed to read brief file {}: {e}", path.display()))
+    })
 }

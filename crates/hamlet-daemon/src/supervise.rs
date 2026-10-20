@@ -98,7 +98,6 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
-use std::fs::{self, OpenOptions};
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -468,11 +467,18 @@ pub fn cmd_for_incarnation(
 /// printable ASCII and truncated.
 #[must_use]
 pub fn title_crash_line(session: &SessionId, restarts: u32, unix_ts: u64, detail: &str) -> String {
-    format!(
-        "- unix {unix_ts} · session {} permanently crashed after {restarts} auto-restart(s) · {}\n",
-        session.token(),
-        scrub_detail(detail)
-    )
+    hamlet_core::stasis::TitleEntry::Crash {
+        timestamp: crate::census::format_epoch_iso8601(unix_ts),
+        session_id: session.token(),
+        exit_code: None,
+        restarts,
+        reason: format!(
+            "session {} permanently crashed after {restarts} auto-restart(s) · {}",
+            session.token(),
+            scrub_detail(detail)
+        ),
+    }
+    .render_line()
 }
 
 /// Scrub untrusted text (stderr tails, error messages) for lineage/trace
@@ -1501,7 +1507,23 @@ async fn supervise_lives(
             }
         };
         let end = match spawned {
-            Ok(live_handle) => run_life(&ctx, session, live_handle, &mut control, restarts).await,
+            Ok(live_handle) => {
+                if let Err(e) = crate::census::stamp_parcel_title(
+                    &ctx.inner.tree,
+                    uid,
+                    hamlet_core::stasis::TitleEntry::SessionIncarnation {
+                        timestamp: crate::census::now_iso8601(),
+                        session_id: session.token(),
+                        incarnation: session.incarnation,
+                    },
+                ) {
+                    ctx.trace(
+                        "session-title-stamp-failed",
+                        format!("session={session}: {e}"),
+                    );
+                }
+                run_life(&ctx, session, live_handle, &mut control, restarts).await
+            }
             Err(e) => {
                 let status = ctx
                     .inner
@@ -1530,14 +1552,34 @@ async fn supervise_lives(
                 if let Err(e) = ctx.set_session(session, SessionStatus::Stopped, final_restarts) {
                     ctx.trace("session-telemetry-failed", format!("charter: {e}"));
                 }
-                let (event, detail) = if killed {
-                    ("session-killed", format!("hard kill, exit={code}"))
+                let (event, detail, status_str) = if killed {
+                    (
+                        "session-killed",
+                        format!("hard kill, exit={code}"),
+                        "killed",
+                    )
                 } else {
                     (
                         "session-stopped",
                         format!("graceful drain, exit={code}, from {status}"),
+                        "stopped",
                     )
                 };
+                if let Err(e) = crate::census::stamp_parcel_title(
+                    &ctx.inner.tree,
+                    uid,
+                    hamlet_core::stasis::TitleEntry::Promotion {
+                        timestamp: crate::census::now_iso8601(),
+                        kind: "session".to_string(),
+                        target: session.token(),
+                        status: status_str.to_string(),
+                    },
+                ) {
+                    ctx.trace(
+                        "session-title-stamp-failed",
+                        format!("session={session}: {e}"),
+                    );
+                }
                 ctx.trace(event, detail);
                 break 'chain;
             }
@@ -1565,7 +1607,7 @@ async fn supervise_lives(
                 );
                 match ctx.inner.config.sessions.restart.backoff_ms(restarts) {
                     None => {
-                        permanent_crash(&ctx, session, restarts, &detail);
+                        permanent_crash(&ctx, session, code, restarts, &detail);
                         ctx.inner.notify_crash(CrashNotice {
                             uid,
                             session,
@@ -1576,6 +1618,21 @@ async fn supervise_lives(
                         break 'chain;
                     }
                     Some(delay_ms) => {
+                        let crash_entry = hamlet_core::stasis::TitleEntry::Crash {
+                            timestamp: crate::census::now_iso8601(),
+                            session_id: session.token(),
+                            exit_code: code,
+                            restarts,
+                            reason: scrub_detail(&detail),
+                        };
+                        if let Err(e) =
+                            crate::census::stamp_parcel_title(&ctx.inner.tree, uid, crash_entry)
+                        {
+                            ctx.trace(
+                                "session-title-stamp-failed",
+                                format!("session={session}: {e}"),
+                            );
+                        }
                         ctx.trace(
                             "session-restart-scheduled",
                             format!("session={session} restarts={restarts} backoff_ms={delay_ms}"),
@@ -1639,6 +1696,13 @@ async fn supervise_lives(
                         match session.next_incarnation() {
                             Ok(next) => session = next,
                             Err(e) => {
+                                permanent_crash(
+                                    &ctx,
+                                    session,
+                                    code,
+                                    restarts,
+                                    &format!("incarnation overflow: {e}"),
+                                );
                                 ctx.trace(
                                     "session-permanently-crashed",
                                     format!("incarnation overflow: {e}"),
@@ -1664,9 +1728,25 @@ async fn supervise_lives(
 }
 
 /// Permanent failure: TITLE.md lineage stamp + sled trace (SPEC §6).
-fn permanent_crash(ctx: &TaskCtx, session: SessionId, restarts: u32, detail: &str) {
-    let line = title_crash_line(&session, restarts, unix_now_ms() / 1000, detail);
-    if let Err(e) = stamp_title(&ctx.inner.tree, ctx.uid, &line) {
+fn permanent_crash(
+    ctx: &TaskCtx,
+    session: SessionId,
+    code: Option<i32>,
+    restarts: u32,
+    detail: &str,
+) {
+    let entry = hamlet_core::stasis::TitleEntry::Crash {
+        timestamp: crate::census::now_iso8601(),
+        session_id: session.token(),
+        exit_code: code,
+        restarts,
+        reason: format!(
+            "session {} permanently crashed after {restarts} auto-restart(s) · {}",
+            session.token(),
+            scrub_detail(detail)
+        ),
+    };
+    if let Err(e) = crate::census::stamp_parcel_title(&ctx.inner.tree, ctx.uid, entry) {
         ctx.trace(
             "session-title-stamp-failed",
             format!("session={session}: {e}"),
@@ -1676,41 +1756,6 @@ fn permanent_crash(ctx: &TaskCtx, session: SessionId, restarts: u32, detail: &st
         "session-permanently-crashed",
         format!("session={session} restarts={restarts} budget exhausted · {detail}"),
     );
-}
-
-/// Append one lineage line to `parcel<uid>/TITLE.md` with ADR-0007
-/// discipline: existing regular file only — never create (lineage must
-/// descend from provisioning), never follow a planted symlink.
-fn stamp_title(tree: &HamletTree, uid: u32, line: &str) -> Result<(), SuperviseError> {
-    let path = tree.parcel_title(uid);
-    match fs::symlink_metadata(&path) {
-        Ok(meta) if meta.file_type().is_file() => {}
-        Ok(_) => {
-            return Err(SuperviseError::TaskFailed(format!(
-                "TITLE.md {} is not a regular file",
-                path.display()
-            )))
-        }
-        Err(e) => {
-            return Err(SuperviseError::Io {
-                context: format!("stat {}", path.display()),
-                source: e,
-            })
-        }
-    }
-    let mut file = OpenOptions::new()
-        .append(true)
-        .open(&path)
-        .map_err(|e| SuperviseError::Io {
-            context: format!("append {}", path.display()),
-            source: e,
-        })?;
-    use std::io::Write;
-    file.write_all(line.as_bytes())
-        .map_err(|e| SuperviseError::Io {
-            context: format!("append {}", path.display()),
-            source: e,
-        })
 }
 
 /// One session life: spawn-handed process → readiness → event loop →
@@ -2372,6 +2417,25 @@ async fn inject_interrupt(
     .await;
     match result {
         Ok(()) => {
+            let directive = match envelope {
+                SessionEnvelope::InterruptAndSteer(i) => {
+                    format!("{}: {}", i.source, i.steering_text)
+                }
+                _ => "steer".to_string(),
+            };
+            if let Err(e) = crate::census::stamp_parcel_title(
+                &ctx.inner.tree,
+                ctx.uid,
+                hamlet_core::stasis::TitleEntry::Steer {
+                    timestamp: crate::census::now_iso8601(),
+                    directive: scrub_detail(&directive),
+                },
+            ) {
+                ctx.trace(
+                    "session-title-stamp-failed",
+                    format!("session={session}: {e}"),
+                );
+            }
             ctx.trace(
                 "session-interrupt-injected",
                 format!(
@@ -2567,7 +2631,7 @@ mod tests {
         let line = title_crash_line(&session, 5, 1_700_000_000, "exit code 137");
         assert_eq!(
             line,
-            "- unix 1700000000 · session 1001.2 permanently crashed after 5 auto-restart(s) · exit code 137\n"
+            "- [2023-11-14T22:13:20Z] crash session_id=1001.2 exit_code=none restarts=5 reason=\"session 1001.2 permanently crashed after 5 auto-restart(s) · exit code 137\"\n"
         );
     }
 

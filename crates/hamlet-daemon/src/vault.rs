@@ -424,6 +424,19 @@ impl Promotion for VaultPromotion {
             );
         }
 
+        if let Some(uid) = submitting_uid {
+            let _ = crate::census::stamp_parcel_title(
+                &self.tree,
+                uid,
+                hamlet_core::stasis::TitleEntry::Promotion {
+                    timestamp: crate::census::now_iso8601(),
+                    kind: "vault".to_string(),
+                    target: artifact_name.to_string(),
+                    status: "promoted".to_string(),
+                },
+            );
+        }
+
         Ok(())
     }
 
@@ -470,6 +483,19 @@ impl Promotion for VaultPromotion {
                     at_unix_ms: now_ms,
                     event: "promotion_rejected".into(),
                     detail: format!("{freight_path} attempt {count} reason {reason}"),
+                },
+            );
+        }
+
+        if let Some(uid) = submitting_uid {
+            let _ = crate::census::stamp_parcel_title(
+                &self.tree,
+                uid,
+                hamlet_core::stasis::TitleEntry::Promotion {
+                    timestamp: crate::census::now_iso8601(),
+                    kind: "vault".to_string(),
+                    target: freight_path.to_string(),
+                    status: "rejected".to_string(),
                 },
             );
         }

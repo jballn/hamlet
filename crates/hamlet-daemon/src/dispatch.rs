@@ -42,7 +42,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{fmt, fs, io};
 
-use hamlet_core::config::Secret;
+use hamlet_core::config::{Secret, Secrets};
 use hamlet_core::dispatch::{
     file_name, is_retryable_status, InboxResponse, Method, OutboxRequest, Outcome, UrlAllowlist,
     MAX_INBOX_BODY_BYTES, MAX_OUTBOX_BYTES,
@@ -751,6 +751,16 @@ pub fn load_env_secrets(tree: &HamletTree) -> Result<BTreeMap<String, Secret>, D
         }
     }
     Ok(secrets)
+}
+
+/// Load `.env` into typed [`Secrets`] (SPEC §11.4).
+///
+/// Confined to this seam per ADR-0020 cl. 6, ADR-0022 cl. 1, and CONVENTIONS §6.
+pub fn load_secrets(tree: &HamletTree) -> Result<Secrets, DispatchPlaneError> {
+    let map = load_env_secrets(tree)?;
+    Ok(Secrets::from_vars(
+        map.iter().map(|(k, v)| (k.as_str(), v.expose())),
+    ))
 }
 
 /// The requesting slot uid behind a dispatch correlation

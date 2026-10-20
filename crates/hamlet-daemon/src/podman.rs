@@ -2232,6 +2232,7 @@ impl Runtime for FakeRuntime {
             if let Some(err) = self.take_failure(&recorded) {
                 return Err(err);
             }
+            self.lock(&self.script).state = ContainerState::Exited;
             Ok(())
         })
     }
@@ -2243,6 +2244,7 @@ impl Runtime for FakeRuntime {
             if let Some(err) = self.take_failure(&recorded) {
                 return Err(err);
             }
+            self.lock(&self.script).state = ContainerState::Exited;
             Ok(())
         })
     }
@@ -2319,6 +2321,7 @@ impl Runtime for FakeRuntime {
             if let Some(err) = self.take_failure(&recorded) {
                 return Err(err);
             }
+            self.lock(&self.script).state = ContainerState::Exited;
             Ok(())
         })
     }

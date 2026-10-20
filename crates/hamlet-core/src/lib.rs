@@ -23,6 +23,7 @@
 //! | [`commission`] | commission lifecycle state machine | §9 |
 //! | [`promote`] | DEED/vault promotion parsing | §9.4, §10 |
 //! | [`stasis`] | hibernation/census types | §10 |
+//! | [`api`] | local API wire contracts (schemas, endpoints, WS) | §12.1–§12.2 |
 //!
 //! **Purity seam (CONVENTIONS §2, review-failable):** this crate performs no
 //! filesystem, process, or network side effects, beyond the two sanctioned
@@ -34,6 +35,7 @@
 //! agents, over `BTreeMap`/`BTreeSet` state with no wall-clock reads
 //! (CONVENTIONS §3).
 
+pub mod api;
 pub mod blueprint;
 pub mod charter;
 pub mod commission;

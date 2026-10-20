@@ -48,8 +48,10 @@ use serde::{Deserialize, Serialize};
 /// additive `mayor.ack_retry_ms` — the re-notification interval for an
 /// acknowledged-never decree, so an ack timeout wakes the Mayor **once per
 /// timeout** with a bounded, operator-visible cadence instead of once per
-/// process lifetime.
-pub const CONFIG_VERSION: u32 = 10;
+/// process lifetime. v10 → v11 (Sprint 07, ADR-0040 cl. 2–3): additive
+/// `resources.cpu_shares`, `resources.memory_pressure_threshold_pct`,
+/// `resources.sample_window`, and `resources.sample_interval_secs`.
+pub const CONFIG_VERSION: u32 = 11;
 
 /// Default daemon data dir (sled telemetry location). Relative paths
 /// resolve against the *working directory containing* the village root —
@@ -84,8 +86,16 @@ const DEFAULT_WEBHOOK_MAX_BODY_BYTES: u64 = 64 * 1024;
 const DEFAULT_CONTAINER_MEMORY: &str = "512m";
 /// Default container CPU limit (`--cpus` value).
 const DEFAULT_CONTAINER_CPUS: &str = "1.0";
+/// Default container relative CPU weight (`--cpu-shares` value, ADR-0040 cl. 2).
+const DEFAULT_CONTAINER_CPU_SHARES: u64 = 1024;
 /// Default container PID limit (`--pids-limit`); fork-bomb brace.
 const DEFAULT_CONTAINER_PIDS_LIMIT: u64 = 256;
+/// Default memory pressure threshold percentage (ADR-0040 cl. 3).
+const DEFAULT_MEMORY_PRESSURE_THRESHOLD_PCT: u8 = 85;
+/// Default consecutive samples for memory pressure detection window (ADR-0040 cl. 3).
+const DEFAULT_PRESSURE_SAMPLE_WINDOW: usize = 3;
+/// Default sample interval in seconds for pressure detection (ADR-0040 cl. 3).
+const DEFAULT_PRESSURE_SAMPLE_INTERVAL_SECS: u64 = 5;
 /// Default readiness-probe timeout for spawned sessions (ADR-0015 cl. 4).
 const DEFAULT_SESSION_READY_TIMEOUT_MS: u64 = 30_000;
 /// Default graceful-stop window before SIGKILL (ADR-0015 cl. 4).
@@ -678,11 +688,11 @@ fn cpus_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"^[0-9]+(\.[0-9]+)?%?$").unwrap())
 }
 
-/// Container resource-limit settings (SPEC §4 hardening; policy **[DEV]**
-/// until the Sprint 07 ADR — these are the `config.json` placeholders the
-/// daemon's podman layer wires into every `podman run`). Defaults are
-/// deliberately conservative; values are charset-validated because they
-/// land verbatim in argv (ADR-0010: typed sources only, never a shell).
+/// Container resource-limit settings (SPEC §4 hardening; policy fixed by
+/// ADR-0040 — these are the `config.json` settings wired into every `podman run`
+/// and the daemon's rolling telemetry monitor). Defaults are deliberately
+/// conservative; values are charset-validated because they land verbatim
+/// in argv (ADR-0010: typed sources only, never a shell).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResourcesConfig {
@@ -690,8 +700,40 @@ pub struct ResourcesConfig {
     pub memory: String,
     /// `--cpus` value, e.g. `"1.0"` or `"50%"`.
     pub cpus: String,
+    /// `--cpu-shares` value (2..=262144, default 1024; ADR-0040 cl. 2).
+    #[serde(default = "default_container_cpu_shares")]
+    pub cpu_shares: u64,
     /// `--pids-limit` (1..=65535; unlimited is never a default).
     pub pids_limit: u64,
+    /// Memory pressure threshold percentage (50..=99, default 85; ADR-0040 cl. 3).
+    #[serde(default = "default_memory_pressure_threshold_pct")]
+    pub memory_pressure_threshold_pct: u8,
+    /// Consecutive samples window for pressure detection (1..=60, default 3; ADR-0040 cl. 3).
+    #[serde(default = "default_pressure_sample_window")]
+    pub sample_window: usize,
+    /// Sample interval in seconds for pressure detection (1..=300, default 5; ADR-0040 cl. 3).
+    #[serde(default = "default_pressure_sample_interval_secs")]
+    pub sample_interval_secs: u64,
+}
+
+#[must_use]
+fn default_container_cpu_shares() -> u64 {
+    DEFAULT_CONTAINER_CPU_SHARES
+}
+
+#[must_use]
+fn default_memory_pressure_threshold_pct() -> u8 {
+    DEFAULT_MEMORY_PRESSURE_THRESHOLD_PCT
+}
+
+#[must_use]
+fn default_pressure_sample_window() -> usize {
+    DEFAULT_PRESSURE_SAMPLE_WINDOW
+}
+
+#[must_use]
+fn default_pressure_sample_interval_secs() -> u64 {
+    DEFAULT_PRESSURE_SAMPLE_INTERVAL_SECS
 }
 
 impl Default for ResourcesConfig {
@@ -699,7 +741,11 @@ impl Default for ResourcesConfig {
         Self {
             memory: DEFAULT_CONTAINER_MEMORY.to_string(),
             cpus: DEFAULT_CONTAINER_CPUS.to_string(),
+            cpu_shares: DEFAULT_CONTAINER_CPU_SHARES,
             pids_limit: DEFAULT_CONTAINER_PIDS_LIMIT,
+            memory_pressure_threshold_pct: DEFAULT_MEMORY_PRESSURE_THRESHOLD_PCT,
+            sample_window: DEFAULT_PRESSURE_SAMPLE_WINDOW,
+            sample_interval_secs: DEFAULT_PRESSURE_SAMPLE_INTERVAL_SECS,
         }
     }
 }
@@ -722,10 +768,34 @@ impl ResourcesConfig {
                 self.cpus
             )));
         }
+        if !(2..=262_144).contains(&self.cpu_shares) {
+            return Err(ConfigError::Invalid(format!(
+                "resources.cpu_shares must be in 2..=262144, got {}",
+                self.cpu_shares
+            )));
+        }
         if self.pids_limit == 0 || self.pids_limit > 65535 {
             return Err(ConfigError::Invalid(format!(
                 "resources.pids_limit must be in 1..=65535, got {}",
                 self.pids_limit
+            )));
+        }
+        if !(50..=99).contains(&self.memory_pressure_threshold_pct) {
+            return Err(ConfigError::Invalid(format!(
+                "resources.memory_pressure_threshold_pct must be in 50..=99, got {}",
+                self.memory_pressure_threshold_pct
+            )));
+        }
+        if !(1..=60).contains(&self.sample_window) {
+            return Err(ConfigError::Invalid(format!(
+                "resources.sample_window must be in 1..=60, got {}",
+                self.sample_window
+            )));
+        }
+        if !(1..=300).contains(&self.sample_interval_secs) {
+            return Err(ConfigError::Invalid(format!(
+                "resources.sample_interval_secs must be in 1..=300, got {}",
+                self.sample_interval_secs
             )));
         }
         Ok(())
@@ -1104,12 +1174,12 @@ mod tests {
     use super::*;
 
     /// Committed golden vector: the exact bytes `hamlet init` writes to
-    /// `config.json` (defaults, `config_version` 10).
+    /// `config.json` (defaults, `config_version` 11).
     #[test]
     fn default_config_render_golden() {
         let expected = "\
 {
-  \"config_version\": 10,
+  \"config_version\": 11,
   \"daemon_data_dir\": \".hamlet-data/sled\",
   \"podman_bin\": \"podman\",
   \"base_image\": \"docker.io/library/alpine:3.20\",
@@ -1126,7 +1196,11 @@ mod tests {
   \"resources\": {
     \"memory\": \"512m\",
     \"cpus\": \"1.0\",
-    \"pids_limit\": 256
+    \"cpu_shares\": 1024,
+    \"pids_limit\": 256,
+    \"memory_pressure_threshold_pct\": 85,
+    \"sample_window\": 3,
+    \"sample_interval_secs\": 5
   },
   \"sessions\": {
     \"ready_timeout_ms\": 30000,
@@ -1447,6 +1521,54 @@ mod tests {
         assert_eq!(parsed.config_version, 9);
         assert_eq!(parsed.mayor.crash_wake, CrashWakePolicy::Every);
         assert_eq!(parsed.mayor.ack_retry_ms, 600_000);
+    }
+
+    /// v10 → v11 is additive: a v10 document (which only had memory, cpus,
+    /// pids_limit in `resources`) parses cleanly and picks up the default
+    /// cpu_shares and pressure detection knobs (ADR-0040 cl. 2–3).
+    #[test]
+    fn v10_config_parses_with_default_resources_extensions() {
+        let v10 = r#"{
+  "config_version": 10,
+  "daemon_data_dir": ".hamlet-data/sled",
+  "podman_bin": "podman",
+  "base_image": "docker.io/library/alpine:3.20",
+  "web_listen_addr": "127.0.0.1:8787",
+  "log_level": "info",
+  "mayor": {
+    "ack_timeout_ms": 30000,
+    "wake_queue_depth": 16,
+    "turn_timeout_ms": 120000,
+    "crash_wake": "budget_exhausted",
+    "escalation_webhook_url": null,
+    "ack_retry_ms": 600000
+  },
+  "dispatch": {
+    "enabled": false,
+    "timeout_secs": 30,
+    "url_allowlist": [],
+    "max_attempts": 5,
+    "backoff_initial_ms": 5000,
+    "backoff_max_ms": 900000
+  },
+  "resources": { "memory": "512m", "cpus": "1.0", "pids_limit": 256 },
+  "sessions": {
+    "ready_timeout_ms": 30000,
+    "stop_grace_ms": 10000,
+    "queue_depth": 64,
+    "latency_spike_ms": 30000,
+    "continue_on_restart": true,
+    "restart": { "max_restarts": 5, "backoff_initial_ms": 1000, "backoff_max_ms": 60000 }
+  },
+  "webhooks": { "enabled": false, "auth_env_key": "HAMLET_WEBHOOK_AUTH", "max_body_bytes": 65536, "routes": {} }
+}
+"#;
+        let parsed = Config::parse(v10).expect("v10 must still parse");
+        assert_eq!(parsed.config_version, 10);
+        assert_eq!(parsed.resources.cpu_shares, 1024);
+        assert_eq!(parsed.resources.memory_pressure_threshold_pct, 85);
+        assert_eq!(parsed.resources.sample_window, 3);
+        assert_eq!(parsed.resources.sample_interval_secs, 5);
     }
 
     /// The retry interval is the only thing standing between "once per
@@ -1916,13 +2038,69 @@ mod tests {
                 "pids_limit {bad} must be rejected"
             );
         }
+        for bad in [0u64, 1, 262_145] {
+            let cfg = Config {
+                resources: ResourcesConfig {
+                    cpu_shares: bad,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            assert!(
+                matches!(cfg.validate(), Err(ConfigError::Invalid(_))),
+                "cpu_shares {bad} must be rejected"
+            );
+        }
+        for bad in [0u8, 49, 100] {
+            let cfg = Config {
+                resources: ResourcesConfig {
+                    memory_pressure_threshold_pct: bad,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            assert!(
+                matches!(cfg.validate(), Err(ConfigError::Invalid(_))),
+                "memory_pressure_threshold_pct {bad} must be rejected"
+            );
+        }
+        for bad in [0usize, 61] {
+            let cfg = Config {
+                resources: ResourcesConfig {
+                    sample_window: bad,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            assert!(
+                matches!(cfg.validate(), Err(ConfigError::Invalid(_))),
+                "sample_window {bad} must be rejected"
+            );
+        }
+        for bad in [0u64, 301] {
+            let cfg = Config {
+                resources: ResourcesConfig {
+                    sample_interval_secs: bad,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            assert!(
+                matches!(cfg.validate(), Err(ConfigError::Invalid(_))),
+                "sample_interval_secs {bad} must be rejected"
+            );
+        }
         for memory in ["512m", "2g", "1024"] {
             for cpus in ["1", "1.0", "50%"] {
                 let cfg = Config {
                     resources: ResourcesConfig {
                         memory: memory.to_string(),
                         cpus: cpus.to_string(),
+                        cpu_shares: 1024,
                         pids_limit: 256,
+                        memory_pressure_threshold_pct: 85,
+                        sample_window: 3,
+                        sample_interval_secs: 5,
                     },
                     ..Default::default()
                 };

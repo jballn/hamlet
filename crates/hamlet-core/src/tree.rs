@@ -64,6 +64,9 @@ const REJECTED: &str = ".rejected";
 /// the daemon — the singular governor — is what files the notice where a
 /// human (CLI, Sprint 08) will look for it.
 const ESCALATIONS: &str = "escalations";
+/// Hidden operator-resolution records beside the escalation inbox
+/// (ADR-0043 cl. 3) — hidden like `decrees/.rejected`, never a notice.
+const RESOLVED: &str = ".resolved";
 
 /// Static (identity-independent) directories created by [`HamletTree::ensure`].
 /// Per-UID and per-name directories are deliberately absent (lazy creation).
@@ -205,6 +208,24 @@ impl HamletTree {
         self.join(&["config.json"])
     }
 
+    /// `daemon.pid` — process ID of the running daemon (SPEC §12.1; ADR-0041).
+    #[must_use]
+    pub fn daemon_pid(&self) -> PathBuf {
+        self.join(&["daemon.pid"])
+    }
+
+    /// `daemon.token` — local authentication secret, mode 0600 (ADR-0041).
+    #[must_use]
+    pub fn daemon_token(&self) -> PathBuf {
+        self.join(&["daemon.token"])
+    }
+
+    /// `daemon.endpoint` — localhost HTTP/WS descriptor JSON (ADR-0041).
+    #[must_use]
+    pub fn daemon_endpoint(&self) -> PathBuf {
+        self.join(&["daemon.endpoint"])
+    }
+
     // --- guild -----------------------------------------------------------
 
     /// `guild/`
@@ -323,6 +344,12 @@ impl HamletTree {
     #[must_use]
     pub fn patron_md(&self, name: &SafeName) -> PathBuf {
         self.patron(name).join("PROPRIETOR.md")
+    }
+
+    /// `…/PROPRIETOR<name>/manifest.json` — backed-up home integrity manifest.
+    #[must_use]
+    pub fn patron_manifest(&self, name: &SafeName) -> PathBuf {
+        self.patron(name).join("manifest.json")
     }
 
     // --- courier ---------------------------------------------------------
@@ -538,6 +565,19 @@ impl HamletTree {
         self.join(&[KEEP, ARCHIVES, &format!("commission{commission}")])
     }
 
+    /// `keep/archives/commission<n>-convergence.json` — dual convergence summary archive (SPEC §10).
+    #[must_use]
+    pub fn commission_convergence_archive(&self, commission: u64) -> PathBuf {
+        self.keep_archives()
+            .join(format!("commission{commission}-convergence.json"))
+    }
+
+    /// `keep/archives/parcel<uid>/` — archived metadata of a hibernated parcel (SPEC §10).
+    #[must_use]
+    pub fn parcel_archive(&self, uid: u32) -> PathBuf {
+        self.join(&[KEEP, ARCHIVES, &format!("parcel{uid}")])
+    }
+
     /// `keep/census/` — active working subtask directories.
     #[must_use]
     pub fn keep_census(&self) -> PathBuf {
@@ -616,6 +656,12 @@ impl HamletTree {
         self.manor().join("MAYOR.md")
     }
 
+    /// `…/manor/TITLE.md` — Mayor chain-of-title lineage (exempt from hibernation).
+    #[must_use]
+    pub fn manor_title(&self) -> PathBuf {
+        self.manor().join("TITLE.md")
+    }
+
     /// `keep/census/manor/home/decrees/` — the watched decree directory
     /// (ADR-0026 cl. 2; `/home/1000/decrees/` in the Mayor container). The
     /// Mayor may write nowhere else (SPEC §4 mounts only its home rw), so
@@ -679,6 +725,30 @@ impl HamletTree {
                 .expect("DecreeId renders a SafeName")
                 .as_str(),
         )
+    }
+
+    /// `…/manor/escalations/<notice>` — a notice addressed by its file name
+    /// (ADR-0043 cl. 3). Not every writer names notices by [`DecreeId`]
+    /// (the vault's promotion-rejection notice does not), so the operator
+    /// inbox keys on the sanitized file name.
+    #[must_use]
+    pub fn manor_escalation_notice(&self, notice: &SafeName) -> PathBuf {
+        self.manor_escalations().join(notice.as_str())
+    }
+
+    /// `…/manor/escalations/.resolved/` — operator resolution records
+    /// (ADR-0043 cl. 3). Daemon-written; notices themselves are never
+    /// moved or edited.
+    #[must_use]
+    pub fn manor_escalations_resolved(&self) -> PathBuf {
+        self.join(&[KEEP, CENSUS, MANOR, ESCALATIONS, RESOLVED])
+    }
+
+    /// `…/manor/escalations/.resolved/<notice file>` — the resolution record
+    /// for the notice whose file name is `notice` (a [`SafeName`]).
+    #[must_use]
+    pub fn manor_escalation_resolution(&self, notice: &SafeName) -> PathBuf {
+        self.manor_escalations_resolved().join(notice.as_str())
     }
 
     /// The one place village paths are composed. Private by design
@@ -833,6 +903,10 @@ mod tests {
             PathBuf::from("/v/.hamlet/tavern/patrons/PROPRIETORmayor/PROPRIETOR.md")
         );
         assert_eq!(
+            tree.patron_manifest(&n),
+            PathBuf::from("/v/.hamlet/tavern/patrons/PROPRIETORmayor/manifest.json")
+        );
+        assert_eq!(
             tree.courier_mail_recipient(&name("1001")),
             PathBuf::from("/v/.hamlet/courier/mail/1001")
         );
@@ -881,6 +955,14 @@ mod tests {
             PathBuf::from("/v/.hamlet/keep/archives/commission1")
         );
         assert_eq!(
+            tree.commission_convergence_archive(1),
+            PathBuf::from("/v/.hamlet/keep/archives/commission1-convergence.json")
+        );
+        assert_eq!(
+            tree.parcel_archive(1042),
+            PathBuf::from("/v/.hamlet/keep/archives/parcel1042")
+        );
+        assert_eq!(
             tree.parcel(1042),
             PathBuf::from("/v/.hamlet/keep/census/parcel1042")
         );
@@ -912,6 +994,10 @@ mod tests {
             tree.manor_mayor_md(),
             PathBuf::from("/v/.hamlet/keep/census/manor/MAYOR.md")
         );
+        assert_eq!(
+            tree.manor_title(),
+            PathBuf::from("/v/.hamlet/keep/census/manor/TITLE.md")
+        );
         // decree directory layout (ADR-0026 cl. 2)
         assert_eq!(
             tree.manor_decrees(),
@@ -937,6 +1023,15 @@ mod tests {
         assert_eq!(tree.env_file(), PathBuf::from("/v/.hamlet/.env"));
         assert_eq!(tree.charter(), PathBuf::from("/v/.hamlet/charter.json"));
         assert_eq!(tree.config(), PathBuf::from("/v/.hamlet/config.json"));
+        assert_eq!(tree.daemon_pid(), PathBuf::from("/v/.hamlet/daemon.pid"));
+        assert_eq!(
+            tree.daemon_token(),
+            PathBuf::from("/v/.hamlet/daemon.token")
+        );
+        assert_eq!(
+            tree.daemon_endpoint(),
+            PathBuf::from("/v/.hamlet/daemon.endpoint")
+        );
     }
 
     /// `static_dirs` covers the root + exactly the dirs `ensure` creates,

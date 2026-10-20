@@ -350,6 +350,16 @@ impl DeedPromoter {
                     "deed_alteration_rejected",
                     format!("parcel{uid}: {deed_err}"),
                 );
+                let _ = crate::census::stamp_parcel_title(
+                    &self.tree,
+                    uid,
+                    hamlet_core::stasis::TitleEntry::Promotion {
+                        timestamp: crate::census::now_iso8601(),
+                        kind: "deed".to_string(),
+                        target: format!("{uid}"),
+                        status: "rejected".to_string(),
+                    },
+                );
                 return Ok(PromotionOutcome::Rejected {
                     uid,
                     reason: deed_err.to_string(),
@@ -449,6 +459,17 @@ impl DeedPromoter {
                 "{bp_name} v{old_version} -> v{new_version} ({} alterations, digest {digest})",
                 alterations.len()
             ),
+        );
+
+        let _ = crate::census::stamp_parcel_title(
+            &self.tree,
+            uid,
+            hamlet_core::stasis::TitleEntry::Promotion {
+                timestamp: crate::census::now_iso8601(),
+                kind: "deed".to_string(),
+                target: format!("{bp_name}.v{new_version}"),
+                status: "promoted".to_string(),
+            },
         );
 
         Ok(PromotionOutcome::Promoted {

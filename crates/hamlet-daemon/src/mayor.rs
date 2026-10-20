@@ -379,6 +379,31 @@ impl ManorProvisioner {
         if !seeded {
             set_mode(&self.tree.manor_mayor_md(), MODE_PARCEL_DOC)?;
         }
+        // Manor exempt from hibernation: TITLE lives at keep/census/manor/TITLE.md (SPEC §10)
+        let manor_title = self.tree.manor_title();
+        if !manor_title.exists() {
+            let title_content =
+                crate::census::manor_title_stub(blueprint, crate::census::unix_now());
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&manor_title)
+                .map_err(io_err(format!("create {}", manor_title.display())))?;
+            file.write_all(title_content.as_bytes())
+                .map_err(io_err(format!("write {}", manor_title.display())))?;
+            set_mode(&manor_title, MODE_PARCEL_DOC)?;
+            if let Ok(doc) = hamlet_core::stasis::TitleDoc::parse(&title_content) {
+                let mut cache = crate::census::title_cache()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                cache.insert(
+                    (self.tree.root().to_path_buf(), MAYOR_UID),
+                    (doc.entries.clone(), doc.content_digest()),
+                );
+            }
+        } else {
+            set_mode(&manor_title, MODE_PARCEL_DOC)?;
+        }
 
         // --- 3. host permission braces (ADR-0011) ------------------------
         let perms = HostPermissions::new(self.runtime.as_ref());
@@ -813,6 +838,31 @@ impl WakeEvent {
                 body,
             )?,
             source: WakeSource::new("deliverable-submitted", format!("{commission}/{uid}")),
+        })
+    }
+
+    /// TITLE.md chain-of-title tamper evidence (SPEC §10).
+    ///
+    /// # Errors
+    ///
+    /// [`MayorError`] — cap refusal.
+    pub fn from_title_tampered(
+        uid: u32,
+        identity: SafeName,
+        detail: impl Into<String>,
+    ) -> Result<Self, MayorError> {
+        let det = detail.into();
+        let body = format!("tamper evidence on TITLE.md for agent {identity} (uid {uid}): {det}\n");
+        Ok(Self {
+            artifact: EventArtifact::new(
+                EventKind::TitleTampered {
+                    uid,
+                    identity: identity.clone(),
+                    detail: det,
+                },
+                body,
+            )?,
+            source: WakeSource::new("title-tamper", format!("{uid}/{identity}")),
         })
     }
 

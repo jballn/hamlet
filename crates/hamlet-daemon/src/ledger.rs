@@ -66,10 +66,12 @@ use hamlet_core::mail::{Mail, MailError, MailHeader, MailSender, SYSTEM_SENDER};
 use hamlet_core::packet::MAX_ARTIFACT_BYTES;
 use hamlet_core::sanitize::{sanitize_name, SafeName, SanitizeError};
 use hamlet_core::slots::MAYOR_UID;
+use hamlet_core::stasis::{BranchOutcome, CommissionConvergenceSummary, DualConvergenceReport};
 use hamlet_core::tree::HamletTree;
 use hamlet_core::watch::Reaction;
 use serde::{Deserialize, Serialize};
 
+use crate::census::ProductionStasis;
 use crate::hostperm::{MODE_PARCEL_DOC, MODE_SHARED_READONLY};
 use crate::mailroute::{MailActor, MailRouteError, MailRouter};
 use crate::mayor::{MayorEngine, MayorError, WakeEvent};
@@ -299,6 +301,10 @@ pub trait CommissionWake: Send + Sync {
     /// Notify the Mayor plane that an agent submitted a deliverable for review
     /// (`WakeReason::DeliverableSubmitted`, SPEC §7, §9.4).
     fn deliverable_submitted(&self, _commission: u64, _event: &WakeEvent) {}
+
+    /// Notify the Mayor plane that dual-state convergence at commission end
+    /// experienced one or more promotion failures (ADR-0039 cl. 5).
+    fn convergence_failed(&self, _commission: u64, _summary: &CommissionConvergenceSummary) {}
 }
 
 /// Default no-op wake hook used when no in-process [`MayorEngine`] is wired
@@ -315,6 +321,7 @@ impl CommissionWake for NoopCommissionWake {
 #[derive(Debug, Default)]
 pub struct RecordingCommissionWake {
     events: Mutex<Vec<(u64, WakeEvent)>>,
+    convergence_failures: Mutex<Vec<(u64, CommissionConvergenceSummary)>>,
 }
 
 impl RecordingCommissionWake {
@@ -328,6 +335,15 @@ impl RecordingCommissionWake {
     #[must_use]
     pub fn events(&self) -> Vec<(u64, WakeEvent)> {
         self.events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Snapshot of all recorded `(commission_id, CommissionConvergenceSummary)` failures.
+    #[must_use]
+    pub fn convergence_failures(&self) -> Vec<(u64, CommissionConvergenceSummary)> {
+        self.convergence_failures
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
@@ -380,6 +396,13 @@ impl CommissionWake for RecordingCommissionWake {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push((commission, event.clone()));
+    }
+
+    fn convergence_failed(&self, commission: u64, summary: &CommissionConvergenceSummary) {
+        self.convergence_failures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((commission, summary.clone()));
     }
 }
 
@@ -991,6 +1014,8 @@ pub struct CommissionCloseReport {
     pub parcels_stopped: usize,
     /// Path to exported telemetry summary when exported.
     pub archives_exported: Option<PathBuf>,
+    /// Dual convergence summary across rostered parcels (SPEC §10; ADR-0039).
+    pub convergence: Option<CommissionConvergenceSummary>,
 }
 
 impl CommissionCloseReport {
@@ -1004,7 +1029,7 @@ impl CommissionCloseReport {
             Some(p) => p.display().to_string(),
             None => "none".to_string(),
         };
-        format!(
+        let mut out = format!(
             "hamlet commission close: commission{id} ({slug})\n\
              \x20 id:            {id}\n\
              \x20 slug:          {slug}\n\
@@ -1012,7 +1037,18 @@ impl CommissionCloseReport {
              \x20 parcels stopped: {}\n\
              \x20 archives:      {archives}\n",
             self.parcels_stopped
-        )
+        );
+        if let Some(conv) = &self.convergence {
+            out.push_str(&format!(
+                " \x20 convergence:   {}\n",
+                if conv.overall_success() {
+                    "ok"
+                } else {
+                    "failed"
+                }
+            ));
+        }
+        out
     }
 }
 
@@ -1230,6 +1266,8 @@ pub struct Ledger {
     mail: Option<Arc<MailRouter>>,
     telemetry: Option<Arc<Telemetry>>,
     promoter: Option<Arc<DeedPromoter>>,
+    stasis: Option<Arc<ProductionStasis>>,
+    runtime: Option<Arc<dyn Runtime>>,
     promotion_trigger: PromotionTrigger,
     podman_bin: PathBuf,
     max_indenture_retries: u32,
@@ -1257,6 +1295,8 @@ impl Ledger {
             mail: None,
             telemetry: None,
             promoter: None,
+            stasis: None,
+            runtime: None,
             promotion_trigger: PromotionTrigger::EntryCompletion,
             podman_bin: PathBuf::from("podman"),
             max_indenture_retries: DEFAULT_MAX_INDENTURE_RETRIES,
@@ -1284,6 +1324,32 @@ impl Ledger {
     #[must_use]
     pub fn promoter(&self) -> Option<&Arc<DeedPromoter>> {
         self.promoter.as_ref()
+    }
+
+    /// Attach a [`ProductionStasis`] instance for patron stasis and dual convergence.
+    #[must_use]
+    pub fn with_stasis(mut self, stasis: Arc<ProductionStasis>) -> Self {
+        self.stasis = Some(stasis);
+        self
+    }
+
+    /// Borrow the attached [`ProductionStasis`] if installed.
+    #[must_use]
+    pub fn stasis(&self) -> Option<&Arc<ProductionStasis>> {
+        self.stasis.as_ref()
+    }
+
+    /// Attach a [`Runtime`] implementation for container operations.
+    #[must_use]
+    pub fn with_runtime(mut self, runtime: Arc<dyn Runtime>) -> Self {
+        self.runtime = Some(runtime);
+        self
+    }
+
+    /// Borrow the attached [`Runtime`] if installed.
+    #[must_use]
+    pub fn runtime(&self) -> Option<&Arc<dyn Runtime>> {
+        self.runtime.as_ref()
     }
 
     /// Attach a [`CommissionWake`] hook (e.g. [`RecordingCommissionWake`] in
@@ -1869,6 +1935,18 @@ impl Ledger {
         record.apply_event(&CommissionEvent::DeliverableSubmitted)?;
         charter.save_atomic(&self.tree.charter())?;
 
+        let target = freight_path.unwrap_or("deliverable").to_string();
+        let _ = crate::census::stamp_parcel_title(
+            &self.tree,
+            uid,
+            hamlet_core::stasis::TitleEntry::Promotion {
+                timestamp: crate::census::now_iso8601(),
+                kind: "submission".to_string(),
+                target,
+                status: "submitted".to_string(),
+            },
+        );
+
         let body = notes.unwrap_or("deliverable submitted for review\n");
         let wake = WakeEvent::from_deliverable_submitted(commission, uid, freight_path, body)
             .map_err(LedgerError::Wake)?;
@@ -1894,8 +1972,10 @@ impl Ledger {
     }
 
     /// Operator commission close (`hamlet commission close <slug>`):
-    /// Advances commission to `WindingDown`, stops any running parcel sessions,
-    /// advances state to `Closed` (`OperatorClose`), exports final telemetry
+    /// Advances commission to `WindingDown`, executes dual-state convergence
+    /// for each rostered parcel (DEED -> blueprint and PROPRIETOR -> patron
+    /// independently), stops any running parcel sessions, advances state to
+    /// `Closed` (`OperatorClose`), exports final convergence and telemetry
     /// archives, and persists `charter.json`.
     pub fn close_commission(&self, slug: &str) -> Result<CommissionCloseReport, LedgerError> {
         let safe_slug = sanitize_name(slug)?;
@@ -1916,21 +1996,150 @@ impl Ledger {
                 state: CommissionState::Closed,
                 parcels_stopped: 0,
                 archives_exported: None,
+                convergence: None,
             });
         }
 
         let roster: Vec<u32> = record.roster.iter().copied().collect();
         let parcels_stopped = roster.len();
 
-        // Mark parcels stasis in charter
+        // Instantiate stasis executor
+        let stasis = match &self.stasis {
+            Some(s) => s.clone(),
+            None => {
+                let runtime = self.runtime.clone().unwrap_or_else(|| {
+                    Arc::new(crate::podman::PodmanRuntime::new(&self.podman_bin))
+                });
+                let mut s = ProductionStasis::new(self.tree.clone(), runtime);
+                if let Some(tel) = &self.telemetry {
+                    s = s.with_telemetry(tel.clone());
+                }
+                Arc::new(s)
+            }
+        };
+
+        // Dual-state convergence (SPEC §10; ADR-0039 cl. 5)
+        let mut summary = CommissionConvergenceSummary::new(commission_id);
+        for &uid in &roster {
+            let patron_name = charter
+                .slots
+                .get(&uid)
+                .map(|s| s.identity.clone())
+                .unwrap_or_else(|| sanitize_name(&format!("agent{uid}")).unwrap());
+
+            // Branch 1: DEED -> blueprint (SPEC §9.4)
+            let deed_outcome = match self.promote_parcel_deed(uid) {
+                Ok(PromotionOutcome::Promoted {
+                    blueprint,
+                    old_version,
+                    new_version,
+                    alterations_count,
+                }) => BranchOutcome::Succeeded {
+                    detail: format!(
+                        "{blueprint} v{old_version}->v{new_version} ({alterations_count} alterations)"
+                    ),
+                },
+                Ok(PromotionOutcome::AlreadyMerged { blueprint, version }) => {
+                    BranchOutcome::Skipped {
+                        reason: format!("{blueprint} v{version} already merged"),
+                    }
+                }
+                Ok(PromotionOutcome::NoAlterations { .. }) => BranchOutcome::Skipped {
+                    reason: "no alterations".to_string(),
+                },
+                Ok(PromotionOutcome::Rejected { reason, .. }) => BranchOutcome::Failed {
+                    error: reason,
+                },
+                Err(e) => BranchOutcome::Failed {
+                    error: e.to_string(),
+                },
+            };
+
+            // Branch 2: PROPRIETOR -> patron (SPEC §10)
+            let trigger = format!("commission:{commission_id}:close");
+            let proprietor_outcome = match stasis.hibernate_sync(uid, &trigger) {
+                Ok(doc) => BranchOutcome::Succeeded {
+                    detail: format!("patron {} hibernated", doc.frontmatter.patron),
+                },
+                Err(e) => BranchOutcome::Failed {
+                    error: e.to_string(),
+                },
+            };
+
+            summary.record(DualConvergenceReport {
+                parcel_uid: uid,
+                patron_name,
+                deed_outcome,
+                proprietor_outcome,
+            });
+        }
+
+        // Export convergence archive
+        let conv_path = self.tree.commission_convergence_archive(commission_id);
+        if let Some(parent) = conv_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(conv_json) = serde_json::to_string_pretty(&summary) {
+            let _ = write_atomic_file(&conv_path, conv_json.as_bytes(), 0o644);
+        }
+
+        // Surface failures as EscalateToHuman-eligible events
+        if !summary.overall_success() {
+            self.wake.convergence_failed(commission_id, &summary);
+            let decree_id = DecreeId::new(MAYOR_UID as u64, format!("{:016x}", commission_id))
+                .unwrap_or_else(|_| DecreeId::new(1, "0000000000000001").unwrap());
+            let mut evidence_refs = Vec::new();
+            if let Ok(rel) = TreeRelPath::parse(&format!(
+                "keep/archives/commission{commission_id}-convergence.json"
+            )) {
+                evidence_refs.push(rel);
+            }
+            let failed_uids = summary.failed_parcels();
+            let notice = EscalationNotice {
+                escalation_version: ESCALATION_VERSION,
+                decree_id: decree_id.clone(),
+                evidence_refs,
+                recorded_unix_ms: unix_now_ms(),
+                summary: format!(
+                    "commission {commission_id} dual convergence failure for parcels: {failed_uids:?}"
+                ),
+            };
+            if let Ok(rendered) = notice.render() {
+                let escalations_dir = self.tree.manor_escalations();
+                let _ = create_dir_checked(&escalations_dir, MODE_SHARED_READONLY);
+                let path = self.tree.manor_escalation_file(&decree_id);
+                let _ = write_atomic_file(&path, rendered.as_bytes(), MODE_COMMISSION_DOC);
+            }
+            if let Some(tel) = &self.telemetry {
+                for failed_uid in failed_uids {
+                    let record = TraceRecord {
+                        at_unix_ms: unix_now_ms(),
+                        event: "commission-convergence-failed".to_string(),
+                        detail: format!(
+                            "commission {commission_id} convergence failed for parcel {failed_uid}"
+                        ),
+                    };
+                    let _ = tel.trace_event(
+                        AgentKey {
+                            commission: commission_id,
+                            uid: failed_uid,
+                        },
+                        record,
+                    );
+                }
+            }
+        }
+
+        // Reload charter to incorporate any mutations from stasis.hibernate_sync
+        let mut charter = Charter::load(&self.tree.charter())?;
+        if let Some(record) = charter.commissions.get_mut(&commission_id) {
+            record.apply_event(&CommissionEvent::OperatorClose)?;
+        }
         for &uid in &roster {
             if let Some(lease) = charter.parcels.get_mut(&uid) {
                 lease.stasis = true;
             }
         }
-
-        // Advance state via OperatorClose
-        record.apply_event(&CommissionEvent::OperatorClose)?;
         charter.save_atomic(&self.tree.charter())?;
 
         // Export telemetry archives if telemetry available
@@ -1952,6 +2161,7 @@ impl Ledger {
             state: CommissionState::Closed,
             parcels_stopped,
             archives_exported,
+            convergence: Some(summary),
         })
     }
 
@@ -2539,6 +2749,16 @@ impl Ledger {
             uid,
             "git_bundle_accepted",
             format!("bundle={bundle_name} ref={target_ref} base={base_for_diff} head={head_oid}"),
+        );
+        let _ = crate::census::stamp_parcel_title(
+            &self.tree,
+            uid,
+            hamlet_core::stasis::TitleEntry::Promotion {
+                timestamp: crate::census::now_iso8601(),
+                kind: "bundle".to_string(),
+                target: bundle_name.to_string(),
+                status: "applied".to_string(),
+            },
         );
         self.wake.git_diff_ready(commission, &wake);
 
@@ -3496,27 +3716,45 @@ fn run_git(
 /// subagents mounting `/var/git/` `:ro` can traverse and fetch regardless of
 /// the daemon host user's `umask` (ADR-0011).
 fn normalize_repo_permissions(git_dir: &Path) -> Result<(), LedgerError> {
-    let meta =
-        fs::symlink_metadata(git_dir).map_err(io_err(&format!("stat {}", git_dir.display())))?;
+    let meta = match fs::symlink_metadata(git_dir) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(io_err(&format!("stat {}", git_dir.display()))(e)),
+    };
     if meta.file_type().is_symlink() {
         return Err(LedgerError::SymlinkRefused {
             path: git_dir.to_path_buf(),
         });
     }
     if meta.is_dir() {
-        fs::set_permissions(git_dir, fs::Permissions::from_mode(MODE_SHARED_READONLY))
-            .map_err(io_err(&format!("chmod 0755 {}", git_dir.display())))?;
-        for entry in
-            fs::read_dir(git_dir).map_err(io_err(&format!("read_dir {}", git_dir.display())))?
+        if let Err(e) =
+            fs::set_permissions(git_dir, fs::Permissions::from_mode(MODE_SHARED_READONLY))
         {
-            let entry = entry.map_err(io_err(&format!("entry in {}", git_dir.display())))?;
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(io_err(&format!("chmod 0755 {}", git_dir.display()))(e));
+            }
+        }
+        let read_dir = match fs::read_dir(git_dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(io_err(&format!("read_dir {}", git_dir.display()))(e)),
+        };
+        for entry in read_dir {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(io_err(&format!("entry in {}", git_dir.display()))(e)),
+            };
             normalize_repo_permissions(&entry.path())?;
         }
     } else if meta.is_file() {
         let current = meta.permissions().mode() & 0o777;
         let mode = (current | 0o444) & !0o022;
-        fs::set_permissions(git_dir, fs::Permissions::from_mode(mode))
-            .map_err(io_err(&format!("chmod {:04o} {}", mode, git_dir.display())))?;
+        if let Err(e) = fs::set_permissions(git_dir, fs::Permissions::from_mode(mode)) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(io_err(&format!("chmod {:04o} {}", mode, git_dir.display()))(e));
+            }
+        }
     }
     Ok(())
 }

@@ -164,6 +164,28 @@ pub fn allocate(
     Ok(uid)
 }
 
+/// Allocate the next available sequential permanent slot for `identity`,
+/// even if `identity` previously held an earlier (now hibernated) slot
+/// (SPEC §10 quick awakening).
+///
+/// The previous slot mapping persists as historical lineage; the newly
+/// allocated slot is bound to `identity`.
+///
+/// # Errors
+///
+/// [`SlotError::Exhausted`] when every uid in 1001–2000 is occupied.
+pub fn allocate_fresh(
+    slots: &mut SlotTable,
+    identity: SafeName,
+    commission: Option<u64>,
+) -> Result<u32, SlotError> {
+    let Some(uid) = next_free_uid(slots) else {
+        return Err(SlotError::Exhausted { identity });
+    };
+    slots.insert(uid, SlotRecord::new(identity, commission));
+    Ok(uid)
+}
+
 /// Lowest unallocated uid in 1001–2000, or `None` when the range is full.
 /// Pure scan over the sorted table; never returns an occupied uid, so a
 /// slot referenced by any surviving record can never be handed out again.

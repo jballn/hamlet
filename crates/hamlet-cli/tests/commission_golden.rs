@@ -18,6 +18,9 @@ use std::process::{Command, Stdio};
 
 use hamlet_cli::init;
 
+mod support;
+use support::start_test_daemon;
+
 const BIN: &str = env!("CARGO_BIN_EXE_hamlet");
 
 #[test]
@@ -25,6 +28,7 @@ fn cli_commission_new_list_show_match_golden_outputs() {
     let tmp = tempfile::tempdir().unwrap();
     let work = tmp.path();
     init::run(work).expect("hamlet init must succeed");
+    let _daemon = start_test_daemon(work);
 
     // 1. Empty `hamlet commission list` matches golden.
     let out = Command::new(BIN)
@@ -139,6 +143,7 @@ fn cli_commission_rejects_bad_slugs_symlinks_and_usage_errors() {
     let tmp = tempfile::tempdir().unwrap();
     let work = tmp.path();
     init::run(work).unwrap();
+    let _daemon = start_test_daemon(work);
 
     let brief = work.join("brief.md");
     fs::write(&brief, "# Valid brief\n").unwrap();
@@ -218,6 +223,7 @@ fn cli_commission_show_renders_indenture_entry_statuses() {
     let tmp = tempfile::tempdir().unwrap();
     let work = tmp.path();
     init::run(work).unwrap();
+    let _daemon = start_test_daemon(work);
 
     let brief = work.join("brief.md");
     fs::write(

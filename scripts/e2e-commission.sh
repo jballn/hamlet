@@ -66,6 +66,10 @@ TREE="$VILLAGE/.hamlet"
 [ -f "$TREE/charter.json" ] || fail "charter.json missing"
 pass "village tree initialized"
 
+# Start daemon for CLI commands over local API (SPEC §12.1; ADR-0041, ADR-0042)
+"$BIN" daemon start --dir "$VILLAGE" >/dev/null || fail "daemon start failed"
+pass "daemon started for commission lifecycle flow"
+
 # 2. hamlet commission new with brief and seed repo
 step "T1.2: hamlet commission new with brief and seeded repository"
 BRIEF="$WORK/brief.md"
@@ -210,6 +214,10 @@ if [ -d "$ARCHIVES_DIR" ]; then
 else
   fail "telemetry archives directory missing at $ARCHIVES_DIR"
 fi
+
+# Stop daemon cleanly
+"$BIN" daemon stop --dir "$VILLAGE" >/dev/null || fail "daemon stop failed"
+pass "daemon stopped"
 
 # --- T2: Adversarial Lifecycle Suite ----------------------------------------
 step "T2: adversarial lifecycle test suite (22 tests; SPEC §7, §9, §11.2)"

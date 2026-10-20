@@ -20,6 +20,9 @@ use hamlet_core::decree::content_digest;
 use hamlet_core::sanitize::sanitize_name;
 use hamlet_core::tree::HamletTree;
 
+mod support;
+use support::start_test_daemon;
+
 const BIN: &str = env!("CARGO_BIN_EXE_hamlet");
 
 fn setup_village(work: &std::path::Path) -> HamletTree {
@@ -58,6 +61,7 @@ fn cli_vault_list_and_export_lifecycle() {
     let tmp = tempfile::tempdir().unwrap();
     let work = tmp.path();
     let tree = setup_village(work);
+    let _daemon = start_test_daemon(work);
 
     // 1. Empty `hamlet vault list`
     let out = Command::new(BIN)
@@ -149,6 +153,7 @@ fn cli_vault_security_symlinks_and_ambiguity_refused() {
     let tmp = tempfile::tempdir().unwrap();
     let work = tmp.path();
     let tree = setup_village(work);
+    let _daemon = start_test_daemon(work);
 
     // Populate commission 1 alpha with artifact "result.bin"
     let vault_alpha = tree.keep_vault_commission(&sanitize_name("alpha").unwrap());

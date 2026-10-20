@@ -1,5 +1,5 @@
 {
-  "config_version": 10,
+  "config_version": 11,
   "daemon_data_dir": ".hamlet-data/sled",
   "podman_bin": "podman",
   "base_image": "docker.io/library/alpine:3.20",
@@ -16,7 +16,11 @@
   "resources": {
     "memory": "512m",
     "cpus": "1.0",
-    "pids_limit": 256
+    "cpu_shares": 1024,
+    "pids_limit": 256,
+    "memory_pressure_threshold_pct": 85,
+    "sample_window": 3,
+    "sample_interval_secs": 5
   },
   "sessions": {
     "ready_timeout_ms": 30000,

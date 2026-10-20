@@ -41,7 +41,9 @@ use serde::{Deserialize, Serialize};
 use crate::commission::{CommissionEvent, CommissionRecord, IndentureEntryStatus};
 use crate::sanitize::SafeName;
 use crate::session::{SessionId, SessionRecord};
-use crate::slots::{self, SlotError, SlotTable, FIRST_AGENT_UID, LAST_AGENT_UID, MAYOR_UID};
+use crate::slots::{
+    self, SlotError, SlotStatus, SlotTable, FIRST_AGENT_UID, LAST_AGENT_UID, MAYOR_UID,
+};
 
 /// Current charter schema version. Mandatory field (CONVENTIONS §3 rule 3);
 /// migrations are additive-only with explicit version steps (ADR-0004).
@@ -535,6 +537,20 @@ impl Charter {
         slots::allocate(&mut self.slots, identity, commission)
     }
 
+    /// Allocate the next sequential slot for an awakened patron (SPEC §10),
+    /// leaving any earlier slot record in `charter.slots` as historical lineage.
+    ///
+    /// # Errors
+    ///
+    /// [`SlotError::Exhausted`] when every uid in 1001–2000 is occupied.
+    pub fn allocate_fresh_slot(
+        &mut self,
+        identity: SafeName,
+        commission: Option<u64>,
+    ) -> std::result::Result<u32, SlotError> {
+        slots::allocate_fresh(&mut self.slots, identity, commission)
+    }
+
     // --- commission lifecycle (SPEC §9; ADR-0036) -------------------------
 
     /// The next commission ledger id: 1-based, `max(existing) + 1`.
@@ -695,7 +711,7 @@ impl Charter {
                 supported: CHARTER_VERSION,
             });
         }
-        let mut bound_identities = BTreeSet::new();
+        let mut active_identities = BTreeSet::new();
         for (&uid, record) in &self.slots {
             let in_range = uid == MAYOR_UID || (FIRST_AGENT_UID..=LAST_AGENT_UID).contains(&uid);
             if !in_range {
@@ -703,11 +719,14 @@ impl Charter {
                     "slot uid {uid} outside {MAYOR_UID} and {FIRST_AGENT_UID}-{LAST_AGENT_UID}"
                 )));
             }
-            // One identity holds exactly ONE permanent slot (SPEC §4;
-            // ADR-0008) — duplicates make allocate/hibernate ambiguous.
-            if !bound_identities.insert(&record.identity) {
+            // One identity holds at most ONE active slot (SPEC §4, §10; ADR-0008, ADR-0039).
+            // Historical slots must be Hibernated or Crashed.
+            if record.status != SlotStatus::Hibernated
+                && record.status != SlotStatus::Crashed
+                && !active_identities.insert(&record.identity)
+            {
                 return Err(invariant(format!(
-                    "slot identity '{identity}' bound to multiple uids (again at {uid})",
+                    "slot identity '{identity}' bound to multiple active uids (again at {uid})",
                     identity = record.identity
                 )));
             }

@@ -21,9 +21,10 @@ publish = false
 # --- internal (path deps; exempt from the allowlist) ---
 hamlet-core = { path = "crates/hamlet-core" }
 hamlet-daemon = { path = "crates/hamlet-daemon" }
+hamlet-tui = { path = "crates/hamlet-tui" }
 
 # --- locked stack, SPEC §3 (versions [DEV] within these majors) ---
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "signal"] }
 axum = "0.7"
 tower-http = "0.6"
 tokio-tungstenite = "0.21"
@@ -36,3 +37,6 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 notify = "6"
 # --- additions by ADR (CONVENTIONS §2; check-deps.sh enforces) ---
 toml = "0.8"  # ADR-0009: blueprint TOML schema parsing
+clap = { version = "4", features = ["derive"] }  # ADR-0042: CLI command tree
+ratatui = "0.30"  # ADR-0042: terminal UI framework
+crossterm = "0.29"  # ADR-0042: terminal manipulation and events

@@ -334,6 +334,15 @@ pub trait Stasis: Send + Sync {
     /// [`DecreeRefusal`] when the slot is absent, already parked, or the
     /// stop failed.
     fn park<'a>(&'a self, uid: u32) -> BoxFuture<'a, Result<(), DecreeRefusal>>;
+
+    /// Hibernate one agent with trigger reason (SPEC §10).
+    fn hibernate<'a>(
+        &'a self,
+        uid: u32,
+        _trigger: &'a str,
+    ) -> BoxFuture<'a, Result<(), DecreeRefusal>> {
+        self.park(uid)
+    }
 }
 
 /// The promotion seam (SPEC §7 validation loop; ADR-0029 cl. 3).
@@ -542,51 +551,7 @@ impl CensusAgentProvisioner {
     }
 }
 
-/// The hibernate executor as it exists in Sprint 05: a **clean stop** of
-/// the agent's session plus the charter lease flip to `stasis: true`
-/// (SPEC §10). The home copy is Sprint 07's job — see [`Stasis`].
-///
-/// Idempotent: stopping an already-stopped session is a no-op, and flipping
-/// an already-parked lease is a no-op, so a replayed `hibernate_agent`
-/// decree converges instead of erroring.
-pub struct CleanStopStasis {
-    supervisor: Arc<Supervisor>,
-}
-
-impl CleanStopStasis {
-    /// Seam over the daemon's one supervisor.
-    #[must_use]
-    pub fn new(supervisor: Arc<Supervisor>) -> Self {
-        Self { supervisor }
-    }
-}
-
-impl Stasis for CleanStopStasis {
-    fn park<'a>(&'a self, uid: u32) -> BoxFuture<'a, Result<(), DecreeRefusal>> {
-        Box::pin(self.park_inner(uid))
-    }
-}
-
-impl CleanStopStasis {
-    async fn park_inner(&self, uid: u32) -> Result<(), DecreeRefusal> {
-        let record = self
-            .supervisor
-            .session_record(uid)
-            .map_err(|e| DecreeRefusal::execution_failed(format!("session record: {e}")))?;
-        if let Some(record) = record {
-            if record.status.is_alive() {
-                // A clean stop: drain + EOF + reap inside the grace window
-                // (SPEC §6). `stop_session` is the typed path; it is
-                // idempotent for an already-dead slot.
-                self.supervisor
-                    .stop_session(uid)
-                    .await
-                    .map_err(|e| DecreeRefusal::execution_failed(format!("stop_session: {e}")))?;
-            }
-        }
-        Ok(())
-    }
-}
+pub use crate::census::ProductionStasis;
 
 /// Recording promotion stub (Sprint 06 replaces it; ADR-0029 cl. 3).
 ///
@@ -1596,7 +1561,11 @@ impl DecreeExecutor {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .clone();
-                stasis.park(*uid).await.map(|()| self.flip_stasis(*uid))
+                let trigger = format!("decree:{}", decree.id());
+                stasis
+                    .hibernate(*uid, &trigger)
+                    .await
+                    .map(|()| self.flip_stasis(*uid))
             }
             Decree::ReassignTask {
                 commission,

@@ -129,7 +129,7 @@ async fn provision_happy_path_records_lease_and_hardens_host() {
     let title = fs::read_to_string(f.tree.parcel_title(uid)).unwrap();
     assert!(title.starts_with(&format!("# TITLE — chain of title · parcel{uid}")));
     assert!(
-        title.contains("provision_parcel(identity=\"scribe\", commission=7)"),
+        title.contains("provision_parcel(identity=\\\"scribe\\\", commission=7)"),
         "first chain-of-title entry names the trigger: {title}"
     );
     assert!(

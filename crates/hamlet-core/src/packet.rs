@@ -78,6 +78,10 @@ pub enum WakeReason {
     SessionCrashed,
     /// A deliverable was submitted for commission promotion review (SPEC §7, §9.4).
     DeliverableSubmitted,
+    /// Resource pressure or repeated OOM suggests an agent session for hibernation (ADR-0040).
+    HibernateCandidate,
+    /// TITLE.md chain-of-title was modified or truncated outside append-only discipline (SPEC §10).
+    TitleTampered,
 }
 
 impl WakeReason {
@@ -95,6 +99,8 @@ impl WakeReason {
             Self::GitDiffReady => "git_diff_ready",
             Self::SessionCrashed => "session_crashed",
             Self::DeliverableSubmitted => "deliverable_submitted",
+            Self::HibernateCandidate => "hibernate_candidate",
+            Self::TitleTampered => "title_tampered",
         }
     }
 }
@@ -196,6 +202,30 @@ pub enum EventKind {
         /// Freight path reference when known.
         path: Option<String>,
     },
+    /// Resource pressure or repeated OOM suggests an agent session for hibernation (ADR-0040).
+    HibernateCandidate {
+        /// Candidate agent UID.
+        uid: u32,
+        /// Candidate agent identity.
+        identity: SafeName,
+        /// Memory usage in bytes.
+        memory_usage_bytes: u64,
+        /// Configured memory limit in bytes.
+        memory_limit_bytes: u64,
+        /// Idle duration in seconds.
+        idle_duration_secs: u64,
+        /// Candidate ranking score.
+        score: u64,
+    },
+    /// TITLE.md chain-of-title tamper evidence (SPEC §10).
+    TitleTampered {
+        /// The slot UID.
+        uid: u32,
+        /// The agent identity.
+        identity: SafeName,
+        /// Tamper detail.
+        detail: String,
+    },
     /// Several events that share one wake reason, merged into the single
     /// evaluation they deserve (ADR-0028 cl. 2). The packet still carries
     /// **one** artifact — [`ContextPacket`] is single-turn by construction —
@@ -234,6 +264,8 @@ impl EventKind {
             Self::GitDiffReady { .. } => WakeReason::GitDiffReady,
             Self::SessionCrashed { .. } => WakeReason::SessionCrashed,
             Self::DeliverableSubmitted { .. } => WakeReason::DeliverableSubmitted,
+            Self::HibernateCandidate { .. } => WakeReason::HibernateCandidate,
+            Self::TitleTampered { .. } => WakeReason::TitleTampered,
             Self::MergedBatch { reason, .. } => *reason,
         }
     }
@@ -328,6 +360,30 @@ impl EventKind {
                 if let Some(p) = path {
                     lines.push(format!("path: {p}"));
                 }
+            }
+            Self::HibernateCandidate {
+                uid,
+                identity,
+                memory_usage_bytes,
+                memory_limit_bytes,
+                idle_duration_secs,
+                score,
+            } => {
+                lines.push(format!("uid: {uid}"));
+                lines.push(format!("identity: {identity}"));
+                lines.push(format!("memory_usage_bytes: {memory_usage_bytes}"));
+                lines.push(format!("memory_limit_bytes: {memory_limit_bytes}"));
+                lines.push(format!("idle_duration_secs: {idle_duration_secs}"));
+                lines.push(format!("score: {score}"));
+            }
+            Self::TitleTampered {
+                uid,
+                identity,
+                detail,
+            } => {
+                lines.push(format!("uid: {uid}"));
+                lines.push(format!("identity: {identity}"));
+                lines.push(format!("detail: {detail}"));
             }
             Self::MergedBatch { reason, members } => {
                 lines.push(format!("merged: {}", members.len()));
@@ -1103,6 +1159,40 @@ emission: one turn, one decision — write decree files only, never podman or ho
                     "commission: 5",
                     "uid: 1001",
                     "path: courier/freight/worker1001/final.tar.gz",
+                ],
+            ),
+            (
+                EventKind::HibernateCandidate {
+                    uid: 1042,
+                    identity: name("scribe"),
+                    memory_usage_bytes: 450 * 1024 * 1024,
+                    memory_limit_bytes: 512 * 1024 * 1024,
+                    idle_duration_secs: 320,
+                    score: 9500,
+                },
+                WakeReason::HibernateCandidate,
+                vec![
+                    "kind: hibernate_candidate",
+                    "uid: 1042",
+                    "identity: scribe",
+                    "memory_usage_bytes: 471859200",
+                    "memory_limit_bytes: 536870912",
+                    "idle_duration_secs: 320",
+                    "score: 9500",
+                ],
+            ),
+            (
+                EventKind::TitleTampered {
+                    uid: 1042,
+                    identity: name("scribe"),
+                    detail: "historical entry 1 was modified or reordered".to_string(),
+                },
+                WakeReason::TitleTampered,
+                vec![
+                    "kind: title_tampered",
+                    "uid: 1042",
+                    "identity: scribe",
+                    "detail: historical entry 1 was modified or reordered",
                 ],
             ),
         ];

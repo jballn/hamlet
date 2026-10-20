@@ -14,7 +14,7 @@ serde_json = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "sync", "time", "net"] }
 notify = { workspace = true }
 reqwest = { workspace = true }        # dispatch outbox sends (ADR-0020)
-axum = { workspace = true }            # inbound webhook endpoints (ADR-0022)
+axum = { workspace = true, features = ["ws"] }            # inbound webhook endpoints (ADR-0022)
 tower-http = { workspace = true, features = ["limit"] }             # hard body cap below extractors
 dotenvy = { workspace = true }         # pure .env parsing at send time (ADR-0020 cl. 6)
 
