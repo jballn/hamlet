@@ -12,6 +12,7 @@
 //!    to existing daemon subsystems (census, ledger, supervisor, mailroute, vault).
 //! 4. **Canonical Responses**: All success and error responses conform to `hamlet-core::api` schemas.
 
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -20,7 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{Path as AxumPath, Query, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -69,6 +70,10 @@ pub struct LocalApiState {
     pub started_at_unix_ms: u64,
     /// Monotonic WS event sequence for events published by this API.
     ws_seq: AtomicU64,
+    /// WebSocket streaming hub (ADR-0044).
+    pub ws_hub: Arc<crate::web::WsHub>,
+    /// Static web asset server (ADR-0044).
+    pub asset_server: Arc<crate::web::AssetServer>,
 }
 
 impl LocalApiState {
@@ -76,6 +81,14 @@ impl LocalApiState {
     #[must_use]
     pub fn new(tree: Arc<HamletTree>, token: LocalToken, shutdown_tx: watch::Sender<bool>) -> Self {
         let (ws_broadcast, _) = broadcast::channel(256);
+        let ws_hub = Arc::new(crate::web::WsHub::new(
+            Arc::clone(&tree),
+            token.clone(),
+            shutdown_tx.clone(),
+        ));
+        let asset_server = Arc::new(crate::web::AssetServer::new(
+            crate::web::AssetConfig::default(),
+        ));
         Self {
             tree,
             token,
@@ -87,12 +100,19 @@ impl LocalApiState {
             ledger: None,
             started_at_unix_ms: unix_now_ms(),
             ws_seq: AtomicU64::new(0),
+            ws_hub,
+            asset_server,
         }
     }
 
     /// Sets the supervisor.
     #[must_use]
     pub fn with_supervisor(mut self, supervisor: Arc<Supervisor>) -> Self {
+        self.ws_hub = Arc::new(
+            (*self.ws_hub)
+                .clone()
+                .with_supervisor(Arc::clone(&supervisor)),
+        );
         self.supervisor = Some(supervisor);
         self
     }
@@ -100,6 +120,11 @@ impl LocalApiState {
     /// Sets the mail router.
     #[must_use]
     pub fn with_mail_router(mut self, mail_router: Arc<MailRouter>) -> Self {
+        self.ws_hub = Arc::new(
+            (*self.ws_hub)
+                .clone()
+                .with_mail_router(Arc::clone(&mail_router)),
+        );
         self.mail_router = Some(mail_router);
         self
     }
@@ -107,6 +132,7 @@ impl LocalApiState {
     /// Sets the stasis engine.
     #[must_use]
     pub fn with_stasis(mut self, stasis: Arc<ProductionStasis>) -> Self {
+        self.ws_hub = Arc::new((*self.ws_hub).clone().with_stasis(Arc::clone(&stasis)));
         self.stasis = Some(stasis);
         self
     }
@@ -114,7 +140,22 @@ impl LocalApiState {
     /// Sets the commission ledger.
     #[must_use]
     pub fn with_ledger(mut self, ledger: Arc<Ledger>) -> Self {
+        self.ws_hub = Arc::new((*self.ws_hub).clone().with_ledger(Arc::clone(&ledger)));
         self.ledger = Some(ledger);
+        self
+    }
+
+    /// Sets the WebSocket streaming hub.
+    #[must_use]
+    pub fn with_ws_hub(mut self, ws_hub: Arc<crate::web::WsHub>) -> Self {
+        self.ws_hub = ws_hub;
+        self
+    }
+
+    /// Sets the static asset server.
+    #[must_use]
+    pub fn with_asset_server(mut self, asset_server: Arc<crate::web::AssetServer>) -> Self {
+        self.asset_server = asset_server;
         self
     }
 
@@ -127,7 +168,10 @@ impl LocalApiState {
     /// cl. 4). Reporting only: nothing subscribes to this to trigger work.
     pub fn publish(&self, topic: WsTopic, event_kind: &str, payload: serde_json::Value) {
         let seq = self.ws_seq.fetch_add(1, Ordering::SeqCst) + 1;
-        self.broadcast(WsEvent::new(topic, event_kind, seq, unix_now_ms(), payload));
+        let event = WsEvent::new(topic, event_kind, seq, unix_now_ms(), payload);
+        let _ = self.ws_broadcast.send(event.clone());
+        self.ws_hub
+            .broadcast_frame(crate::web::WsBroadcastFrame::LegacyEvent(event));
     }
 }
 
@@ -262,6 +306,72 @@ struct CensusQuery {
     commission: Option<String>,
 }
 
+/// Pure projection of census records.
+pub(crate) fn project_census(
+    tree: &HamletTree,
+    telemetry: Option<&Telemetry>,
+) -> Vec<CensusRecordView> {
+    match list_census(tree, telemetry) {
+        Ok(views) => views
+            .into_iter()
+            .map(|v| CensusRecordView {
+                uid: v.uid,
+                identity: v.identity,
+                commission: v.commission,
+                commission_slug: v.commission_slug,
+                state: v.state,
+                stasis: v.stasis,
+                session_count: v.session_count,
+                counters: ApiCensusCounters {
+                    input_tokens: v.counters.input_tokens,
+                    output_tokens: v.counters.output_tokens,
+                    cost_micro_usd: v.counters.cost_micro_usd,
+                    traces: v.counters.traces,
+                },
+                last_event: v.last_event,
+                last_event_ts: v.last_event_ts,
+                title_digest: v.title_digest,
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Pure projection of commissions summaries.
+pub(crate) fn project_commissions(
+    ledger: Option<&Ledger>,
+    tree: &HamletTree,
+) -> Vec<CommissionSummaryView> {
+    let ledger_fallback;
+    let l_ref = match ledger {
+        Some(l) => l,
+        None => {
+            ledger_fallback = Ledger::new((*tree).clone());
+            &ledger_fallback
+        }
+    };
+    match l_ref.list_commissions() {
+        Ok(items) => items
+            .into_iter()
+            .map(|item| CommissionSummaryView {
+                commission_id: item.id,
+                slug: item.slug,
+                state: item.state.kind_name().to_string(),
+                roster: item.roster.into_iter().collect(),
+                deliverables_count: 0,
+                brief: item.has_brief,
+                indenture: item.has_indenture,
+                git: if item.has_bare_git {
+                    "bare".to_string()
+                } else {
+                    "-".to_string()
+                },
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// `GET /api/v1/census`
 async fn census_handler(
     State(state): State<Arc<LocalApiState>>,
@@ -273,48 +383,10 @@ async fn census_handler(
     }
 
     let telemetry = state.supervisor.as_ref().map(|s| s.telemetry().as_ref());
-    let views = match list_census(&state.tree, telemetry) {
-        Ok(v) => v,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiErrorResponse::internal_error(format!(
-                    "census error: {e}"
-                ))),
-            )
-                .into_response();
-        }
-    };
-
-    let filter_slug = query.commission.as_deref();
-    let records: Vec<CensusRecordView> = views
-        .into_iter()
-        .filter(|v| {
-            if let Some(slug) = filter_slug {
-                v.commission_slug.as_ref().map(|s| s.as_str()) == Some(slug)
-            } else {
-                true
-            }
-        })
-        .map(|v| CensusRecordView {
-            uid: v.uid,
-            identity: v.identity,
-            commission: v.commission,
-            commission_slug: v.commission_slug,
-            state: v.state,
-            stasis: v.stasis,
-            session_count: v.session_count,
-            counters: ApiCensusCounters {
-                input_tokens: v.counters.input_tokens,
-                output_tokens: v.counters.output_tokens,
-                cost_micro_usd: v.counters.cost_micro_usd,
-                traces: v.counters.traces,
-            },
-            last_event: v.last_event,
-            last_event_ts: v.last_event_ts,
-            title_digest: v.title_digest,
-        })
-        .collect();
+    let mut records = project_census(&state.tree, telemetry);
+    if let Some(slug) = query.commission.as_deref() {
+        records.retain(|v| v.commission_slug.as_ref().map(|s| s.as_str()) == Some(slug));
+    }
 
     (StatusCode::OK, Json(records)).into_response()
 }
@@ -328,40 +400,8 @@ async fn commission_list_handler(
         return res;
     }
 
-    let ledger = state
-        .ledger
-        .clone()
-        .unwrap_or_else(|| Arc::new(Ledger::new(state.tree.as_ref().clone())));
-
-    match ledger.list_commissions() {
-        Ok(items) => {
-            let views: Vec<CommissionSummaryView> = items
-                .into_iter()
-                .map(|item| CommissionSummaryView {
-                    commission_id: item.id,
-                    slug: item.slug,
-                    state: item.state.kind_name().to_string(),
-                    roster: item.roster.into_iter().collect(),
-                    deliverables_count: 0,
-                    brief: item.has_brief,
-                    indenture: item.has_indenture,
-                    git: if item.has_bare_git {
-                        "bare".to_string()
-                    } else {
-                        "-".to_string()
-                    },
-                })
-                .collect();
-            (StatusCode::OK, Json(views)).into_response()
-        }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiErrorResponse::internal_error(format!(
-                "ledger error: {e}"
-            ))),
-        )
-            .into_response(),
-    }
+    let views = project_commissions(state.ledger.as_deref(), &state.tree);
+    (StatusCode::OK, Json(views)).into_response()
 }
 
 /// `GET /api/v1/ledger/commissions/:slug`
@@ -531,29 +571,14 @@ async fn commission_close_handler(
     }
 }
 
-/// `GET /api/v1/decrees`
-async fn decrees_list_handler(
-    State(state): State<Arc<LocalApiState>>,
-    headers: HeaderMap,
-) -> Response {
-    if let Some(res) = authenticate(&headers, None, &state) {
-        return res;
-    }
-
-    let charter = match Charter::load(&state.tree.charter()) {
+/// Pure projection of decrees in manor.
+pub(crate) fn project_decrees(tree: &HamletTree) -> Vec<DecreeSummaryView> {
+    let charter = match Charter::load(&tree.charter()) {
         Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiErrorResponse::internal_error(format!(
-                    "failed to load charter: {e}"
-                ))),
-            )
-                .into_response();
-        }
+        Err(_) => return Vec::new(),
     };
 
-    let dir = state.tree.manor_decrees();
+    let dir = tree.manor_decrees();
     let mut summaries = Vec::new();
     if let Ok(entries) = fs::read_dir(&dir) {
         for entry in entries.flatten() {
@@ -594,7 +619,18 @@ async fn decrees_list_handler(
     }
 
     summaries.sort_by_key(|d| d.seq);
-    (StatusCode::OK, Json(summaries)).into_response()
+    summaries
+}
+
+/// `GET /api/v1/decrees`
+async fn decrees_list_handler(
+    State(state): State<Arc<LocalApiState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(res) = authenticate(&headers, None, &state) {
+        return res;
+    }
+    (StatusCode::OK, Json(project_decrees(&state.tree))).into_response()
 }
 
 /// `GET /api/v1/decrees/:id`
@@ -673,57 +709,44 @@ struct VaultQuery {
     commission: Option<String>,
 }
 
-/// `GET /api/v1/vault`
-async fn vault_list_handler(
-    State(state): State<Arc<LocalApiState>>,
-    headers: HeaderMap,
-    Query(query): Query<VaultQuery>,
-) -> Response {
-    if let Some(res) = authenticate(&headers, None, &state) {
-        return res;
-    }
-
-    let vault_root = state.tree.keep_vault();
+/// Pure projection of keep vault items.
+pub(crate) fn project_vault(tree: &HamletTree) -> Vec<VaultItemView> {
+    let vault_root = tree.keep_vault();
     let mut items = Vec::new();
-    let filter_comm = query.commission.as_deref();
 
     if let Ok(entries) = fs::read_dir(&vault_root) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
                 let dir_name = entry.file_name().to_string_lossy().to_string();
-                if filter_comm.is_none() || filter_comm == Some(dir_name.as_str()) {
-                    let comm_safe = sanitize_name(&dir_name).ok();
-                    if let Ok(sub_entries) = fs::read_dir(&path) {
-                        for sub in sub_entries.flatten() {
-                            let sub_path = sub.path();
-                            if sub_path.is_file()
-                                && sub_path.extension().and_then(|e| e.to_str()) != Some("sha256")
-                            {
-                                let size_bytes = sub.metadata().map(|m| m.len()).unwrap_or(0);
-                                let sidecar_name =
-                                    format!("{}.sha256", sub.file_name().to_string_lossy());
-                                let sidecar = path.join(sidecar_name);
-                                let sha256_raw = fs::read_to_string(sidecar).unwrap_or_default();
-                                let sha256 = sha256_raw
-                                    .split_whitespace()
-                                    .next()
-                                    .unwrap_or("")
-                                    .to_string();
+                let comm_safe = sanitize_name(&dir_name).ok();
+                if let Ok(sub_entries) = fs::read_dir(&path) {
+                    for sub in sub_entries.flatten() {
+                        let sub_path = sub.path();
+                        if sub_path.is_file()
+                            && sub_path.extension().and_then(|e| e.to_str()) != Some("sha256")
+                        {
+                            let size_bytes = sub.metadata().map(|m| m.len()).unwrap_or(0);
+                            let sidecar_name =
+                                format!("{}.sha256", sub.file_name().to_string_lossy());
+                            let sidecar = path.join(sidecar_name);
+                            let sha256_raw = fs::read_to_string(sidecar).unwrap_or_default();
+                            let sha256 = sha256_raw
+                                .split_whitespace()
+                                .next()
+                                .unwrap_or("")
+                                .to_string();
 
-                                items.push(VaultItemView {
-                                    name: sub.file_name().to_string_lossy().to_string(),
-                                    commission: comm_safe.clone(),
-                                    size_bytes,
-                                    sha256,
-                                });
-                            }
+                            items.push(VaultItemView {
+                                name: sub.file_name().to_string_lossy().to_string(),
+                                commission: comm_safe.clone(),
+                                size_bytes,
+                                sha256,
+                            });
                         }
                     }
                 }
-            } else if path.is_file()
-                && path.extension().and_then(|e| e.to_str()) != Some("sha256")
-                && filter_comm.is_none()
+            } else if path.is_file() && path.extension().and_then(|e| e.to_str()) != Some("sha256")
             {
                 let size_bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
                 let sidecar_name = format!("{}.sha256", entry.file_name().to_string_lossy());
@@ -746,46 +769,52 @@ async fn vault_list_handler(
     }
 
     items.sort_by(|a, b| a.name.cmp(&b.name));
-    (StatusCode::OK, Json(items)).into_response()
+    items
 }
 
-/// `POST /api/v1/vault/export`
-async fn vault_export_handler(
+/// `GET /api/v1/vault`
+async fn vault_list_handler(
     State(state): State<Arc<LocalApiState>>,
     headers: HeaderMap,
-    Json(payload): Json<VaultExportRequest>,
+    Query(query): Query<VaultQuery>,
 ) -> Response {
     if let Some(res) = authenticate(&headers, None, &state) {
         return res;
     }
 
+    let filter_comm = query.commission.as_deref();
+    let mut items = project_vault(&state.tree);
+    if let Some(filter) = filter_comm {
+        items.retain(|i| i.commission.as_ref().map(|c| c.as_str()) == Some(filter));
+    }
+
+    (StatusCode::OK, Json(items)).into_response()
+}
+
+/// Pure helper for exporting vault artifact deliverables.
+pub(crate) fn export_vault_artifact(
+    tree: &HamletTree,
+    payload: &VaultExportRequest,
+) -> Result<VaultExportResponse, (StatusCode, String)> {
     let safe_artifact = match sanitize_name(&payload.artifact) {
         Ok(name) => name,
         Err(e) => {
-            return (
+            return Err((
                 StatusCode::BAD_REQUEST,
-                Json(ApiErrorResponse::bad_request(format!(
-                    "invalid artifact name '{}': {e}",
-                    payload.artifact
-                ))),
-            )
-                .into_response();
+                format!("invalid artifact name '{}': {e}", payload.artifact),
+            ));
         }
     };
 
-    let vault_root = state.tree.keep_vault();
+    let vault_root = tree.keep_vault();
     let (source, resolved_commission) = if let Some(ref comm) = payload.commission {
         let p = vault_root.join(comm.as_str()).join(safe_artifact.as_str());
         if let Ok(meta) = fs::symlink_metadata(&p) {
             if meta.file_type().is_symlink() {
-                return (
+                return Err((
                     StatusCode::BAD_REQUEST,
-                    Json(ApiErrorResponse::bad_request(format!(
-                        "symlink vault path {} refused (ADR-0007)",
-                        p.display()
-                    ))),
-                )
-                    .into_response();
+                    format!("symlink vault path {} refused (ADR-0007)", p.display()),
+                ));
             }
         }
         (p, Some(comm.clone()))
@@ -800,28 +829,26 @@ async fn vault_export_handler(
                     let path = entry.path();
                     if let Ok(meta) = fs::symlink_metadata(&path) {
                         if meta.file_type().is_symlink() {
-                            return (
+                            return Err((
                                 StatusCode::BAD_REQUEST,
-                                Json(ApiErrorResponse::bad_request(format!(
+                                format!(
                                     "symlink vault directory {} refused (ADR-0007)",
                                     path.display()
-                                ))),
-                            )
-                                .into_response();
+                                ),
+                            ));
                         }
                     }
                     if path.is_dir() {
                         let candidate = path.join(safe_artifact.as_str());
                         if let Ok(meta) = fs::symlink_metadata(&candidate) {
                             if meta.file_type().is_symlink() {
-                                return (
+                                return Err((
                                     StatusCode::BAD_REQUEST,
-                                    Json(ApiErrorResponse::bad_request(format!(
+                                    format!(
                                         "symlink vault artifact {} refused (ADR-0007)",
                                         candidate.display()
-                                    ))),
-                                )
-                                    .into_response();
+                                    ),
+                                ));
                             }
                         }
                         if candidate.is_file() {
@@ -834,27 +861,22 @@ async fn vault_export_handler(
 
             if matches.len() > 1 {
                 let slugs: Vec<_> = matches.into_iter().map(|(s, _)| s).collect();
-                return (
+                return Err((
                     StatusCode::CONFLICT,
-                    Json(ApiErrorResponse::conflict(format!(
+                    format!(
                         "ambiguous artifact '{}': found in commissions {}; specify --commission <slug> to disambiguate",
                         payload.artifact,
                         slugs.join(", ")
-                    ))),
-                )
-                    .into_response();
+                    ),
+                ));
             } else if matches.len() == 1 {
                 let (slug, cand) = matches.remove(0);
                 (cand, sanitize_name(&slug).ok())
             } else {
-                return (
+                return Err((
                     StatusCode::NOT_FOUND,
-                    Json(ApiErrorResponse::not_found(format!(
-                        "vault artifact '{}' not found",
-                        payload.artifact
-                    ))),
-                )
-                    .into_response();
+                    format!("vault artifact '{}' not found", payload.artifact),
+                ));
             }
         }
     };
@@ -864,39 +886,30 @@ async fn vault_export_handler(
         .unwrap_or_else(|_| vault_root.clone());
     if let Ok(canonical_source) = source.canonicalize() {
         if !canonical_source.starts_with(&canonical_root) || canonical_source == canonical_root {
-            return (
+            return Err((
                 StatusCode::BAD_REQUEST,
-                Json(ApiErrorResponse::bad_request(format!(
-                    "vault artifact '{}' escapes vault root",
-                    payload.artifact
-                ))),
-            )
-                .into_response();
+                format!("vault artifact '{}' escapes vault root", payload.artifact),
+            ));
         }
     }
 
     if !source.exists() || !source.is_file() {
-        return (
+        return Err((
             StatusCode::NOT_FOUND,
-            Json(ApiErrorResponse::not_found(format!(
-                "vault artifact '{}' not found",
-                payload.artifact
-            ))),
-        )
-            .into_response();
+            format!("vault artifact '{}' not found", payload.artifact),
+        ));
     }
 
     let dest = PathBuf::from(&payload.destination);
     if let Ok(meta) = fs::symlink_metadata(&dest) {
         if meta.file_type().is_symlink() {
-            return (
+            return Err((
                 StatusCode::BAD_REQUEST,
-                Json(ApiErrorResponse::bad_request(format!(
+                format!(
                     "refusing symlink destination path {} under ADR-0007",
                     dest.display()
-                ))),
-            )
-                .into_response();
+                ),
+            ));
         }
     }
     let target = if dest.is_dir() {
@@ -907,27 +920,23 @@ async fn vault_export_handler(
 
     if let Ok(meta) = fs::symlink_metadata(&target) {
         if meta.file_type().is_symlink() {
-            return (
+            return Err((
                 StatusCode::BAD_REQUEST,
-                Json(ApiErrorResponse::bad_request(format!(
+                format!(
                     "refusing symlink target path {} under ADR-0007",
                     target.display()
-                ))),
-            )
-                .into_response();
+                ),
+            ));
         }
     }
 
     let bytes_written = match fs::copy(&source, &target) {
         Ok(b) => b,
         Err(e) => {
-            return (
+            return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiErrorResponse::internal_error(format!(
-                    "export copy failed: {e}"
-                ))),
-            )
-                .into_response();
+                format!("export copy failed: {e}"),
+            ));
         }
     };
 
@@ -946,15 +955,29 @@ async fn vault_export_handler(
         .unwrap_or("")
         .to_string();
 
-    let resp = VaultExportResponse {
+    Ok(VaultExportResponse {
         artifact: safe_artifact.into_string(),
         destination: target.display().to_string(),
         bytes_written,
         sha256,
         commission: resolved_commission,
-    };
+    })
+}
 
-    (StatusCode::OK, Json(resp)).into_response()
+/// `POST /api/v1/vault/export`
+async fn vault_export_handler(
+    State(state): State<Arc<LocalApiState>>,
+    headers: HeaderMap,
+    Json(payload): Json<VaultExportRequest>,
+) -> Response {
+    if let Some(res) = authenticate(&headers, None, &state) {
+        return res;
+    }
+
+    match export_vault_artifact(&state.tree, &payload) {
+        Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
+        Err((code, msg)) => (code, Json(ApiErrorResponse::new(code.as_str(), msg))).into_response(),
+    }
 }
 
 /// `GET /api/v1/metrics`
@@ -1242,6 +1265,14 @@ async fn mail_send_handler(
     }
 }
 
+pub(crate) async fn hibernate_agent(
+    stasis: &ProductionStasis,
+    uid: u32,
+    trigger: &str,
+) -> Result<hamlet_core::stasis::PatronDoc, crate::census::StasisError> {
+    stasis.hibernate(uid, trigger).await
+}
+
 /// `POST /api/v1/agents/:uid/hibernate`
 async fn agent_hibernate_handler(
     State(state): State<Arc<LocalApiState>>,
@@ -1420,28 +1451,33 @@ async fn ws_handler(
         return res;
     }
 
-    ws.on_upgrade(move |socket| handle_ws_socket(socket, state))
-}
-
-async fn handle_ws_socket(mut socket: WebSocket, state: Arc<LocalApiState>) {
-    let mut rx = state.ws_broadcast.subscribe();
-    while let Ok(event) = rx.recv().await {
-        let text = match serde_json::to_string(&event) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        if socket.send(Message::Text(text)).await.is_err() {
-            break;
-        }
-    }
+    let hub = Arc::clone(&state.ws_hub);
+    ws.on_upgrade(move |socket| async move {
+        hub.handle_socket(socket).await;
+    })
 }
 
 // ---------------------------------------------------------------------------
 // Landmark & Escalation Projections (SPEC §2, §7; ADR-0043)
 // ---------------------------------------------------------------------------
 
+/// Pure projection of unread mail counts per recipient UID.
+pub(crate) fn project_mail_counts(tree: &HamletTree) -> BTreeMap<u32, usize> {
+    let mut counts = BTreeMap::new();
+    let is_mail = |t: &fs::FileType, name: &str| t.is_file() && name.ends_with(".mail");
+    for name in landmark_names(&tree.courier_mail()) {
+        if let Ok(uid) = name.parse::<u32>() {
+            if let Ok(safe) = sanitize_name(&name) {
+                let unread = landmark_count(&tree.courier_mail_recipient(&safe), is_mail);
+                counts.insert(uid, unread);
+            }
+        }
+    }
+    counts
+}
+
 /// Sorted, non-hidden entry names of `dir` (empty when absent).
-fn landmark_names(dir: &Path) -> Vec<String> {
+pub(crate) fn landmark_names(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = fs::read_dir(dir)
         .map(|entries| {
             entries
@@ -1456,7 +1492,7 @@ fn landmark_names(dir: &Path) -> Vec<String> {
 }
 
 /// Count entries of `dir` matching `pred` on the (non-followed) file type.
-fn landmark_count(dir: &Path, pred: impl Fn(&fs::FileType, &str) -> bool) -> usize {
+pub(crate) fn landmark_count(dir: &Path, pred: impl Fn(&fs::FileType, &str) -> bool) -> usize {
     fs::read_dir(dir)
         .map(|entries| {
             entries
@@ -1473,7 +1509,7 @@ fn landmark_count(dir: &Path, pred: impl Fn(&fs::FileType, &str) -> bool) -> usi
 
 /// Regular files and their total size anywhere under `dir`. Symlinks are
 /// never followed (ADR-0007): a projection must not walk out of the tree.
-fn landmark_files_recursive(dir: &Path) -> (usize, u64) {
+pub(crate) fn landmark_files_recursive(dir: &Path) -> (usize, u64) {
     let mut count = 0usize;
     let mut bytes = 0u64;
     let mut stack = vec![dir.to_path_buf()];
@@ -1496,7 +1532,7 @@ fn landmark_files_recursive(dir: &Path) -> (usize, u64) {
     (count, bytes)
 }
 
-fn is_visible_file(t: &fs::FileType, name: &str) -> bool {
+pub(crate) fn is_visible_file(t: &fs::FileType, name: &str) -> bool {
     t.is_file() && !name.starts_with('.')
 }
 
@@ -1520,7 +1556,7 @@ fn load_resolution(tree: &HamletTree, notice: &str) -> Option<EscalationResoluti
 }
 
 /// Pure projection of the escalation inbox.
-fn project_escalations(tree: &HamletTree) -> Vec<EscalationView> {
+pub(crate) fn project_escalations(tree: &HamletTree) -> Vec<EscalationView> {
     escalation_notice_names(tree)
         .into_iter()
         .map(|file| {
@@ -1560,7 +1596,7 @@ fn project_escalations(tree: &HamletTree) -> Vec<EscalationView> {
 }
 
 /// Pure projection of every SPEC §2 landmark through tree accessors.
-fn project_landmarks(tree: &HamletTree) -> LandmarksView {
+pub(crate) fn project_landmarks(tree: &HamletTree) -> LandmarksView {
     let charter = Charter::load(&tree.charter()).ok();
 
     let guild = GuildLandmark {
@@ -1663,6 +1699,77 @@ async fn escalations_list_handler(
     (StatusCode::OK, Json(project_escalations(&state.tree))).into_response()
 }
 
+/// Pure helper for resolving manor escalations.
+pub(crate) fn resolve_escalation(
+    tree: &HamletTree,
+    mail_router: Option<&MailRouter>,
+    id: &str,
+    resolution: &str,
+) -> Result<EscalationResolveResponse, (StatusCode, String)> {
+    let safe = sanitize_name(id).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid escalation id: {e}"),
+        )
+    })?;
+    let res_trimmed = resolution.trim();
+    if res_trimmed.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "resolution must not be empty".to_string(),
+        ));
+    }
+    let notice_ok = fs::symlink_metadata(tree.manor_escalation_notice(&safe))
+        .map(|m| m.is_file())
+        .unwrap_or(false);
+    if !notice_ok {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("escalation {safe} not found"),
+        ));
+    }
+    let record_path = tree.manor_escalation_resolution(&safe);
+    if record_path.exists() {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("escalation {safe} already resolved"),
+        ));
+    }
+
+    let record = EscalationResolution {
+        resolution_version: ESCALATION_RESOLUTION_VERSION,
+        id: safe.to_string(),
+        resolution: res_trimmed.to_string(),
+        recorded_unix_ms: unix_now_ms(),
+    };
+    let _ = fs::create_dir_all(tree.manor_escalations_resolved());
+    write_atomic_file(&record_path, record.render().as_bytes(), Some(0o644)).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to record resolution: {e}"),
+        )
+    })?;
+
+    let mayor_notified = match (mail_router, sanitize_name("operator")) {
+        (Some(router), Ok(op)) => router
+            .send(
+                MailActor::Patron(op),
+                hamlet_core::slots::MAYOR_UID,
+                &format!("escalation {safe} resolved"),
+                res_trimmed,
+                None,
+            )
+            .is_ok(),
+        _ => false,
+    };
+
+    Ok(EscalationResolveResponse {
+        id: safe.to_string(),
+        resolved: true,
+        mayor_notified,
+    })
+}
+
 /// `POST /api/v1/escalations/:id/resolve`
 async fn escalation_resolve_handler(
     State(state): State<Arc<LocalApiState>>,
@@ -1673,78 +1780,23 @@ async fn escalation_resolve_handler(
     if let Some(res) = authenticate(&headers, None, &state) {
         return res;
     }
-    let api_err = |code: StatusCode, err: ApiErrorResponse| (code, Json(err)).into_response();
 
-    let Ok(safe) = sanitize_name(&id) else {
-        return api_err(
-            StatusCode::BAD_REQUEST,
-            ApiErrorResponse::bad_request("invalid escalation id"),
-        );
-    };
-    let resolution = payload.resolution.trim();
-    if resolution.is_empty() {
-        return api_err(
-            StatusCode::BAD_REQUEST,
-            ApiErrorResponse::bad_request("resolution must not be empty"),
-        );
+    match resolve_escalation(
+        &state.tree,
+        state.mail_router.as_deref(),
+        &id,
+        &payload.resolution,
+    ) {
+        Ok(resp) => {
+            state.publish(
+                WsTopic::Decree,
+                "escalation_resolved",
+                serde_json::json!({ "id": resp.id, "mayor_notified": resp.mayor_notified }),
+            );
+            (StatusCode::OK, Json(resp)).into_response()
+        }
+        Err((code, msg)) => (code, Json(ApiErrorResponse::new(code.as_str(), msg))).into_response(),
     }
-    let notice_ok = fs::symlink_metadata(state.tree.manor_escalation_notice(&safe))
-        .map(|m| m.is_file())
-        .unwrap_or(false);
-    if !notice_ok {
-        return api_err(
-            StatusCode::NOT_FOUND,
-            ApiErrorResponse::not_found(format!("escalation {safe} not found")),
-        );
-    }
-    let record_path = state.tree.manor_escalation_resolution(&safe);
-    if record_path.exists() {
-        return api_err(
-            StatusCode::CONFLICT,
-            ApiErrorResponse::conflict(format!("escalation {safe} already resolved")),
-        );
-    }
-
-    let record = EscalationResolution {
-        resolution_version: ESCALATION_RESOLUTION_VERSION,
-        id: safe.to_string(),
-        resolution: resolution.to_string(),
-        recorded_unix_ms: unix_now_ms(),
-    };
-    if let Err(e) = fs::create_dir_all(state.tree.manor_escalations_resolved())
-        .and_then(|()| write_atomic_file(&record_path, record.render().as_bytes(), Some(0o644)))
-    {
-        return api_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            ApiErrorResponse::internal_error(format!("failed to record resolution: {e}")),
-        );
-    }
-
-    // The verdict reaches the Mayor on the ordinary mail-wake plane.
-    let mayor_notified = match (&state.mail_router, sanitize_name("operator")) {
-        (Some(router), Ok(op)) => router
-            .send(
-                MailActor::Patron(op),
-                hamlet_core::slots::MAYOR_UID,
-                &format!("escalation {safe} resolved"),
-                resolution,
-                None,
-            )
-            .is_ok(),
-        _ => false,
-    };
-
-    state.publish(
-        WsTopic::Decree,
-        "escalation_resolved",
-        serde_json::json!({ "id": safe.as_str(), "mayor_notified": mayor_notified }),
-    );
-    let resp = EscalationResolveResponse {
-        id: safe.to_string(),
-        resolved: true,
-        mayor_notified,
-    };
-    (StatusCode::OK, Json(resp)).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -1753,7 +1805,9 @@ async fn escalation_resolve_handler(
 
 /// Builds the local API axum router.
 pub fn local_api_router(state: Arc<LocalApiState>) -> Router {
-    Router::new()
+    let asset_routes = crate::web::asset_router(Arc::clone(&state.asset_server));
+
+    let api_routes = Router::new()
         .route(ENDPOINT_STATUS, get(status_handler))
         .route(ENDPOINT_STOP, post(stop_handler))
         .route(ENDPOINT_CENSUS, get(census_handler))
@@ -1779,14 +1833,16 @@ pub fn local_api_router(state: Arc<LocalApiState>) -> Router {
             ENDPOINT_ESCALATION_RESOLVE,
             post(escalation_resolve_handler),
         )
-        .with_state(state)
+        .with_state(state);
+
+    api_routes.merge(asset_routes)
 }
 
 // ---------------------------------------------------------------------------
 // File Lifecycle Helpers
 // ---------------------------------------------------------------------------
 
-fn write_atomic_file(dest: &Path, content: &[u8], mode: Option<u32>) -> io::Result<()> {
+pub(crate) fn write_atomic_file(dest: &Path, content: &[u8], mode: Option<u32>) -> io::Result<()> {
     let parent = dest.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,

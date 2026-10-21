@@ -11,6 +11,7 @@
 //! 3. **Stable Wire Protocol**: Prefixed under [`API_V1_PREFIX`], versioned, strongly typed.
 //! 4. **Auth**: Local-only secret token via `Authorization: Bearer <token>` or [`LOCAL_TOKEN_HEADER`].
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -843,6 +844,592 @@ impl WsEvent {
 }
 
 // ---------------------------------------------------------------------------
+// WebSocket Bidirectional Framing Protocol (SPEC §12.3, §14; ADR-0044)
+// ---------------------------------------------------------------------------
+
+/// Maximum allowed length for spectator chat bubble text (SPEC §12.3 honesty rule).
+pub const MAX_BUBBLE_TEXT_LEN: usize = 140;
+
+/// Maximum allowed length for spectator mail snippet (SPEC §12.3 honesty rule).
+pub const MAX_MAIL_SNIPPET_LEN: usize = 64;
+
+mod string_or_int_map {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::BTreeMap;
+    use std::str::FromStr;
+
+    pub fn serialize<S>(
+        map: &Option<BTreeMap<u32, usize>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        map.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<BTreeMap<u32, usize>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let opt: Option<BTreeMap<String, usize>> = Option::deserialize(deserializer)?;
+        match opt {
+            None => Ok(None),
+            Some(m) => {
+                let mut out = BTreeMap::new();
+                for (k, v) in m {
+                    let id = u32::from_str(&k).map_err(serde::de::Error::custom)?;
+                    out.insert(id, v);
+                }
+                Ok(Some(out))
+            }
+        }
+    }
+}
+
+/// Incremental or snapshot projection delta frame streamed from daemon to client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateDeltaFrame {
+    /// Ephemeral daemon instance identifier (changes on restart).
+    pub daemon_instance_id: String,
+    /// Monotonic sequence number for this connection.
+    pub seq: u64,
+    /// Telemetry/event timestamp (unix ms).
+    pub timestamp_unix_ms: u64,
+    /// True if this frame represents a full state snapshot (e.g. on connect or resync).
+    pub is_snapshot: bool,
+    /// Active working parcels view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub census: Option<Vec<CensusRecordView>>,
+    /// Active commission summaries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commissions: Option<Vec<CommissionSummaryView>>,
+    /// Decree summaries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decrees: Option<Vec<DecreeSummaryView>>,
+    /// Vault deliverable items.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault: Option<Vec<VaultItemView>>,
+    /// Per-agent mailbox unread/total counts (UID -> count).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "string_or_int_map"
+    )]
+    pub mail_counts: Option<BTreeMap<u32, usize>>,
+    /// Village landmark topology projections.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landmarks: Option<LandmarksView>,
+    /// Unresolved manor escalations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escalations: Option<Vec<EscalationView>>,
+}
+
+impl StateDeltaFrame {
+    /// Creates a full state snapshot frame (e.g. on initial connect or resync).
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn snapshot(
+        daemon_instance_id: impl Into<String>,
+        seq: u64,
+        timestamp_unix_ms: u64,
+        census: Vec<CensusRecordView>,
+        commissions: Vec<CommissionSummaryView>,
+        decrees: Vec<DecreeSummaryView>,
+        vault: Vec<VaultItemView>,
+        mail_counts: BTreeMap<u32, usize>,
+        landmarks: LandmarksView,
+        escalations: Vec<EscalationView>,
+    ) -> Self {
+        Self {
+            daemon_instance_id: daemon_instance_id.into(),
+            seq,
+            timestamp_unix_ms,
+            is_snapshot: true,
+            census: Some(census),
+            commissions: Some(commissions),
+            decrees: Some(decrees),
+            vault: Some(vault),
+            mail_counts: Some(mail_counts),
+            landmarks: Some(landmarks),
+            escalations: Some(escalations),
+        }
+    }
+
+    /// Creates an incremental diff frame with only specified domain projections updated.
+    #[must_use]
+    pub fn diff(daemon_instance_id: impl Into<String>, seq: u64, timestamp_unix_ms: u64) -> Self {
+        Self {
+            daemon_instance_id: daemon_instance_id.into(),
+            seq,
+            timestamp_unix_ms,
+            is_snapshot: false,
+            census: None,
+            commissions: None,
+            decrees: None,
+            vault: None,
+            mail_counts: None,
+            landmarks: None,
+            escalations: None,
+        }
+    }
+}
+
+/// Batched metric ticks streamed from the daemon sled projections.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetricsBatchFrame {
+    /// Monotonic sequence number.
+    pub seq: u64,
+    /// Timestamp (unix ms) when batch was gathered.
+    pub timestamp_unix_ms: u64,
+    /// Bounded batch of parcel metric samples.
+    pub ticks: Vec<ParcelMetricTick>,
+}
+
+impl MetricsBatchFrame {
+    /// Constructs a new metrics batch.
+    #[must_use]
+    pub fn new(seq: u64, timestamp_unix_ms: u64, ticks: Vec<ParcelMetricTick>) -> Self {
+        Self {
+            seq,
+            timestamp_unix_ms,
+            ticks,
+        }
+    }
+}
+
+/// Per-parcel/session resource telemetry sample.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParcelMetricTick {
+    /// Agent UID slot.
+    pub uid: u32,
+    /// Active session incarnation identifier if running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Accumulated or delta input tokens.
+    pub tokens_in: u64,
+    /// Accumulated or delta output tokens.
+    pub tokens_out: u64,
+    /// Total cost in micro USD ($0.000001).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_micro_usd: Option<u64>,
+    /// Turn or model invocation latency in milliseconds.
+    pub latency_ms: u64,
+    /// Resident memory bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_bytes: Option<u64>,
+    /// CPU usage in tenths of a percent (e.g. 155 = 15.5%).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_percent_x10: Option<u32>,
+}
+
+/// Visual target for an over-the-head chat bubble in the 8-bit village.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "id", rename_all = "snake_case")]
+pub enum BubbleTarget {
+    /// Subagent parcel by UID (1001-2000).
+    Agent(u32),
+    /// Mayor orchestrator (UID 1000).
+    Mayor,
+    /// Village landmark building (e.g. "guild", "tavern", "courier", "market", "keep", "manor").
+    Landmark(String),
+    /// Village-wide broadcast (over central plaza).
+    Broadcast,
+}
+
+/// Typed categories of speech/chat bubbles (SPEC §12.3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BubbleKind {
+    /// Mail delivery notice: subject and snippet only (body strictly suppressed per SPEC §12.3).
+    MailSnippet {
+        from_uid: u32,
+        to_uid: u32,
+        subject: String,
+        snippet: String,
+    },
+    /// Confirmation of operator steer directive injection.
+    SteerConfirmation { uid: u32, directive_snippet: String },
+    /// Escalation notice surfacing a blocker to the Mayor/Operator.
+    EscalationNotice {
+        escalation_id: String,
+        reason: String,
+    },
+    /// Decree execution verdict (applied, rejected, or replayed).
+    DecreeAck {
+        decree_id: String,
+        success: bool,
+        summary: String,
+    },
+    /// Agent conversational speech bubble.
+    AgentSpeech { uid: u32, text: String },
+}
+
+/// Chat-bubble event for over-the-head rendering above village sprites.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BubbleFrame {
+    /// Monotonic sequence number.
+    pub seq: u64,
+    /// Timestamp (unix ms) when event occurred.
+    pub timestamp_unix_ms: u64,
+    /// Target entity over whose head the bubble appears.
+    pub target: BubbleTarget,
+    /// Specific typed bubble variant.
+    pub kind: BubbleKind,
+    /// Sanitized, bounded display text for the bubble.
+    pub text: String,
+    /// Suggested on-screen display duration in milliseconds.
+    pub duration_ms: u32,
+}
+
+impl BubbleFrame {
+    /// Constructs a mail snippet bubble, enforcing the SPEC §12.3 honesty rule.
+    #[must_use]
+    pub fn mail_snippet(
+        seq: u64,
+        timestamp_unix_ms: u64,
+        from_uid: u32,
+        to_uid: u32,
+        subject: impl Into<String>,
+        raw_snippet: impl AsRef<str>,
+    ) -> Self {
+        let subject = subject.into();
+        let snippet = Self::truncate_safe(raw_snippet.as_ref(), MAX_MAIL_SNIPPET_LEN);
+        let text = format!("[Mail] {subject}: {snippet}");
+        let text = Self::truncate_safe(&text, MAX_BUBBLE_TEXT_LEN);
+        Self {
+            seq,
+            timestamp_unix_ms,
+            target: BubbleTarget::Agent(to_uid),
+            kind: BubbleKind::MailSnippet {
+                from_uid,
+                to_uid,
+                subject,
+                snippet,
+            },
+            text,
+            duration_ms: 4000,
+        }
+    }
+
+    /// Constructs a steer confirmation bubble.
+    #[must_use]
+    pub fn steer(seq: u64, timestamp_unix_ms: u64, uid: u32, directive: impl AsRef<str>) -> Self {
+        let snippet = Self::truncate_safe(directive.as_ref(), 48);
+        let text = format!("Steered: {snippet}");
+        let text = Self::truncate_safe(&text, MAX_BUBBLE_TEXT_LEN);
+        Self {
+            seq,
+            timestamp_unix_ms,
+            target: BubbleTarget::Agent(uid),
+            kind: BubbleKind::SteerConfirmation {
+                uid,
+                directive_snippet: snippet,
+            },
+            text,
+            duration_ms: 3000,
+        }
+    }
+
+    /// Constructs an escalation notice bubble.
+    #[must_use]
+    pub fn escalation(
+        seq: u64,
+        timestamp_unix_ms: u64,
+        escalation_id: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        let escalation_id = escalation_id.into();
+        let reason = reason.into();
+        let text = format!("! Escalation: {reason}");
+        let text = Self::truncate_safe(&text, MAX_BUBBLE_TEXT_LEN);
+        Self {
+            seq,
+            timestamp_unix_ms,
+            target: BubbleTarget::Mayor,
+            kind: BubbleKind::EscalationNotice {
+                escalation_id,
+                reason,
+            },
+            text,
+            duration_ms: 5000,
+        }
+    }
+
+    /// Constructs a decree ack bubble.
+    #[must_use]
+    pub fn decree_ack(
+        seq: u64,
+        timestamp_unix_ms: u64,
+        decree_id: impl Into<String>,
+        success: bool,
+        summary: impl Into<String>,
+    ) -> Self {
+        let decree_id = decree_id.into();
+        let summary = summary.into();
+        let status = if success { "Ack" } else { "Rejected" };
+        let text = format!("Decree {status}: {summary}");
+        let text = Self::truncate_safe(&text, MAX_BUBBLE_TEXT_LEN);
+        Self {
+            seq,
+            timestamp_unix_ms,
+            target: BubbleTarget::Landmark("manor".to_string()),
+            kind: BubbleKind::DecreeAck {
+                decree_id,
+                success,
+                summary,
+            },
+            text,
+            duration_ms: 4000,
+        }
+    }
+
+    /// Constructs an agent speech bubble.
+    #[must_use]
+    pub fn agent_speech(
+        seq: u64,
+        timestamp_unix_ms: u64,
+        uid: u32,
+        speech: impl AsRef<str>,
+    ) -> Self {
+        let text = Self::truncate_safe(speech.as_ref(), MAX_BUBBLE_TEXT_LEN);
+        Self {
+            seq,
+            timestamp_unix_ms,
+            target: BubbleTarget::Agent(uid),
+            kind: BubbleKind::AgentSpeech {
+                uid,
+                text: text.clone(),
+            },
+            text,
+            duration_ms: 3500,
+        }
+    }
+
+    fn truncate_safe(s: &str, max_len: usize) -> String {
+        let mut chars = s.chars();
+        let truncated: String = chars.by_ref().take(max_len).collect();
+        if chars.next().is_some() && max_len >= 3 {
+            let mut prefix: String = truncated.chars().take(max_len - 3).collect();
+            prefix.push_str("...");
+            prefix
+        } else {
+            truncated
+        }
+    }
+}
+
+/// Acknowledgment frame returned for client-initiated mutations over WebSocket.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandAckFrame {
+    /// Monotonic sequence number.
+    pub seq: u64,
+    /// Timestamp (unix ms) when acknowledgment was generated.
+    pub timestamp_unix_ms: u64,
+    /// Correlation ID supplied by client in [`WsCommandFrame`].
+    pub correlation_id: String,
+    /// REST endpoint path corresponding to the mutation.
+    pub command_endpoint: String,
+    /// True if command executed successfully.
+    pub success: bool,
+    /// HTTP-equivalent status code (e.g. 200, 400, 404, 409).
+    pub status_code: u16,
+    /// Optional response payload (e.g. `CommissionNewResponse`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<serde_json::Value>,
+    /// Optional error description when `success` is false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl CommandAckFrame {
+    /// Constructs a successful command acknowledgment.
+    #[must_use]
+    pub fn success(
+        seq: u64,
+        timestamp_unix_ms: u64,
+        correlation_id: impl Into<String>,
+        command_endpoint: impl Into<String>,
+        payload: Option<serde_json::Value>,
+    ) -> Self {
+        Self {
+            seq,
+            timestamp_unix_ms,
+            correlation_id: correlation_id.into(),
+            command_endpoint: command_endpoint.into(),
+            success: true,
+            status_code: 200,
+            payload,
+            error: None,
+        }
+    }
+
+    /// Constructs an error command acknowledgment.
+    #[must_use]
+    pub fn error(
+        seq: u64,
+        timestamp_unix_ms: u64,
+        correlation_id: impl Into<String>,
+        command_endpoint: impl Into<String>,
+        status_code: u16,
+        error: impl Into<String>,
+    ) -> Self {
+        Self {
+            seq,
+            timestamp_unix_ms,
+            correlation_id: correlation_id.into(),
+            command_endpoint: command_endpoint.into(),
+            success: false,
+            status_code,
+            payload: None,
+            error: Some(error.into()),
+        }
+    }
+}
+
+/// Server-to-client frames streamed over the WebSocket connection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WsServerFrame {
+    /// Village projection state snapshot or diff.
+    StateDelta(Box<StateDeltaFrame>),
+    /// Rate-limited batch of parcel telemetry ticks.
+    Metrics(MetricsBatchFrame),
+    /// Over-the-head chat bubble event.
+    Bubble(BubbleFrame),
+    /// Acknowledgment of a client mutation command.
+    CommandAck(CommandAckFrame),
+    /// Notice requiring client to clear local state and resync.
+    ResyncRequired {
+        seq: u64,
+        timestamp_unix_ms: u64,
+        daemon_instance_id: String,
+        reason: String,
+    },
+    /// Heartbeat response to client ping.
+    Pong { timestamp_unix_ms: u64 },
+    /// Backward-compatible legacy event frame.
+    Event(WsEvent),
+}
+
+/// Client-to-server frames received over the WebSocket connection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WsClientFrame {
+    /// Mutation command mapped 1:1 onto local API endpoints.
+    Command(WsCommandFrame),
+    /// Request full state snapshot resync.
+    Resync {
+        last_seen_seq: Option<u64>,
+        daemon_instance_id: Option<String>,
+    },
+    /// Heartbeat ping.
+    Ping { timestamp_unix_ms: u64 },
+    /// Heartbeat pong.
+    Pong { timestamp_unix_ms: u64 },
+}
+
+/// Client command container with correlation identifier for asynchronous response correlation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WsCommandFrame {
+    /// Client-generated correlation ID.
+    pub correlation_id: String,
+    /// Typed command action and parameters.
+    pub action: WsCommandAction,
+}
+
+impl WsCommandFrame {
+    /// Constructs a new command frame.
+    #[must_use]
+    pub fn new(correlation_id: impl Into<String>, action: WsCommandAction) -> Self {
+        Self {
+            correlation_id: correlation_id.into(),
+            action,
+        }
+    }
+}
+
+/// Typed client mutation commands mapping 1:1 onto ADR-0041/ADR-0043 daemon endpoints.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", content = "payload", rename_all = "snake_case")]
+pub enum WsCommandAction {
+    /// Create new commission (`POST /api/v1/commissions/new`).
+    CommissionNew(CommissionNewRequest),
+    /// Close active commission (`POST /api/v1/commissions/:slug/close`).
+    CommissionClose {
+        slug: SafeName,
+        request: CommissionCloseRequest,
+    },
+    /// Hibernate active parcel (`POST /api/v1/agents/:uid/hibernate`).
+    AgentHibernate {
+        uid: u32,
+        request: AgentHibernateRequest,
+    },
+    /// Wake patron into parcel (`POST /api/v1/agents/wake`).
+    AgentWake(AgentWakeRequest),
+    /// Steer active agent session (`POST /api/v1/agents/:uid/steer`).
+    AgentSteer {
+        uid: u32,
+        request: AgentSteerRequest,
+    },
+    /// Send mail message (`POST /api/v1/mail/send`).
+    MailSend(MailSendRequest),
+    /// Export vault artifact (`POST /api/v1/vault/export`).
+    VaultExport(VaultExportRequest),
+    /// Resolve manor escalation (`POST /api/v1/escalations/:id/resolve`).
+    EscalationResolve {
+        id: SafeName,
+        request: EscalationResolveRequest,
+    },
+    /// Stop daemon (`POST /api/v1/daemon/stop`).
+    DaemonStop,
+}
+
+impl WsCommandAction {
+    /// Returns the exact REST endpoint path string for this command action.
+    #[must_use]
+    pub fn endpoint_path(&self) -> String {
+        match self {
+            Self::CommissionNew(_) => ENDPOINT_COMMISSION_NEW.to_string(),
+            Self::CommissionClose { slug, .. } => {
+                endpoint_path(ENDPOINT_COMMISSION_CLOSE, &[("slug", slug.as_str())])
+            }
+            Self::AgentHibernate { uid, .. } => {
+                let uid_str = uid.to_string();
+                endpoint_path(ENDPOINT_AGENT_HIBERNATE, &[("uid", &uid_str)])
+            }
+            Self::AgentWake(_) => ENDPOINT_AGENT_WAKE.to_string(),
+            Self::AgentSteer { uid, .. } => {
+                let uid_str = uid.to_string();
+                endpoint_path(ENDPOINT_AGENT_STEER, &[("uid", &uid_str)])
+            }
+            Self::MailSend(_) => ENDPOINT_MAIL_SEND.to_string(),
+            Self::VaultExport(_) => ENDPOINT_VAULT_EXPORT.to_string(),
+            Self::EscalationResolve { id, .. } => {
+                endpoint_path(ENDPOINT_ESCALATION_RESOLVE, &[("id", id.as_str())])
+            }
+            Self::DaemonStop => ENDPOINT_STOP.to_string(),
+        }
+    }
+
+    /// Stable identifier name of the action.
+    #[must_use]
+    pub fn action_name(&self) -> &'static str {
+        match self {
+            Self::CommissionNew(_) => "commission_new",
+            Self::CommissionClose { .. } => "commission_close",
+            Self::AgentHibernate { .. } => "agent_hibernate",
+            Self::AgentWake(_) => "agent_wake",
+            Self::AgentSteer { .. } => "agent_steer",
+            Self::MailSend(_) => "mail_send",
+            Self::VaultExport(_) => "vault_export",
+            Self::EscalationResolve { .. } => "escalation_resolve",
+            Self::DaemonStop => "daemon_stop",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Unit Tests
 // ---------------------------------------------------------------------------
 
@@ -996,5 +1583,347 @@ mod tests {
         assert_eq!(EscalationResolution::parse(&text).unwrap(), rec);
         let bad = text.replace("\"resolution_version\": 1", "\"resolution_version\": 9");
         assert!(EscalationResolution::parse(&bad).is_err());
+    }
+
+    #[test]
+    fn state_delta_frame_snapshot_and_diff_roundtrip() {
+        let mut mail_counts = BTreeMap::new();
+        mail_counts.insert(1000, 3);
+        mail_counts.insert(1001, 1);
+
+        let snap = StateDeltaFrame::snapshot(
+            "inst-42",
+            1,
+            1729000000000,
+            vec![CensusRecordView {
+                uid: 1001,
+                identity: safe("builder-bot"),
+                commission: Some(42),
+                commission_slug: Some(safe("world-slice")),
+                state: "live".into(),
+                stasis: false,
+                session_count: 1,
+                counters: ApiCensusCounters {
+                    input_tokens: 120,
+                    output_tokens: 30,
+                    cost_micro_usd: 1500,
+                    traces: 5,
+                },
+                last_event: Some("pi_tool_call".into()),
+                last_event_ts: Some("1729000000000".into()),
+                title_digest: "abc".into(),
+            }],
+            vec![CommissionSummaryView {
+                commission_id: 1,
+                slug: safe("world-slice"),
+                state: "Active".into(),
+                roster: vec![1001],
+                deliverables_count: 1,
+                brief: true,
+                indenture: true,
+                git: "init".into(),
+            }],
+            vec![DecreeSummaryView {
+                decree_id: "d-1-init".into(),
+                seq: 1,
+                action: "charter_update".into(),
+                status: "applied".into(),
+                reason: Some("initial layout".into()),
+            }],
+            vec![VaultItemView {
+                name: "deliverable.tar.gz".into(),
+                commission: Some(safe("world-slice")),
+                size_bytes: 1048576,
+                sha256: "abcdef0123456789".into(),
+            }],
+            mail_counts,
+            LandmarksView::default(),
+            vec![],
+        );
+
+        let json = serde_json::to_string(&snap).expect("serialize snapshot");
+        let decoded: StateDeltaFrame = serde_json::from_str(&json).expect("deserialize snapshot");
+        assert_eq!(decoded, snap);
+        assert!(decoded.is_snapshot);
+
+        // Incremental diff
+        let mut diff = StateDeltaFrame::diff("inst-42", 2, 1729000001000);
+        let mut updated_counts = BTreeMap::new();
+        updated_counts.insert(1001, 2);
+        diff.mail_counts = Some(updated_counts);
+
+        let diff_json = serde_json::to_string(&diff).expect("serialize diff");
+        let diff_decoded: StateDeltaFrame =
+            serde_json::from_str(&diff_json).expect("deserialize diff");
+        assert_eq!(diff_decoded, diff);
+        assert!(!diff_decoded.is_snapshot);
+        assert!(diff_decoded.census.is_none());
+    }
+
+    #[test]
+    fn metrics_batch_frame_roundtrip() {
+        let frame = MetricsBatchFrame::new(
+            10,
+            1729000000000,
+            vec![
+                ParcelMetricTick {
+                    uid: 1001,
+                    session_id: Some("sess-1".into()),
+                    tokens_in: 12000,
+                    tokens_out: 450,
+                    cost_micro_usd: Some(15000),
+                    latency_ms: 320,
+                    memory_bytes: Some(64 * 1024 * 1024),
+                    cpu_percent_x10: Some(185), // 18.5%
+                },
+                ParcelMetricTick {
+                    uid: 1000,
+                    session_id: None,
+                    tokens_in: 500,
+                    tokens_out: 100,
+                    cost_micro_usd: None,
+                    latency_ms: 45,
+                    memory_bytes: None,
+                    cpu_percent_x10: None,
+                },
+            ],
+        );
+
+        let json = serde_json::to_string(&frame).expect("serialize metrics batch");
+        let decoded: MetricsBatchFrame =
+            serde_json::from_str(&json).expect("deserialize metrics batch");
+        assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn bubble_frame_honesty_rule_and_truncation() {
+        // Honesty rule: bodies strictly suppressed, only snippet delivered
+        let bubble = BubbleFrame::mail_snippet(
+            12,
+            1729000000000,
+            1001,
+            1000,
+            "Re: Task Completion",
+            "Artifact delivered at keep/vault/output.txt with verified hash",
+        );
+        assert_eq!(bubble.target, BubbleTarget::Agent(1000));
+        assert!(bubble.text.starts_with("[Mail] Re: Task Completion:"));
+        assert!(bubble.text.len() <= MAX_BUBBLE_TEXT_LEN);
+
+        if let BubbleKind::MailSnippet { snippet, .. } = &bubble.kind {
+            assert!(snippet.len() <= MAX_MAIL_SNIPPET_LEN);
+        } else {
+            panic!("expected MailSnippet kind");
+        }
+
+        // Steer bubble
+        let steer_bubble =
+            BubbleFrame::steer(13, 1729000000000, 1001, "Focus on fixing broken unit test");
+        assert_eq!(steer_bubble.target, BubbleTarget::Agent(1001));
+        assert!(steer_bubble.text.contains("Focus on fixing"));
+
+        // Long text truncation test
+        let oversized = "A".repeat(300);
+        let truncated_speech = BubbleFrame::agent_speech(14, 1729000000000, 1001, &oversized);
+        assert!(truncated_speech.text.len() <= MAX_BUBBLE_TEXT_LEN);
+        assert!(truncated_speech.text.ends_with("..."));
+    }
+
+    #[test]
+    fn command_ack_frame_roundtrip() {
+        let ack_ok = CommandAckFrame::success(
+            5,
+            1729000000000,
+            "corr-123",
+            "/api/v1/commissions/new",
+            Some(serde_json::json!({"slug": "test-comm", "created": true})),
+        );
+        let json = serde_json::to_string(&ack_ok).expect("serialize ack_ok");
+        let decoded: CommandAckFrame = serde_json::from_str(&json).expect("deserialize ack_ok");
+        assert_eq!(decoded, ack_ok);
+        assert!(decoded.success);
+        assert_eq!(decoded.status_code, 200);
+
+        let ack_err = CommandAckFrame::error(
+            6,
+            1729000000000,
+            "corr-124",
+            "/api/v1/agents/1001/steer",
+            404,
+            "parcel 1001 is hibernated",
+        );
+        let err_json = serde_json::to_string(&ack_err).expect("serialize ack_err");
+        let err_decoded: CommandAckFrame =
+            serde_json::from_str(&err_json).expect("deserialize ack_err");
+        assert_eq!(err_decoded, ack_err);
+        assert!(!err_decoded.success);
+        assert_eq!(err_decoded.status_code, 404);
+        assert_eq!(
+            err_decoded.error.as_deref(),
+            Some("parcel 1001 is hibernated")
+        );
+    }
+
+    #[test]
+    fn ws_server_frame_tagged_matrix() {
+        let snap_frame =
+            WsServerFrame::StateDelta(Box::new(StateDeltaFrame::diff("inst-1", 1, 100)));
+        let json = serde_json::to_string(&snap_frame).expect("serialize snap_frame");
+        assert!(json.contains("\"type\":\"state_delta\""));
+        let decoded: WsServerFrame = serde_json::from_str(&json).expect("deserialize snap_frame");
+        assert_eq!(decoded, snap_frame);
+
+        let resync = WsServerFrame::ResyncRequired {
+            seq: 99,
+            timestamp_unix_ms: 100,
+            daemon_instance_id: "inst-2".into(),
+            reason: "daemon restarted".into(),
+        };
+        let r_json = serde_json::to_string(&resync).expect("serialize resync");
+        assert!(r_json.contains("\"type\":\"resync_required\""));
+        let r_decoded: WsServerFrame = serde_json::from_str(&r_json).expect("deserialize resync");
+        assert_eq!(r_decoded, resync);
+    }
+
+    #[test]
+    fn ws_command_action_endpoint_mapping_and_roundtrip() {
+        let cases: Vec<(WsCommandAction, &str, &str)> = vec![
+            (
+                WsCommandAction::CommissionNew(CommissionNewRequest {
+                    slug: safe("world-slice"),
+                    brief: "Make game".into(),
+                    seed_dir: None,
+                }),
+                "/api/v1/commissions/new",
+                "commission_new",
+            ),
+            (
+                WsCommandAction::CommissionClose {
+                    slug: safe("alpha"),
+                    request: CommissionCloseRequest {
+                        slug: safe("alpha"),
+                    },
+                },
+                "/api/v1/commissions/alpha/close",
+                "commission_close",
+            ),
+            (
+                WsCommandAction::AgentHibernate {
+                    uid: 1002,
+                    request: AgentHibernateRequest {
+                        trigger: Some("idle".into()),
+                    },
+                },
+                "/api/v1/agents/1002/hibernate",
+                "agent_hibernate",
+            ),
+            (
+                WsCommandAction::AgentWake(AgentWakeRequest {
+                    patron: safe("coder"),
+                    commission: Some(safe("alpha")),
+                }),
+                "/api/v1/agents/wake",
+                "agent_wake",
+            ),
+            (
+                WsCommandAction::AgentSteer {
+                    uid: 1003,
+                    request: AgentSteerRequest {
+                        directive: "pause and reflect".into(),
+                    },
+                },
+                "/api/v1/agents/1003/steer",
+                "agent_steer",
+            ),
+            (
+                WsCommandAction::MailSend(MailSendRequest {
+                    from: Some("1000".into()),
+                    to: 1001,
+                    subject: "Directive".into(),
+                    body: "Hello".into(),
+                }),
+                "/api/v1/mail/send",
+                "mail_send",
+            ),
+            (
+                WsCommandAction::VaultExport(VaultExportRequest {
+                    artifact: "bundle.tar.gz".into(),
+                    destination: "/tmp/out".into(),
+                    commission: Some(safe("alpha")),
+                }),
+                "/api/v1/vault/export",
+                "vault_export",
+            ),
+            (
+                WsCommandAction::EscalationResolve {
+                    id: safe("esc-1"),
+                    request: EscalationResolveRequest {
+                        resolution: "Approved".into(),
+                    },
+                },
+                "/api/v1/escalations/esc-1/resolve",
+                "escalation_resolve",
+            ),
+            (
+                WsCommandAction::DaemonStop,
+                "/api/v1/daemon/stop",
+                "daemon_stop",
+            ),
+        ];
+
+        for (action, expected_endpoint, expected_name) in cases {
+            assert_eq!(action.endpoint_path(), expected_endpoint);
+            assert_eq!(action.action_name(), expected_name);
+
+            let cmd_frame = WsClientFrame::Command(WsCommandFrame::new("corr-1", action));
+            let json = serde_json::to_string(&cmd_frame).expect("serialize cmd_frame");
+            assert!(json.contains("\"type\":\"command\""));
+            let decoded: WsClientFrame =
+                serde_json::from_str(&json).expect("deserialize cmd_frame");
+            assert_eq!(decoded, cmd_frame);
+        }
+    }
+
+    #[test]
+    fn ws_protocol_golden_vectors() {
+        // Golden vector 1: Resync frame
+        let golden_resync =
+            r#"{"type":"resync","last_seen_seq":42,"daemon_instance_id":"inst-prev"}"#;
+        let client_frame: WsClientFrame =
+            serde_json::from_str(golden_resync).expect("parse golden resync");
+        assert_eq!(
+            client_frame,
+            WsClientFrame::Resync {
+                last_seen_seq: Some(42),
+                daemon_instance_id: Some("inst-prev".into()),
+            }
+        );
+
+        // Golden vector 2: Server Bubble Frame
+        let golden_bubble = r#"{
+            "type": "bubble",
+            "seq": 7,
+            "timestamp_unix_ms": 1729000000000,
+            "target": {"type": "agent", "id": 1001},
+            "kind": {
+                "kind": "mail_snippet",
+                "from_uid": 1000,
+                "to_uid": 1001,
+                "subject": "Status check",
+                "snippet": "Are tests passing?"
+            },
+            "text": "[Mail] Status check: Are tests passing?",
+            "duration_ms": 4000
+        }"#;
+        let server_frame: WsServerFrame =
+            serde_json::from_str(golden_bubble).expect("parse golden bubble");
+        match server_frame {
+            WsServerFrame::Bubble(b) => {
+                assert_eq!(b.seq, 7);
+                assert_eq!(b.target, BubbleTarget::Agent(1001));
+                assert_eq!(b.text, "[Mail] Status check: Are tests passing?");
+            }
+            _ => panic!("expected bubble frame"),
+        }
     }
 }

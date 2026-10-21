@@ -878,6 +878,7 @@ dependencies = [
  "sled",
  "tempfile",
  "tokio",
+ "tokio-tungstenite 0.21.0",
  "tower-http",
 ]
 
@@ -899,6 +900,11 @@ dependencies = [
 [[package]]
 name = "hamlet-web"
 version = "0.0.0"
+dependencies = [
+ "hamlet-core",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "hashbrown"

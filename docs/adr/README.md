@@ -89,6 +89,7 @@ ADRs are immutable. To change a decision:
 | [0041](0041-daemon-local-api.md) | Daemon local API contract: localhost HTTP+WS, 0600 token auth, zero-orchestration projections & commands | Accepted |
 | [0042](0042-cli-command-tree-and-tui-architecture.md) | CLI command tree and TUI architecture: clap surface, exit code policy, ratatui landmark MUD | Accepted (§4 room contents superseded by ADR-0043) |
 | [0043](0043-tui-rooms-landmark-projection.md) | TUI rooms on the SPEC §2 tree; landmark + escalation projections, WS command publication | Accepted (supersedes ADR-0042 §4 room contents; amends ADR-0041 cl. 4–5) |
+| [0044](0044-ws-protocol-and-web-arch.md) | WS protocol framing and web architecture: bidirectional frames, 2D canvas, asset pipeline | Accepted |
 
 Keep this index updated in the same commit that adds/changes an ADR.
 
@@ -108,4 +109,4 @@ reused. Where a later prompt cites one of these, read the ADR actually written:
 | Sprint 06 "ADR-0012" | commission state machine + git mediation | 0012 (derived images) | **ADR-0036** (state machine) + **ADR-0037** (git mediation) + **ADR-0038** (DEED promotion) |
 | Sprint 07 "ADR-0013" | stasis formats + resource policy | 0013 (pkgcache trust) | **ADR-0039** (stasis formats) + **ADR-0040** (resource policy) |
 | Sprint 08 "ADR-0014" | CLI surface + local API contract | 0014 (parcel env policy) | **ADR-0041** (local API) + **ADR-0042** (CLI/TUI) |
-| Sprint 09 "ADR-0015" | WS protocol + asset architecture | 0015 (session protocol) | next free number (0044+) |
+| Sprint 09 "ADR-0015" | WS protocol + asset architecture | 0015 (session protocol) | **ADR-0044** |

@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>hamlet — 8-bit Village RPG</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- Boot Screen & Sting Sound (assets/audio/toBe.wav) -->
+  <div id="boot-overlay" class="boot-screen" role="dialog" aria-modal="true" aria-label="Console Boot Splash">
+    <div class="boot-container">
+      <pre class="boot-logo">
+ _   _   ___   __  __  _      _____  _____ 
+| | | | / _ \ |  \/  || |    |  ___||_   _|
+| |_| |/ /_\ \| |\/| || |    | |__    | |  
+|  _  ||  _  || |  | || |    |  __|   | |  
+| | | || | | || |  | || |___ | |___   | |  
+\_| |_/\_| |_/\_|  |_/\_____/\____/   \_/  
+      </pre>
+      <div class="boot-tagline">=== 8-BIT VILLAGE ORCHESTRATION ENGINE ===</div>
+      <div class="boot-spec">SPEC §12.3 WASM PRESENTATION LAYER</div>
+      <div class="boot-prompt" id="boot-prompt">INITIALIZING CONSOLE...</div>
+    </div>
+  </div>
+
+  <div id="app">
+    <header id="village-header">
+      <div class="title-group">
+        <h1>HAMLET</h1>
+        <span class="subtitle">8-bit Village Engine (SPEC §12.3)</span>
+      </div>
+      <div class="header-right">
+        <div id="fps-badge" class="badge fps-good">60 FPS</div>
+        <div id="connection-badge" class="badge disconnected">Disconnected</div>
+      </div>
+    </header>
+
+    <div id="hud-bar">
+      <div class="hud-item"><span class="label">INSTANCE:</span> <span id="hud-instance" class="val">—</span></div>
+      <div class="hud-item"><span class="label">SEQ:</span> <span id="hud-seq" class="val">0</span></div>
+      <div class="hud-item"><span class="label">AGENTS:</span> <span id="hud-agents" class="val">0</span></div>
+      <div class="hud-item"><span class="label">COMMISSIONS:</span> <span id="hud-commissions" class="val">0</span></div>
+      <div class="hud-item"><span class="label">DECREES:</span> <span id="hud-decrees" class="val">0</span></div>
+      <div class="hud-item"><span class="label">MAIL:</span> <span id="hud-mail" class="val">0</span></div>
+      <div class="hud-item"><span class="label">COST:</span> <span id="hud-cost" class="val">$0.00</span></div>
+    </div>
+
+    <div id="ticker-bar">
+      <span class="ticker-label">TICKER:</span>
+      <span id="ticker-text" class="ticker-content">Connecting to daemon WebSocket stream...</span>
+    </div>
+
+    <main id="viewport">
+      <div id="canvas-container">
+        <canvas id="village-canvas" width="512" height="384" tabindex="0" role="img" aria-label="8-bit Village Map Canvas"></canvas>
+      </div>
+
+      <nav id="landmark-nav" aria-label="Village Landmark Navigation">
+        <h2>Landmarks (SPEC §2)</h2>
+        <ul id="landmark-list">
+          <li><button class="nav-btn" data-landmark="guild" accesskey="1"><kbd>1</kbd> Guild Hall (guild/)</button></li>
+          <li><button class="nav-btn" data-landmark="courier" accesskey="2"><kbd>2</kbd> Courier Post (courier/)</button></li>
+          <li><button class="nav-btn" data-landmark="keep" accesskey="3"><kbd>3</kbd> Keep & Vault (keep/)</button></li>
+          <li><button class="nav-btn" data-landmark="tavern" accesskey="4"><kbd>4</kbd> Tavern & Stasis (tavern/)</button></li>
+          <li><button class="nav-btn" data-landmark="market" accesskey="5"><kbd>5</kbd> Market Stalls (market/)</button></li>
+          <li><button class="nav-btn" data-landmark="manor" accesskey="6"><kbd>6</kbd> Mayor's Manor (keep/census/manor/)</button></li>
+        </ul>
+        <div id="aria-status" role="region" aria-live="polite" class="sr-only">Village canvas initialized.</div>
+      </nav>
+    </main>
+
+    <!-- Management Pixel UI Drawer (DOM-Hybrid Overlay) -->
+    <aside id="management-drawer" class="management-drawer hidden" role="dialog" aria-modal="true" aria-labelledby="drawer-title">
+      <div class="drawer-header">
+        <div class="drawer-title-group">
+          <h2 id="drawer-title">Management Desk</h2>
+          <span id="drawer-subtitle" class="drawer-sub">SPEC §12.3</span>
+        </div>
+        <button id="drawer-close" class="pixel-btn close-btn" title="Close Panel (Esc)" aria-label="Close Panel">✕ [ESC]</button>
+      </div>
+
+      <div id="mutation-banner" class="mutation-banner hidden" role="status" aria-live="polite"></div>
+
+      <div id="drawer-content" class="drawer-content">
+        <!-- Dynamically rendered management panel -->
+      </div>
+    </aside>
+
+    <footer id="village-footer">
+      <div id="interaction-panel">
+        <span id="selected-info">Select a landmark building or workshop sprite to inspect. Hotkeys 1–6 navigate landmarks.</span>
+      </div>
+    </footer>
+  </div>
+
+  <script src="hamlet.js"></script>
+</body>
+</html>

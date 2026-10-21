@@ -15,6 +15,7 @@ tokio = { workspace = true, features = ["io-util", "sync", "time", "net"] }
 notify = { workspace = true }
 reqwest = { workspace = true }        # dispatch outbox sends (ADR-0020)
 axum = { workspace = true, features = ["ws"] }            # inbound webhook endpoints (ADR-0022)
+tokio-tungstenite = { workspace = true }
 tower-http = { workspace = true, features = ["limit"] }             # hard body cap below extractors
 dotenvy = { workspace = true }         # pure .env parsing at send time (ADR-0020 cl. 6)
 

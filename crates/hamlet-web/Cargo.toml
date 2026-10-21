@@ -5,6 +5,10 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
-# Stub stage: no dependencies yet. WASM glue/tooling lands in sprint 09 and
-# will require an ADR for any crate outside the SPEC §3 locked stack.
+hamlet-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

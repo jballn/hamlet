@@ -5,3 +5,7 @@ target/
 logs/
 __pycache__/
 .hamlet-data/
+dist/
+crates/hamlet-web/dist/
+pi-session-*.html
+roadmap/.runner-state.json
