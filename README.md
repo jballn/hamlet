@@ -163,3 +163,10 @@ Hamlet is verified by a strict test battery enforcing behavioral immutability an
 - **[Developer Conventions (`roadmap/CONVENTIONS.md`)](roadmap/CONVENTIONS.md)**: Coding standards, purity rules, and engineering practices.
 - **[Documentation Index (`docs/README.md`)](docs/README.md)**: Directory overview and guide to repository documentation.
 - **[Backlog & Future Work (`docs/BACKLOG.md`)](docs/BACKLOG.md)**: Tracked future improvements and post-1.0 roadmap items.
+
+---
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
+

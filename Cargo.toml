@@ -16,6 +16,7 @@ members = [
 version = "0.0.0"
 edition = "2021"
 publish = false
+license = "MIT"
 
 [workspace.dependencies]
 # --- internal (path deps; exempt from the allowlist) ---

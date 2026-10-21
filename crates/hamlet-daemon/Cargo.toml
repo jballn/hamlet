@@ -4,6 +4,7 @@ description = "The singular governor: only crate that spawns processes or mutate
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [dependencies]
 # Locked stack (SPEC §3 / CONVENTIONS §2) — additions require an ADR.

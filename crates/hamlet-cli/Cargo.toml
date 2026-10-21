@@ -4,6 +4,7 @@ description = "The `hamlet` binary: operator command surface (SPEC §12.1). No o
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [lib]
 name = "hamlet_cli"

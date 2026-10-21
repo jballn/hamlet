@@ -4,6 +4,7 @@ description = "WASM 8-bit RPG frontend assets + Rust/JS glue served by axum (SPE
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [lib]
 crate-type = ["cdylib", "rlib"]
