@@ -158,6 +158,7 @@ Hamlet is verified by a strict test battery enforcing behavioral immutability an
 
 ## Documentation
 
+- **[Installation Guide (`docs/INSTALLATION_GUIDE.md`)](docs/INSTALLATION_GUIDE.md)**: System prerequisites, platform setup guides (Linux deb/rpm/other, Windows WSL2/native, macOS), compilation, and environment configuration.
 - **[Specification (`SPEC.md`)](SPEC.md)**: Normative specification covering village layout, security model, and protocol encodings.
 - **[Architecture Decision Records (`docs/adr/`)](docs/adr/)**: 44 accepted ADRs documenting architectural decisions and rationale.
 - **[Developer Conventions (`roadmap/CONVENTIONS.md`)](roadmap/CONVENTIONS.md)**: Coding standards, purity rules, and engineering practices.

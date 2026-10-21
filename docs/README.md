@@ -9,6 +9,7 @@ Welcome to the Hamlet technical documentation. This directory and the repository
 | Document / Directory | Purpose | Audience |
 |---|---|---|
 | [**`SPEC.md`**](../SPEC.md) | The normative architectural and behavioural specification for Hamlet. Defines village filesystem layout, agent lifecycle, IPC mechanisms, security policies, and resource bounds. | Core developers, auditors, integrations |
+| [**`docs/INSTALLATION_GUIDE.md`**](INSTALLATION_GUIDE.md) | Complete system prerequisites, platform setup guides (Linux deb/rpm/other, Windows WSL2/native, macOS), build instructions, configuration, and diagnostics. | Operators, contributors, evaluators |
 | [**`docs/adr/`**](adr/) | Architecture Decision Records (ADRs 0001 through 0044). Documents every key technical decision, architectural pivot, wire encoding, and security boundary. | All contributors |
 | [**`docs/BACKLOG.md`**](BACKLOG.md) | Tracked post-1.0 enhancements, architectural extensions, and future-work backlog items. | Roadmap planners, contributors |
 | [**`roadmap/CONVENTIONS.md`**](../roadmap/CONVENTIONS.md) | Engineering conventions, code layout rules, purity seams, error handling doctrine, atomic write guarantees, and commit formatting. | All contributors |
