@@ -475,3 +475,23 @@ Per the ADR index (`docs/adr/README.md`), Sprint 09 "ADR-0015" corresponds to **
 
 ## Step 07 — commit-agent: WASM frontend merge & tag
 
+Status: **done**. Precondition `GATE 09/06: PASS` verified.
+
+### Commits (`sprint/09-wasm-frontend`, in order)
+
+| SHA | Scope | Why |
+| --- | ----- | --- |
+| `2c65b6f` | `feat(core,web)` | WS protocol + web architecture (ADR-0015 / ADR-0044) |
+| `f6a14c5` | `feat(daemon)` | asset serving + WS streams (SPEC §12.3, ADR-0015 / ADR-0044) |
+| `900237c` | `feat(web)` | 8-bit village canvas + state-driven sprites (SPEC §12.3) |
+| `311c9d0` | `feat(web)` | pixel management UI over command channel (SPEC §12.3) |
+| `26bb227` | `test(web,daemon)` | e2e suite + resolve QA09-01, QA09-02, QA09-03 protocol findings |
+| `a11b200` | `ci(scripts,roadmap)` | wire build-web into ci-local and record GATE 09/06 PASS in HANDOFF |
+
+### Merge & tag
+
+- **Squash-merged** `sprint/09-wasm-frontend` → `main`: **`08ba61a`** (575 files changed, +11374, -300).
+- **Tagged** `sprint/09-wasm-frontend` → `08ba61a`.
+- **Battery on merged main**: `./scripts/ci-local.sh` PASS (fmt, clippy, check-deps, all workspace tests, village disk policy, guarded podman battery, and all 12 e2e scripts green).
+
+
