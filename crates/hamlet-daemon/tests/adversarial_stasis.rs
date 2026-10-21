@@ -1035,7 +1035,8 @@ fn test_resource_policy_static_audit_call_sites() {
                                 || fname == "decrees.rs"
                                 || fname == "ledger.rs"
                                 || fname == "agent.rs"
-                                || fname == "local_api.rs",
+                                || fname == "local_api.rs"
+                                || fname == "vault.rs",
                             "unauthorized hibernate call site at {}:{}: {}",
                             path.display(),
                             line_no + 1,

@@ -5,14 +5,14 @@
 //! are built as `Vec<String>` from typed sources only (ADR-0010 cl. 1–2):
 //! volume flags exclusively from [`MountSet::to_podman_args`] (the normative
 //! SPEC §4 table), env flags from validated [`Blueprint::env`], image refs
-//! from [`BlueprintMeta::base_image`], names from [`SafeName`] or numeric
+//! from `BlueprintMeta::base_image`, names from [`SafeName`] or numeric
 //! UIDs. Raw paths/specs never reach argv.
 //!
 //! # Isolation policy (fixed by ADR-0010 cl. 3–4, as amended by ADR-0011)
 //!
 //! Every `run_detached` argv carries:
 //! - `--user <uid>:<uid>` over podman's DEFAULT rootless private userns
-//!   (host user → 0; subuid[i] → i+1) so the container user *is* the
+//!   (host user → 0; `subuid[i]` → `i+1`) so the container user *is* the
 //!   charter UID slot (Mayor: 1000) with the same mapping in every
 //!   container — the prerequisite for ownership-based cross-UID isolation
 //!   on shared mounts (ADR-0011; no `--userns` flag is ever passed);
@@ -942,7 +942,7 @@ pub fn unshare_exec_argv(podman_bin: &Path, cmd: &[String]) -> Result<Vec<String
 /// exactly the `# owner:` / `# group:` comment lines the audit's first two
 /// rules are derived from — "owner is a charter slot" and the group check —
 /// so with `-c` every real listing failed to parse as
-/// [`MissingOwner`](crate::freight::FreightError::MissingOwner). The parser
+/// [`MissingOwner`](hamlet_core::freight::FreightError::MissingOwner). The parser
 /// ignores `# file:`/`# flags:`/blank lines, so the un-omitted header is
 /// harmless noise and the *owner* is mandatory state. Verified against GNU
 /// acl 2.4.0, the host tool ADR-0021 cl. 2 names as a prerequisite.
@@ -1052,11 +1052,11 @@ pub fn cat_cmd(path: &Path) -> Result<Vec<String>, PodmanError> {
 }
 
 /// `mktemp -- <dir>/.<prefix>XXXXXX` payload for [`unshare_exec_argv`] —
-/// step one of [`unshare_write_atomic`].
+/// step one of `unshare_write_atomic`.
 ///
 /// `mktemp` creates its output with **`O_CREAT|O_EXCL`** and a name nobody
 /// can predict from outside the call, which is exactly the ADR-0007
-/// create-new property the daemon's own [`create_new`] temp walk buys in
+/// create-new property the daemon's own `create_new` temp walk buys in
 /// user space. That is why the write seam goes through it rather than
 /// guessing a name: the Mayor controls `manor/home/decrees/` and can
 /// pre-plant any *predictable* name (QA05-04), but cannot pre-plant six
@@ -1078,7 +1078,7 @@ pub fn mktemp_staged_cmd(dir: &Path, prefix: &str) -> Result<Vec<String>, Podman
 }
 
 /// `cp -- <src> <dest>` payload for [`unshare_exec_argv`] — step two of
-/// [`unshare_write_atomic`]: copy the daemon-staged bytes onto the temp
+/// `unshare_write_atomic`: copy the daemon-staged bytes onto the temp
 /// file `mktemp` just created exclusively. Pure.
 ///
 /// # Errors
@@ -1096,7 +1096,7 @@ pub fn cp_staged_cmd(src: &Path, dest: &Path) -> Result<Vec<String>, PodmanError
 }
 
 /// `chmod 0600 -- <path>` payload for [`unshare_exec_argv`] — step three of
-/// [`unshare_write_atomic`]. `0600` is correct only *after* the chown: the
+/// `unshare_write_atomic`. `0600` is correct only *after* the chown: the
 /// file's owner becomes the slot UID, which is exactly who may read it.
 /// Pure.
 ///
@@ -1117,7 +1117,7 @@ pub fn chmod_staged_cmd(mode: &str, path: &Path) -> Result<Vec<String>, PodmanEr
 }
 
 /// `chown <uid>:<gid> -- <path>` payload for [`unshare_exec_argv`] — step
-/// four of [`unshare_write_atomic`]: hand the file to the subuid whose home
+/// four of `unshare_write_atomic`: hand the file to the subuid whose home
 /// it lives in (ADR-0011 cl. 2), so the daemon still owns no part of it
 /// afterwards. Pure.
 ///
@@ -1135,7 +1135,7 @@ pub fn chown_one_cmd(uid: u32, gid: u32, path: &Path) -> Result<Vec<String>, Pod
 }
 
 /// `mv -- <src> <dest>` payload for [`unshare_exec_argv`] — the final,
-/// atomic step of [`unshare_write_atomic`]: rename inside the same
+/// atomic step of `unshare_write_atomic`: rename inside the same
 /// directory, so a reader (the Mayor) never observes a partial ack. Pure.
 ///
 /// # Errors
@@ -1322,7 +1322,7 @@ pub struct SessionExecSpec {
     /// Sorted rendering: `BTreeMap` iteration (CONVENTIONS §3 r1).
     pub env: BTreeMap<String, String>,
     /// In-container command (`pi --mode rpc …` in production; validated by
-    /// [`validate_cmd`] — no leading-dash flag injection).
+    /// `validate_cmd` — no leading-dash flag injection).
     pub cmd: Vec<String>,
 }
 
@@ -2062,7 +2062,7 @@ impl FakeRuntime {
     }
 
     /// Queue one injected failure for the next runtime call whose podman
-    /// subcommand (argv[1]) equals `verb` — e.g. `"run"`, `"pull"`,
+    /// subcommand (`argv[1]`) equals `verb` — e.g. `"run"`, `"pull"`,
     /// `"unshare"`, `"rm"`. Verb queues are checked before the generic
     /// [`FakeRuntime::fail_next`] queue, so provisioning rollback tests can
     /// fail exactly one step of a multi-call flow.

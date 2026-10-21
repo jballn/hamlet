@@ -248,7 +248,7 @@ impl HamletTree {
 
     /// `guild/blueprints/<name>.toml` — one immutable environment
     /// declaration (SPEC §5). A Mayor `provision_agent` decree names it
-    /// with a [`SafeName`](crate::sanitize::SafeName) `blueprint_ref`, so
+    /// with a [`crate::sanitize::SafeName`] `blueprint_ref`, so
     /// the file name is built here and nowhere else (CONVENTIONS §4).
     #[must_use]
     pub fn guild_blueprint(&self, name: &crate::sanitize::SafeName) -> PathBuf {
@@ -623,19 +623,38 @@ impl HamletTree {
         self.parcel_home(uid).join("git-spool")
     }
 
-    /// `keep/census/archives/git/<commission>/<uid>/` — daemon-owned archive of
-    /// accepted git bundles for a commission and agent slot (ADR-0037 cl. 6).
+    /// `keep/archives/git/<commission>/<uid>/` — daemon-owned archive of
+    /// accepted git bundles for a commission and agent slot (SPEC §2, ADR-0037 cl. 6).
     /// Lazy: created on first accepted bundle, never by `ensure`.
     #[must_use]
     pub fn census_git_archive(&self, commission: u64, uid: u32) -> PathBuf {
-        self.join(&[
+        let canonical = self.join(&[
+            KEEP,
+            ARCHIVES,
+            "git",
+            &commission.to_string(),
+            &uid.to_string(),
+        ]);
+        let legacy = self.join(&[
             KEEP,
             CENSUS,
             ARCHIVES,
             "git",
             &commission.to_string(),
             &uid.to_string(),
-        ])
+        ]);
+        if legacy.exists() && !canonical.exists() {
+            legacy
+        } else {
+            canonical
+        }
+    }
+
+    /// Alias for [`HamletTree::census_git_archive`] locating the git bundle archive
+    /// at `keep/archives/git/<commission>/<uid>/` (SPEC §2).
+    #[must_use]
+    pub fn git_archive(&self, commission: u64, uid: u32) -> PathBuf {
+        self.census_git_archive(commission, uid)
     }
 
     /// `keep/census/manor/` — the Mayor's lease environment.
@@ -988,7 +1007,11 @@ mod tests {
         );
         assert_eq!(
             tree.census_git_archive(7, 1042),
-            PathBuf::from("/v/.hamlet/keep/census/archives/git/7/1042")
+            PathBuf::from("/v/.hamlet/keep/archives/git/7/1042")
+        );
+        assert_eq!(
+            tree.git_archive(7, 1042),
+            PathBuf::from("/v/.hamlet/keep/archives/git/7/1042")
         );
         assert_eq!(
             tree.manor_mayor_md(),

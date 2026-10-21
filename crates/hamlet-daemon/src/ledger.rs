@@ -766,7 +766,7 @@ pub fn compose_indenture_mail(
 #[serde(rename_all = "snake_case")]
 pub enum GitBundleAckStatus {
     /// Bundle passed all ADR-0037 checks, updated the agent's branch in
-    /// `commission<n>/git/`, archived to `keep/census/archives/git/<n>/<uid>/`,
+    /// `commission<n>/git/`, archived to `keep/archives/git/<n>/<uid>/`,
     /// and woke the Mayor with `git_diff_ready`.
     Accepted,
     /// Bundle failed an ADR-0037 check; renamed to `<name>.bundle.<token>` and
@@ -873,7 +873,7 @@ pub enum GitBundleOutcome {
     /// File name was not a `.bundle` candidate or vanished before processing.
     Ignored,
     /// Bundle was validated, applied to `commission<n>/git/`, archived to
-    /// `keep/census/archives/git/<n>/<uid>/<name>`, acked, and `GitDiffReady`
+    /// `keep/archives/git/<n>/<uid>/<name>`, acked, and `GitDiffReady`
     /// fired.
     Accepted {
         /// 1-based commission ID.
@@ -888,7 +888,7 @@ pub enum GitBundleOutcome {
         base_oid: String,
         /// New head OID on `branch_ref`.
         head_oid: String,
-        /// Host path to the archived bundle under `keep/census/archives/git/`.
+        /// Host path to the archived bundle under `keep/archives/git/`.
         archive_path: PathBuf,
         /// Constructed `GitDiffReady` wake event.
         wake: WakeEvent,
@@ -2725,7 +2725,7 @@ impl Ledger {
         let wake = WakeEvent::from_git_diff(commission, base_safe, head_safe, diff_body)
             .map_err(LedgerError::Wake)?;
 
-        // Archive bundle under `keep/census/archives/git/<commission>/<uid>/<bundle_name>`
+        // Archive bundle under `keep/archives/git/<commission>/<uid>/<bundle_name>`
         let archive_dir = self.tree.census_git_archive(commission, uid);
         create_dir_checked(&archive_dir, MODE_SHARED_READONLY)?;
         let archive_path = archive_dir.join(bundle_name);

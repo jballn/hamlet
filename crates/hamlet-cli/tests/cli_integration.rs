@@ -273,6 +273,25 @@ fn test_mail_send_list_read_lifecycle() {
     let detail_json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(detail_json["summary"]["file_name"], first_file);
     assert!(detail_json["body"].is_string());
+
+    // 8. Read latest mail message without specifying file (Finding 10/01-03)
+    let out = Command::new(BIN)
+        .current_dir(work)
+        .args(["mail", "read", "1001"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("Urgent Notice"));
+
+    let out = Command::new(BIN)
+        .current_dir(work)
+        .args(["--json", "mail", "read", "1001"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let detail_json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(detail_json["summary"]["subject"], "Urgent Notice");
 }
 
 #[test]

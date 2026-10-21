@@ -36,7 +36,7 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Create the normative .hamlet/ village tree inside <dir>
+    /// Create the normative .hamlet/ village tree inside `<dir>`
     Init {
         /// Target village directory
         dir: Option<PathBuf>,
@@ -208,11 +208,11 @@ pub enum MailAction {
         /// Recipient slot UID
         uid: u32,
     },
-    /// Read a specific mail message or list recipient mail
+    /// Read a specific mail message (or latest message if unspecified)
     Read {
         /// Recipient slot UID
         uid: u32,
-        /// Specific mail file name
+        /// Specific mail file name (optional; defaults to latest message)
         file: Option<String>,
     },
     /// Send courier mail to a recipient slot

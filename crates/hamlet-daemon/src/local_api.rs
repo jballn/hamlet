@@ -39,8 +39,10 @@ use tokio::net::TcpListener;
 use tokio::sync::{broadcast, watch};
 
 use crate::census::{list_census, ProductionStasis};
+use crate::decrees::DecreeExecutor;
 use crate::ledger::Ledger;
 use crate::mailroute::{MailActor, MailRouter};
+use crate::mayor::MayorEngine;
 use crate::supervise::Supervisor;
 use crate::telemetry::{AgentKey, Telemetry};
 
@@ -66,6 +68,10 @@ pub struct LocalApiState {
     pub stasis: Option<Arc<ProductionStasis>>,
     /// Optional commission ledger reference.
     pub ledger: Option<Arc<Ledger>>,
+    /// Optional Mayor evaluation engine.
+    pub mayor_engine: Option<Arc<MayorEngine>>,
+    /// Optional decree interpretation executor.
+    pub decree_executor: Option<Arc<DecreeExecutor>>,
     /// Process start timestamp in unix ms.
     pub started_at_unix_ms: u64,
     /// Monotonic WS event sequence for events published by this API.
@@ -98,6 +104,8 @@ impl LocalApiState {
             mail_router: None,
             stasis: None,
             ledger: None,
+            mayor_engine: None,
+            decree_executor: None,
             started_at_unix_ms: unix_now_ms(),
             ws_seq: AtomicU64::new(0),
             ws_hub,
@@ -142,6 +150,20 @@ impl LocalApiState {
     pub fn with_ledger(mut self, ledger: Arc<Ledger>) -> Self {
         self.ws_hub = Arc::new((*self.ws_hub).clone().with_ledger(Arc::clone(&ledger)));
         self.ledger = Some(ledger);
+        self
+    }
+
+    /// Sets the Mayor evaluation engine.
+    #[must_use]
+    pub fn with_mayor_engine(mut self, engine: Arc<MayorEngine>) -> Self {
+        self.mayor_engine = Some(engine);
+        self
+    }
+
+    /// Sets the decree executor.
+    #[must_use]
+    pub fn with_decree_executor(mut self, executor: Arc<DecreeExecutor>) -> Self {
+        self.decree_executor = Some(executor);
         self
     }
 
@@ -1975,28 +1997,237 @@ pub async fn serve_daemon(
     } else {
         hamlet_core::config::Config::default()
     };
-    let fakeagent_path =
-        std::env::var("HAMLET_FAKEAGENT_BIN").unwrap_or_else(|_| "/bin/true".to_string());
-    let spawner: Arc<dyn crate::supervise::SessionSpawner> =
-        Arc::new(crate::supervise::HostProcessSpawner::new(&fakeagent_path));
+
+    let podman_available = if std::env::var("HAMLET_FORCE_FAKEAGENT").unwrap_or_default() == "1" {
+        false
+    } else if std::env::var("HAMLET_PODMAN_TESTS").unwrap_or_default() == "1" {
+        true
+    } else if std::env::var("HAMLET_FAKEAGENT_BIN").is_ok() {
+        false
+    } else {
+        std::process::Command::new(&config.podman_bin)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    };
+
+    let runtime: Arc<dyn crate::podman::Runtime> = if podman_available {
+        Arc::new(crate::podman::PodmanRuntime::from_config(&config))
+    } else {
+        Arc::new(crate::podman::FakeRuntime::default())
+    };
+
+    let spawner: Arc<dyn crate::supervise::SessionSpawner> = if podman_available {
+        Arc::new(crate::supervise::PodmanSpawner::new(Arc::clone(&runtime)))
+    } else {
+        let fakeagent_path =
+            std::env::var("HAMLET_FAKEAGENT_BIN").unwrap_or_else(|_| "/bin/true".to_string());
+        Arc::new(crate::supervise::HostProcessSpawner::new(&fakeagent_path))
+    };
+
     let supervisor = Arc::new(Supervisor::new(
         (*tree).clone(),
         config.clone(),
-        spawner,
+        Arc::clone(&spawner),
         Arc::clone(&telemetry),
     ));
-    let mail_router = Arc::new(MailRouter::new(Arc::clone(&supervisor)));
-    let ledger = Arc::new(Ledger::new((*tree).clone()));
-    let runtime: Arc<dyn crate::podman::Runtime> = Arc::new(crate::podman::FakeRuntime::default());
-    let stasis =
-        Arc::new(ProductionStasis::new((*tree).clone(), runtime).with_telemetry(telemetry.clone()));
+
+    let mayor_engine = Arc::new(
+        MayorEngine::new((*tree).clone(), config.clone(), Arc::clone(&spawner))
+            .with_telemetry(Arc::clone(&telemetry)),
+    );
+    let _ = mayor_engine.recover();
+
+    let commission_wake = Arc::new(crate::ledger::CommissionWakeBridge::new(Arc::clone(
+        &mayor_engine,
+    )));
+    let mayor_mail_bridge = Arc::new(crate::mayor::MayorMailBridge::new(Arc::clone(
+        &mayor_engine,
+    )));
+    let crash_wake = Arc::new(crate::decrees::CrashWakeBridge::new(Arc::clone(
+        &mayor_engine,
+    )));
+    let _census_wake = Arc::new(crate::census::CensusWakeBridge::new(Arc::clone(
+        &mayor_engine,
+    )));
+
+    supervisor.set_crash_wake(crash_wake);
+
+    let mail_router =
+        Arc::new(MailRouter::new(Arc::clone(&supervisor)).with_mayor_mail(mayor_mail_bridge));
+
+    let ledger = Arc::new(
+        Ledger::new((*tree).clone())
+            .with_wake(commission_wake.clone())
+            .with_mail_router(Arc::clone(&mail_router)),
+    );
+    mail_router.set_ledger(Arc::clone(&ledger));
+
+    let stasis = Arc::new(
+        ProductionStasis::new((*tree).clone(), Arc::clone(&runtime))
+            .with_telemetry(Arc::clone(&telemetry))
+            .with_supervisor(Arc::clone(&supervisor)),
+    );
+
+    let secrets = crate::dispatch::load_secrets(&tree).unwrap_or_default();
+
+    let provisioner = Arc::new(crate::census::Provisioner::new(
+        (*tree).clone(),
+        config.clone(),
+        Arc::clone(&runtime),
+    ));
+    let agent_provisioner: Arc<dyn crate::decrees::AgentProvisioner> = Arc::new(
+        crate::decrees::CensusAgentProvisioner::new(provisioner, Arc::clone(&supervisor), secrets),
+    );
+
+    let vault_promotion = Arc::new(
+        crate::vault::VaultPromotion::new((*tree).clone())
+            .with_telemetry(Arc::clone(&telemetry))
+            .with_mail(Arc::clone(&mail_router))
+            .with_supervisor(Arc::clone(&supervisor))
+            .with_stasis(Arc::clone(&stasis))
+            .with_wake(commission_wake),
+    );
+
+    let decree_executor = Arc::new(
+        crate::decrees::DecreeExecutor::new((*tree).clone(), config.clone())
+            .with_provisioner(agent_provisioner)
+            .with_router(Arc::new(crate::decrees::SupervisorRouter::new(Arc::clone(
+                &supervisor,
+            ))))
+            .with_stasis(Arc::clone(&stasis) as Arc<dyn crate::decrees::Stasis>)
+            .with_promotion(vault_promotion)
+            .with_runtime(Arc::clone(&runtime))
+            .with_telemetry(Arc::clone(&telemetry))
+            .with_ledger(Arc::clone(&ledger)),
+    );
+
+    let freight_wake = Arc::new(crate::mayor::FreightWakeBridge::new(Arc::clone(
+        &mayor_engine,
+    )));
+    let freight_guard = Arc::new(crate::freight::FreightGuard::new(
+        Arc::clone(&supervisor),
+        Arc::clone(&runtime),
+        freight_wake,
+    ));
+
+    let dispatcher = Arc::new(crate::watch::Dispatcher::new());
+
+    // 1) Mail route plane
+    if let Err(e) = mail_router.ensure_spool_dirs() {
+        eprintln!("hamlet-daemon: mail spool dirs ensure failed: {e}");
+    }
+    if let Ok(report) = mail_router.recover_spools() {
+        if report.scanned > 0 {
+            eprintln!(
+                "hamlet-daemon: mail recovery scanned={} delivered={} bounced={}",
+                report.scanned, report.delivered, report.bounced
+            );
+        }
+    }
+    let mail_handle = mail_router.attach(&dispatcher);
+
+    // 2) Decree interpretation plane
+    if let Ok(report) = decree_executor.scan().await {
+        if !report.outcomes.is_empty() {
+            eprintln!(
+                "hamlet-daemon: decree recovery executed={} replayed={} rejected={} quarantined={}",
+                report.executed(),
+                report.replayed(),
+                report.rejected(),
+                report.quarantined()
+            );
+        }
+    }
+    let decree_handle = crate::decrees::attach(Arc::clone(&decree_executor), &dispatcher);
+    let ack_watch_handle =
+        crate::decrees::spawn_ack_timeout_watch((*tree).clone(), Arc::clone(&mayor_engine));
+
+    // 3) Freight plane
+    if let Err(e) = freight_guard.ensure_root_acl().await {
+        eprintln!("hamlet-daemon: freight ensure root acl note: {e}");
+    }
+    if let Ok(report) = freight_guard.audit_all().await {
+        if report.scanned > 0 {
+            eprintln!(
+                "hamlet-daemon: freight startup audit scanned={} clean={} flagged={} skipped={}",
+                report.scanned, report.clean, report.flagged, report.skipped
+            );
+        }
+    }
+    let freight_handle = freight_guard.attach(&dispatcher);
+
+    // 4) Git spool plane
+    let git_spool_handle =
+        match crate::ledger::Ledger::spawn_git_spool_plane(Arc::clone(&ledger), &dispatcher) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                eprintln!("hamlet-daemon: git spool plane startup failed: {e}");
+                None
+            }
+        };
+
+    // 5) DEED plane
+    let deed_promoter = Arc::new(
+        crate::promote::DeedPromoter::new((*tree).clone())
+            .with_telemetry(Arc::clone(&telemetry))
+            .with_mail(Arc::clone(&mail_router)),
+    );
+    let deed_handle = crate::promote::spawn_deed_plane(deed_promoter, &dispatcher);
+
+    // 6) Webhook dispatch plane
+    let http_client: Arc<dyn crate::dispatch::HttpClient> = Arc::new(
+        crate::dispatch::ReqwestClient::new(std::time::Duration::from_secs(10))
+            .map_err(|e| io::Error::other(e.to_string()))?,
+    );
+    let dispatch_handle = match crate::dispatch::spawn_dispatch_plane(
+        Arc::clone(&supervisor),
+        http_client,
+        &dispatcher,
+    )
+    .await
+    {
+        Ok((_, h)) => Some(h),
+        Err(e) => {
+            eprintln!("hamlet-daemon: dispatch plane startup failed: {e}");
+            None
+        }
+    };
+
+    // 7) Optional inbound webhook axum server
+    let webhook_server_handle = if config.webhooks.enabled {
+        let webhook_service = Arc::new(crate::web::WebhookService::new(
+            Arc::clone(&supervisor),
+            Arc::clone(&mail_router),
+            Arc::new(crate::mayor::WebhookWakeBridge::new(Arc::clone(
+                &mayor_engine,
+            ))),
+        ));
+        match crate::web::spawn_web_server(webhook_service).await {
+            Ok(h) => Some(h),
+            Err(e) => {
+                eprintln!("hamlet-daemon: webhook server start failed: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // 8) Tree inotify filesystem watcher
+    let watcher_handle =
+        crate::watch::spawn_tree_watcher((*tree).clone(), Arc::clone(&dispatcher), || {})
+            .map_err(|e| io::Error::other(e.to_string()))?;
 
     let state = Arc::new(
         LocalApiState::new(tree.clone(), token.clone(), shutdown_tx.clone())
             .with_supervisor(supervisor)
             .with_mail_router(mail_router)
             .with_ledger(ledger)
-            .with_stasis(stasis),
+            .with_stasis(stasis)
+            .with_mayor_engine(mayor_engine)
+            .with_decree_executor(decree_executor),
     );
 
     let router = local_api_router(state);
@@ -2017,6 +2248,23 @@ pub async fn serve_daemon(
     });
 
     let res = server_fut.await.map_err(io::Error::other);
+
+    let mut watcher = watcher_handle;
+    watcher.stop().await;
+
+    mail_handle.abort();
+    decree_handle.abort();
+    ack_watch_handle.abort();
+    freight_handle.abort();
+    if let Some(h) = git_spool_handle {
+        h.abort();
+    }
+    deed_handle.abort();
+    if let Some(h) = dispatch_handle {
+        h.abort();
+    }
+    drop(webhook_server_handle);
+
     let _ = cleanup_daemon_files(&tree_cleanup);
     res
 }

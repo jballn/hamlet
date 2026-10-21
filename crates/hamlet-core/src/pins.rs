@@ -63,7 +63,7 @@ use crate::blueprint::{
 
 /// The committed pin table (`defaults/toolchain-pins.toml`), embedded so a
 /// daemon binary carries its own trust anchor. Kept in sync by the golden
-/// test [`tests::default_pins_parse`].
+/// test `tests::default_pins_parse`.
 pub const DEFAULT_TOOLCHAIN_PINS_TOML: &str = include_str!("../../../defaults/toolchain-pins.toml");
 
 /// Only schema version this parser accepts (additive migrations bump it).

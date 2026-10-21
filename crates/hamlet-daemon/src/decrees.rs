@@ -323,8 +323,8 @@ pub trait SessionRouter: Send + Sync {
 ///
 /// **Sprint 07 hook (recorded):** implement [`Stasis::park`] as
 /// *clean stop → `podman unshare` copy of `parcel<uid>/home/` → charter
-/// `stasis: true`* and [`Stasis::wake`] as the inverse, then delete
-/// [`CleanStopStasis`]. No caller changes: the executor only knows the trait.
+/// `stasis: true`* and `Stasis::wake` as the inverse, then delete
+/// `CleanStopStasis`. No caller changes: the executor only knows the trait.
 pub trait Stasis: Send + Sync {
     /// Park one agent: stop its session cleanly and mark its lease as in
     /// stasis (charter `parcels[uid].stasis = true`).

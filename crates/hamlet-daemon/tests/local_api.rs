@@ -672,3 +672,64 @@ fn test_daemon_discovery_file_lifecycle() {
     assert!(!tree.daemon_pid().exists());
     assert!(!tree.daemon_endpoint().exists());
 }
+
+#[tokio::test]
+async fn test_serve_daemon_governor_startup_and_plane_orchestration() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tree = Arc::new(HamletTree::ensure(tmp.path().join(".hamlet")).unwrap());
+
+    // Initialize minimal charter
+    let mut charter = Charter::empty();
+    charter.reserve_mayor(name("mayor")).unwrap();
+    charter.allocate_slot(name("worker"), None).unwrap();
+    charter.save_atomic(&tree.charter()).unwrap();
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let tree_run = Arc::clone(&tree);
+    let daemon_task = tokio::spawn(async move {
+        hamlet_daemon::local_api::serve_daemon(tree_run, Some(0), Some(shutdown_rx)).await
+    });
+
+    // Poll for discovery files
+    let mut ep: Option<DaemonEndpoint> = None;
+    let mut token: Option<LocalToken> = None;
+    for _ in 0..50 {
+        if tree.daemon_endpoint().exists() && tree.daemon_token().exists() {
+            if let Ok(c) = fs::read_to_string(tree.daemon_endpoint()) {
+                if let Ok(parsed) = serde_json::from_str::<DaemonEndpoint>(&c) {
+                    ep = Some(parsed);
+                    let t = fs::read_to_string(tree.daemon_token()).unwrap();
+                    token = Some(LocalToken::new(t.trim()));
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    let endpoint = ep.expect("endpoint written");
+    let local_token = token.expect("token written");
+
+    // 1. Call status endpoint
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{}/api/v1/daemon/status", endpoint.base_url()))
+        .header("Authorization", format!("Bearer {}", local_token.as_str()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let status_json: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(status_json["pid"], std::process::id());
+
+    // 2. Shut down daemon
+    shutdown_tx.send(true).unwrap();
+    let result = daemon_task.await.unwrap();
+    assert!(result.is_ok());
+
+    // 3. Confirm discovery files cleaned up
+    assert!(!tree.daemon_endpoint().exists());
+    assert!(!tree.daemon_token().exists());
+    assert!(!tree.daemon_pid().exists());
+}

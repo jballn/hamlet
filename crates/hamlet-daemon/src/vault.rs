@@ -44,6 +44,7 @@ pub struct VaultPromotion {
     telemetry: Option<Arc<Telemetry>>,
     mail: Option<Arc<MailRouter>>,
     supervisor: Option<Arc<Supervisor>>,
+    stasis: Option<Arc<crate::census::ProductionStasis>>,
     max_rejections: u32,
     rejections: Mutex<BTreeMap<String, u32>>,
     wake: Option<Arc<dyn CommissionWake>>,
@@ -58,6 +59,7 @@ impl VaultPromotion {
             telemetry: None,
             mail: None,
             supervisor: None,
+            stasis: None,
             max_rejections: DEFAULT_MAX_PROMOTION_REJECTIONS,
             rejections: Mutex::new(BTreeMap::new()),
             wake: None,
@@ -82,6 +84,13 @@ impl VaultPromotion {
     #[must_use]
     pub fn with_supervisor(mut self, supervisor: Arc<Supervisor>) -> Self {
         self.supervisor = Some(supervisor);
+        self
+    }
+
+    /// Attach stasis governor for executing agent hibernation on deliverable approval.
+    #[must_use]
+    pub fn with_stasis(mut self, stasis: Arc<crate::census::ProductionStasis>) -> Self {
+        self.stasis = Some(stasis);
         self
     }
 
@@ -381,28 +390,20 @@ impl Promotion for VaultPromotion {
                 .map_err(|e| DecreeRefusal::execution_failed(format!("advance commission: {e}")))?;
         }
 
-        // Set submitting parcel in stasis
+        // Set submitting parcel in stasis directly only if stasis governor is not attached.
+        // If attached, ProductionStasis::hibernate executes the complete stasis lifecycle
+        // (home backup, manifest, PROPRIETOR.md, TITLE.md, charter status, parcel directory cleanup).
         if let Some(uid) = submitting_uid {
-            if let Some(lease) = charter.parcels.get_mut(&uid) {
-                lease.stasis = true;
+            if self.stasis.is_none() {
+                if let Some(lease) = charter.parcels.get_mut(&uid) {
+                    lease.stasis = true;
+                }
             }
         }
 
         charter
             .save_atomic(&self.tree.charter())
             .map_err(|e| DecreeRefusal::execution_failed(format!("save charter: {e}")))?;
-
-        // Spin down session
-        if let Some(uid) = submitting_uid {
-            if let Some(sup) = &self.supervisor {
-                let sup = Arc::clone(sup);
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    handle.spawn(async move {
-                        let _ = sup.stop_session(uid).await;
-                    });
-                }
-            }
-        }
 
         // Export telemetry to archives
         if let Some(tel) = &self.telemetry {
@@ -424,6 +425,7 @@ impl Promotion for VaultPromotion {
             );
         }
 
+        // Stamp promotion entry into parcel TITLE.md before parcel cleanup/hibernation
         if let Some(uid) = submitting_uid {
             let _ = crate::census::stamp_parcel_title(
                 &self.tree,
@@ -435,6 +437,30 @@ impl Promotion for VaultPromotion {
                     status: "promoted".to_string(),
                 },
             );
+        }
+
+        // Transition submitting agent into stasis or spin down session
+        if let Some(uid) = submitting_uid {
+            if let Some(stasis) = &self.stasis {
+                if let Err(_e) = stasis.hibernate_sync(uid, "decree:promotion_approved") {
+                    // Fallback: if hibernation fails before teardown, ensure lease.stasis is marked
+                    if let Ok(mut charter) = Charter::load(&self.tree.charter()) {
+                        if let Some(lease) = charter.parcels.get_mut(&uid) {
+                            if !lease.stasis {
+                                lease.stasis = true;
+                                let _ = charter.save_atomic(&self.tree.charter());
+                            }
+                        }
+                    }
+                }
+            } else if let Some(sup) = &self.supervisor {
+                let sup = Arc::clone(sup);
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        let _ = sup.stop_session(uid).await;
+                    });
+                }
+            }
         }
 
         Ok(())

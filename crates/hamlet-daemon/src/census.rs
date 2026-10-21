@@ -14,7 +14,7 @@
 //! 3. apply the ADR-0011 host permission table ([`crate::hostperm`]) so the
 //!    mount table is genuinely enforcing *before* any container starts;
 //! 4. resolve the derived parcel image and `run_detached` with
-//!    [`MountSet::for_agent`] (SPEC §4) via the [`Runtime`] seam
+//!    [`hamlet_core::mount::MountSet::for_agent`] (SPEC §4) via the [`Runtime`] seam
 //!    (ADR-0012: `[meta].base_image` is the PARENT, the apk tools live in a
 //!    local derived layer);
 //! 5. **bootstrap the home** ([`crate::bootstrap`], SPEC §5: the daemon
@@ -2121,27 +2121,30 @@ impl ProductionStasis {
                     source: e.to_string(),
                 })?;
             if let Some(rec) = rec {
-                if rec.status.is_alive() {
-                    sup.stop_session(uid)
-                        .await
-                        .map_err(|e| StasisError::StopSession {
-                            uid,
-                            source: e.to_string(),
-                        })?;
+                if rec.status.is_alive() && sup.is_live(uid) {
+                    match sup.stop_session(uid).await {
+                        Ok(_) | Err(crate::supervise::SuperviseError::NotLive(_)) => {}
+                        Err(e) => {
+                            return Err(StasisError::StopSession {
+                                uid,
+                                source: e.to_string(),
+                            });
+                        }
+                    }
                 }
             }
-        } else {
-            let state = self
+        }
+
+        let state = self
+            .runtime
+            .state(identity.as_str())
+            .await
+            .unwrap_or(ContainerState::Unknown);
+        if state == ContainerState::Running {
+            let _ = self
                 .runtime
-                .state(identity.as_str())
-                .await
-                .unwrap_or(ContainerState::Unknown);
-            if state == ContainerState::Running {
-                let _ = self
-                    .runtime
-                    .stop(identity.as_str(), Duration::from_secs(5))
-                    .await;
-            }
+                .stop(identity.as_str(), Duration::from_secs(5))
+                .await;
         }
 
         // Container teardown

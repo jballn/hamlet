@@ -33,7 +33,7 @@ pub struct RenderLandmark {
     pub status_label: String,
 }
 
-/// Renderable parcel workshop structure in the census zone (SPEC §2 keep/census/parcel<uid>/).
+/// Renderable parcel workshop structure in the census zone (SPEC §2 `keep/census/parcel<uid>/`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RenderWorkshop {
     pub uid: u32,

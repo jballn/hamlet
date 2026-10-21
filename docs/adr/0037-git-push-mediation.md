@@ -62,11 +62,11 @@ rules, conflict policy, and the `GitDiffReady` wake that closes the loop.
    a governance decision, and the daemon will not make one silently.
 
 6. **Consumption is atomic and observable.** A consumed bundle leaves the spool:
-   accepted bundles are archived under `keep/census/archives/git/<n>/<uid>/`
-   (audit trail, same shape as freight archives); refused bundles are renamed in
-   place to `<name>.bundle.<reason>` so the agent sees the receipt and the
-   scanner cannot loop. Every refusal is also mailed to the slot with the full
-   typed reason (refusals are never silent) and traced.
+   accepted bundles are archived under `keep/archives/git/<n>/<uid>/`
+   (audit trail conforming to SPEC §2, with compatibility alias for existing trees);
+   refused bundles are renamed in place to `<name>.bundle.<reason>` so the agent sees
+   the receipt and the scanner cannot loop. Every refusal is also mailed to the slot
+   with the full typed reason (refusals are never silent) and traced.
 
 7. **`GitDiffReady` closes the loop.** On a successful apply the Mayor is woken
    with `EventKind::GitDiffReady { commission, base, head }`: `base` = previous

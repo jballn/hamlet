@@ -20,7 +20,7 @@
 //! 3. **Env layer**: the derived per-UID structural vars plus the blueprint's
 //!    non-secret `[env]` defaults are written to `$HOME/.profile`. Secrets
 //!    from `.env` are injected at session start (Sprint 03) and are NEVER
-//!    written into a home — asserted by [`tests::profile_never_carries_secrets`]
+//!    written into a home — asserted by `tests::profile_never_carries_secrets`
 //!    and by the guarded suite.
 //!
 //! # pkgcache is a mirror, not a trust anchor (ADR-0013)
@@ -72,7 +72,7 @@
 //!   the inner command is validated so it can't become an `env` option.
 //! - Every written path is inside `/home/<uid>/` or `/var/pkgcache/dist/`;
 //!   `/var/git/`, `/var/context/`, `/usr`, `/etc` are never touched
-//!   ([`tests::no_step_writes_outside_home_or_mirror`]).
+//!   (`tests::no_step_writes_outside_home_or_mirror`).
 //! - Blueprint `[env]` cannot set structural keys, loader keys (`LD_PRELOAD`
 //!   …), or point an executable prefix into a shared mount.
 //! - Profile values are single-quoted, so a hostile blueprint value can't
@@ -585,7 +585,7 @@ pub fn apk_packages(blueprint: &Blueprint) -> Vec<String> {
 /// reset both to empty for *any* parent, which is the fail-closed direction:
 /// a run that somehow reached the image with no daemon-supplied command errors
 /// out instead of starting a root shell. Every daemon `run` argv appends an
-/// explicit non-empty command ([`KEEP_ALIVE_COMMAND`], refused if empty by
+/// explicit non-empty command (`KEEP_ALIVE_COMMAND`, refused if empty by
 /// `validate_cmd`), so the keep-alive remains the only possible body.
 #[must_use]
 pub fn containerfile(blueprint: &Blueprint) -> String {

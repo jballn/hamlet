@@ -43,7 +43,7 @@
 //!
 //! Restart policy (ADR-0015 cl. 4): unexpected exit or readiness timeout →
 //! charter `crashed` + sled trace; budget check via the pure schedule
-//! [`RestartConfig::backoff_ms`] over the persisted `restart_count` (no
+//! [`hamlet_core::config::RestartConfig::backoff_ms`] over the persisted `restart_count` (no
 //! wall-clock state, CONVENTIONS §3 r4); a scheduled restart bumps the
 //! incarnation ([`SessionId::next_incarnation`]) and — with
 //! `continue_on_restart` — adds pi `--continue`. `restart_count` resets to
@@ -482,7 +482,7 @@ pub fn title_crash_line(session: &SessionId, restarts: u32, unix_ts: u64, detail
 }
 
 /// Scrub untrusted text (stderr tails, error messages) for lineage/trace
-/// rendering: printable ASCII only, whitespace collapsed, ≤ [`DETAIL_CAP`]
+/// rendering: printable ASCII only, whitespace collapsed, ≤ `DETAIL_CAP`
 /// chars. Values are already masked upstream ([`crate::podman::redacted_argv`]);
 /// this is the second line of defense (CONVENTIONS §6).
 #[must_use]

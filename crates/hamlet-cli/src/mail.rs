@@ -94,42 +94,51 @@ pub async fn read(
 ) -> Result<String, ClientError> {
     let client = HamletClient::discover(dir_flag)?;
 
-    match file {
-        Some(file_name) => {
-            let path = format!("/api/v1/mail/{uid}/{file_name}");
-            let detail: MailMessageDetail = client.get(&path).await?;
-
-            if json {
-                return serde_json::to_string_pretty(&detail).map_err(|e| {
-                    ClientError::Operational(format!("JSON serialization error: {e}"))
-                });
+    let file_to_read = match file {
+        Some(file_name) => file_name.to_string(),
+        None => {
+            let path = format!("/api/v1/mail/{uid}");
+            let items: Vec<MailMessageSummary> = client.get(&path).await?;
+            if let Some(latest) = items.last() {
+                latest.file_name.clone()
+            } else if json {
+                return Ok("null\n".to_string());
+            } else {
+                return Ok(format!("(no mail for slot {uid})\n"));
             }
-
-            let mut out = format!(
-                "From:    {}\n\
-                 To:      {}\n\
-                 Subject: {}\n\
-                 Status:  {}\n\
-                 File:    {}\n\n\
-                 {}\n",
-                detail.summary.from,
-                detail.summary.to,
-                detail.summary.subject,
-                if detail.summary.read {
-                    "read"
-                } else {
-                    "unread"
-                },
-                detail.summary.file_name,
-                detail.body
-            );
-            if !out.ends_with('\n') {
-                out.push('\n');
-            }
-            Ok(out)
         }
-        None => list(dir_flag, uid, json).await,
+    };
+
+    let path = format!("/api/v1/mail/{uid}/{file_to_read}");
+    let detail: MailMessageDetail = client.get(&path).await?;
+
+    if json {
+        return serde_json::to_string_pretty(&detail)
+            .map_err(|e| ClientError::Operational(format!("JSON serialization error: {e}")));
     }
+
+    let mut out = format!(
+        "From:    {}\n\
+         To:      {}\n\
+         Subject: {}\n\
+         Status:  {}\n\
+         File:    {}\n\n\
+         {}\n",
+        detail.summary.from,
+        detail.summary.to,
+        detail.summary.subject,
+        if detail.summary.read {
+            "read"
+        } else {
+            "unread"
+        },
+        detail.summary.file_name,
+        detail.body
+    );
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    Ok(out)
 }
 
 /// Execute `hamlet mail send`.

@@ -1416,7 +1416,12 @@ async fn repro_qa05_02_stop_midrun_loses_telemetry_tail() {
     let log = f.log_path("tail-race");
     let script = f.write_script(
         "tail-race",
-        json!({ "log": log, "flood_frames": 3000, "malformed_every_n": 50 }),
+        json!({
+            "log": log,
+            "flood_frames": 3000,
+            "malformed_every_n": 50,
+            "settle_after_ms": 1500
+        }),
     );
     f.start(&script, "").await;
     // Land the stop INSIDE the run's ~300ms emission window (fast poll —

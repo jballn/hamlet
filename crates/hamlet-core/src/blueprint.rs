@@ -1,4 +1,4 @@
-//! Blueprint schema (SPEC §5; schema was [DEV] → resolved by ADR-0009).
+//! Blueprint schema (SPEC §5; schema was \[DEV\] → resolved by ADR-0009).
 //!
 //! Immutable versioned TOML environment declarations in `guild/blueprints/`
 //! (tools + versions: pixi packages, node versions, cargo toolchains,
@@ -71,7 +71,7 @@ use crate::sanitize::{sanitize_name, SafeName, SanitizeError};
 /// The committed default blueprint (SPEC §4 base: Alpine + uutils +
 /// Pixi/NVM/Cargo), shipped at `defaults/village-alpine.toml`. Seeded into
 /// `guild/blueprints/` by provisioning; kept in sync by the golden test
-/// [`tests::default_blueprint_parses`].
+/// `tests::default_blueprint_parses`.
 pub const DEFAULT_BLUEPRINT_TOML: &str = include_str!("../../../defaults/village-alpine.toml");
 
 /// Maximum length of a tool name / version spec / env value (ADR-0009).
@@ -466,7 +466,7 @@ impl Blueprint {
     /// # Errors
     ///
     /// Errors only if the committed default itself is invalid — a CI-level
-    /// defect, guarded by [`tests::default_blueprint_parses`].
+    /// defect, guarded by `tests::default_blueprint_parses`.
     pub fn default_village_alpine() -> Result<Self, BlueprintError> {
         Self::from_toml(DEFAULT_BLUEPRINT_TOML)
     }

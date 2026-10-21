@@ -24,13 +24,13 @@
 //! - **between wakes: no process at all**, so "zero token cost" is a
 //!   structural property, not a hope ([`SleepState`]);
 //! - **no `--continue`, ever** — the argv comes from
-//!   [`pi_session_cmd`](crate::supervise::pi_session_cmd), which never adds
+//!   [`crate::supervise::pi_session_cmd`], which never adds
 //!   it, and a restart-policy restart is refused rather than resumed.
 //!
 //! # Zero-token sleep, asserted
 //!
 //! [`MayorEngine`] owns no session between calls: the spawned process is
-//! awaited to exit inside `evaluate`. [`SleepState::Awake`] is false after
+//! awaited to exit inside `evaluate`. [`SleepState::awake`] is false after
 //! every wake, and no stdout byte can arrive when nothing is running. The
 //! integration suite asserts both (packet golden + "log gains no lines").
 //!
@@ -314,7 +314,7 @@ pub struct ManorProvisioned {
 
 /// The manor governor: reserves UID 1000, creates the parcel-shaped manor
 /// (`keep/census/manor/{MAYOR.md,home/}`), hardens it under ADR-0011, and
-/// starts the Mayor container with [`MountSet::for_mayor`] (SPEC §4) via
+/// starts the Mayor container with [`hamlet_core::mount::MountSet::for_mayor`] (SPEC §4) via
 /// the [`Runtime`] seam.
 ///
 /// **Crash convergence:** re-provisioning adopts intact state — the charter
@@ -705,7 +705,7 @@ impl WakeEvent {
 
     /// A supervised agent session crashed (SPEC §6; ADR-0029 cl. 2). The
     /// body is the daemon-side crash line — no stderr, no secrets
-    /// ([`scrub_detail`](crate::supervise::scrub_detail) already applied).
+    /// ([`crate::supervise::scrub_detail`] already applied).
     ///
     /// # Errors
     ///
@@ -1038,7 +1038,7 @@ pub struct QueueStats {
 /// FIFO, deterministic, capped: `push` deduplicates by **source identity**
 /// and refuses at `cap`; `take_batch` folds a maximal prefix of same-reason
 /// events into one artifact while the merged body fits
-/// [`MAX_ARTIFACT_BYTES`], splitting (never truncating) at the cap.
+/// [`hamlet_core::packet::MAX_ARTIFACT_BYTES`], splitting (never truncating) at the cap.
 #[derive(Debug)]
 pub struct WakeQueue {
     cap: usize,
@@ -1409,8 +1409,8 @@ pub struct MayorEngine {
 
 impl MayorEngine {
     /// Engine over a village tree, the engine config, and the session
-    /// spawn seam ([`PodmanSpawner`] in production,
-    /// [`HostProcessSpawner`](crate::supervise::HostProcessSpawner) over
+    /// spawn seam ([`crate::supervise::PodmanSpawner`] in production,
+    /// [`crate::supervise::HostProcessSpawner`] over
     /// the FakeAgent in tests).
     #[must_use]
     pub fn new(tree: HamletTree, config: Config, spawner: Arc<dyn SessionSpawner>) -> Self {

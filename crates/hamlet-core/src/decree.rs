@@ -1,4 +1,4 @@
-//! Decree vocabulary + file encodings (SPEC §7; encodings [DEV] → ADR-0026).
+//! Decree vocabulary + file encodings (SPEC §7; encodings \[DEV\] → ADR-0026).
 //!
 //! The Mayor is a stateless executive: it emits **decrees as files** and the
 //! daemon interprets them. This module owns the pure half of that contract —

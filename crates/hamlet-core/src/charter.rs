@@ -8,8 +8,8 @@
 //! derivation (timestamps are telemetry, never state inputs).
 //!
 //! **Normative content groups** (SPEC §11.1; later sprints extend
-//! additively): [`slots`](crate::slots) (uid → identity record), `agents`
-//! (registry refs), `commissions` (id → [`CommissionRecord`](crate::commission::CommissionRecord),
+//! additively): [`crate::slots`] (uid → identity record), `agents`
+//! (registry refs), `commissions` (id → [`crate::commission::CommissionRecord`],
 //! charter v4, ADR-0036), `parcels` (uid
 //! lease records), `sessions` (uid → supervised session record, charter v2,
 //! ADR-0015), `decrees` (decree sequence → queue status) + `decree_receipts`
@@ -57,7 +57,7 @@ use crate::slots::{
 /// rather than silently dropped. `decrees` (id → status) is untouched, so
 /// v2 files still load. v3 → v4 (Sprint 06, ADR-0036 cl. 2): the
 /// `commissions` value type retypes from the 2-state placeholder string to
-/// [`CommissionRecord`](crate::commission::CommissionRecord); the legacy
+/// [`crate::commission::CommissionRecord`]; the legacy
 /// string carries exactly two bits and maps bijectively at parse time
 /// (`open` → draft, `closed` → closed), so v3 files still load.
 pub const CHARTER_VERSION: u32 = 4;
@@ -67,7 +67,7 @@ pub const CHARTER_VERSION: u32 = 4;
 /// All groups are `BTreeMap`/`BTreeSet` (sorted keys fall out naturally) and
 /// serialize away when empty, so a fresh village renders exactly
 /// `{"charter_version": 2}`. Parsing is strict (`deny_unknown_fields` via
-/// the [`StrictCharter`] wire mirror): unknown fields are corruption at
+/// the `StrictCharter` wire mirror): unknown fields are corruption at
 /// every supported version, older-version documents simply omit newer
 /// groups (additive migration fills defaults), and newer files are rejected
 /// by the version check.
