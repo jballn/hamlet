@@ -375,4 +375,29 @@ Executed the complete, uncompromised verification battery across all tiers:
 
 `GATE 10/04: PASS`
 
+---
+
+## Step 05 — commit-agent: Final verification merge, release candidate & release notes
+
+Status: **done**. Precondition `GATE 10/04: PASS` verified.
+
+### Commits (`sprint/10-final-verification`, in order)
+
+| SHA | Scope | Why |
+| --- | ----- | --- |
+| `ab08a42` | `docs(audit)` | SPEC conformance matrix across §§1–14 (60+ requirements) & findings (`AUDIT 10/01: 3 FINDINGS`) |
+| `ecd9346` | `fix(daemon,cli,core)` | Remediate 10/01 audit findings: singular governor planes, git archives topology, mail read verb |
+| `4597bbf` | `chore` | Final code cleanup, zero rustdoc warnings, root docs & roadmap, backlog extraction |
+| `a7e836f` | `ci(roadmap)` | Full uncompromised verification battery across all tiers (`GATE 10/04: PASS`) |
+| `3af8d04` | `docs` | Complete `RELEASE-NOTES.md` for v0.1.0-rc1 (SPEC §14; ADR 0001–0044) |
+
+### Merge & Tag
+
+- **Squash-merged** `sprint/10-final-verification` → `main`: **`f4faf12`** (31 files changed, +2896, -133).
+- **Tagged** `sprint/10-final-verification` → **`f4faf12cd694dcc220feef4e71094c245be4fdec`**.
+- **Tagged** `v0.1.0-rc1` → **`f4faf12cd694dcc220feef4e71094c245be4fdec`**.
+- **Release notes**: [`RELEASE-NOTES.md`](../../RELEASE-NOTES.md).
+- **Follow-on maintenance on main**: `81ef27a` (`fix(core,daemon): refresh rustup-init pin to 1.29.2 following upstream release (ADR-0013)`).
+- **Verification on merged main**: `./scripts/ci-local.sh` confirmed **PASS** across all 5 verification gates, all 7 guarded podman suites, and all 13 end-to-end suites.
+
 
