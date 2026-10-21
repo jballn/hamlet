@@ -693,7 +693,7 @@ mod tests {
         );
         assert_eq!(
             rust.artifact("rustup").unwrap().version(),
-            "1.29.1",
+            "1.29.2",
             "the multiplexer carries its own upstream version, not the toolchain's"
         );
         for a in rust.artifacts() {

@@ -79,7 +79,7 @@ version = "1.98.1"
 
   [[pins.artifacts]]
   role = "rustup"           # static-pie musl binary → installs the multiplexer only
-  version = "1.29.1"        # (`--default-toolchain none`: no unverified downloads).
+  version = "1.29.2"        # (`--default-toolchain none`: no unverified downloads).
                             # Rolling upstream URL, so the digest is the version:
   arch = "x86_64"
   format = "binary"
@@ -87,7 +87,7 @@ version = "1.98.1"
   url = "https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-musl/rustup-init"
   # when rust-lang.org republishes rustup-init this pin must be refreshed
   # (bootstrap fails closed on the mismatch instead of installing new bytes).
-  sha256 = "331228566cc931f32cd684f9bebc5956a5e5d7394c8d5de595f196a658ab98e6"
+  sha256 = "2ba97d668c06dc4b1884f2a3fa6f4cf14b9bd0c1db379af7e4f87a705ff19edd"
 
   [[pins.artifacts]]
   role = "rustc"            # standalone component tarballs, extracted into one

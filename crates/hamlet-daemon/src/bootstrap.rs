@@ -3552,7 +3552,7 @@ name = "ripgrep"
         );
         assert!(lines[3].starts_with("  - tool: nvm/node 22 → 22.23.3 · manager@0.40.8 sha256 "));
         assert!(
-            lines[4].starts_with("  - tool: cargo/rust stable → 1.98.1 · rustup@1.29.1 sha256 ")
+            lines[4].starts_with("  - tool: cargo/rust stable → 1.98.1 · rustup@1.29.2 sha256 ")
         );
         assert_eq!(
             lines[5],
